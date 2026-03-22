@@ -1,0 +1,67 @@
+# Ultra Limiter — Clean-room ReShade addon
+# Written from public API documentation only (NVAPI, ReShade, MinHook, Windows).
+# No Display Commander code. See ORIGINS.txt for full provenance.
+cmake_minimum_required(VERSION 3.15)
+project(ultra_limiter LANGUAGES C CXX)
+
+add_library(ultra_limiter SHARED
+    main.cpp
+    ul_config.cpp
+    ul_limiter.cpp
+    ul_log.cpp
+    ul_reflex.cpp
+    ul_timing.cpp
+)
+
+# Include directories
+target_include_directories(ultra_limiter PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}
+    SYSTEM
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/external/reshade/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/external/reshade>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/external/imgui>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/external/nvapi>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/external/minhook/include>
+)
+
+# MinHook static library
+set(UL_MINHOOK_DIR ${CMAKE_CURRENT_LIST_DIR}/external/minhook)
+if(EXISTS "${UL_MINHOOK_DIR}")
+    set(UL_MINHOOK_SOURCES
+        ${UL_MINHOOK_DIR}/src/buffer.c
+        ${UL_MINHOOK_DIR}/src/hook.c
+        ${UL_MINHOOK_DIR}/src/trampoline.c
+        ${UL_MINHOOK_DIR}/src/hde/hde32.c
+        ${UL_MINHOOK_DIR}/src/hde/hde64.c
+    )
+    add_library(ul_minhook STATIC ${UL_MINHOOK_SOURCES})
+    target_compile_definitions(ul_minhook PRIVATE MH_STATIC=1)
+    target_include_directories(ul_minhook PRIVATE ${UL_MINHOOK_DIR}/include)
+    if(MSVC)
+        set_property(TARGET ul_minhook PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    target_link_libraries(ultra_limiter PRIVATE ul_minhook)
+else()
+    message(FATAL_ERROR "MinHook not found at ${UL_MINHOOK_DIR}. Clone it: git clone https://github.com/TsudaKageyu/minhook external/minhook")
+endif()
+
+# C++17 for ReShade headers
+target_compile_features(ultra_limiter PRIVATE cxx_std_17)
+
+# MSVC settings
+if(MSVC)
+    target_compile_options(ultra_limiter PRIVATE /utf-8 /wd4191 /wd4996)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        target_compile_options(ultra_limiter PRIVATE /arch:AVX2)
+    endif()
+    set_property(TARGET ultra_limiter PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(ultra_limiter PRIVATE $<$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>:/Zi>)
+    target_link_options(ultra_limiter PRIVATE $<$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>:/DEBUG>)
+endif()
+
+# Output as .addon64
+set_target_properties(ultra_limiter PROPERTIES
+    OUTPUT_NAME "ultra_limiter"
+    SUFFIX ".addon64"
+    PREFIX ""
+)
