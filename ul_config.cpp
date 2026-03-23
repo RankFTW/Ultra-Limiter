@@ -130,6 +130,7 @@ static void WriteDefaults(const char* path) {
     fprintf(f,
         "[UltraLimiter]\n"
         "fps_limit=0\n"
+        "bg_fps_limit=0\n"
         "fg_mult=auto\n"
         "boost=game\n"
         "preset=native_pacing\n"
@@ -180,6 +181,8 @@ void LoadSettings(HMODULE addon_module) {
 
     g_cfg.fps_limit.store(static_cast<float>(GetPrivateProfileIntA("UltraLimiter", "fps_limit", 0, ini)),
                           std::memory_order_relaxed);
+    g_cfg.bg_fps_limit.store(static_cast<float>(GetPrivateProfileIntA("UltraLimiter", "bg_fps_limit", 0, ini)),
+                              std::memory_order_relaxed);
 
     GetPrivateProfileStringA("UltraLimiter", "fg_mult", "auto", buf, sizeof(buf), ini);
     if (_stricmp(buf, "off") == 0)       g_cfg.fg_mult.store(FGMultiplier::Off);
@@ -249,6 +252,7 @@ void SaveSettings() {
     ul_log::Write("SaveSettings: writing %s", s_ini);
 
     WInt("fps_limit", static_cast<int>(g_cfg.fps_limit.load(std::memory_order_relaxed)));
+    WInt("bg_fps_limit", static_cast<int>(g_cfg.bg_fps_limit.load(std::memory_order_relaxed)));
 
     switch (g_cfg.fg_mult.load()) {
         case FGMultiplier::Off: W("fg_mult", "off"); break;

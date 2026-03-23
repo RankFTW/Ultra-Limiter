@@ -673,6 +673,20 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
 
     ImGui::Spacing();
 
+    // --- Background FPS Limit ---
+    ImGui::TextDisabled("Background FPS Limit");
+    ImGui::SameLine(); ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("FPS cap when the game window is not focused.\nReduces GPU/CPU usage while alt-tabbed.\nSet 0 to disable (uses normal FPS limit).");
+
+    float bg_fps = g_cfg.bg_fps_limit.load(std::memory_order_relaxed);
+    int bg_fps_i = static_cast<int>(bg_fps);
+    if (ImGui::SliderInt("##bg_fps_limit", &bg_fps_i, 0, 120)) {
+        g_cfg.bg_fps_limit.store(static_cast<float>(bg_fps_i));
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
+
+    ImGui::Spacing();
+
     // --- VSync ---
     ImGui::TextDisabled("VSync");
     ImGui::SameLine(); ImGui::TextDisabled("(?)");
@@ -1069,6 +1083,23 @@ static void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* sc,
     if (!sc) return;
     HWND hwnd = static_cast<HWND>(sc->get_hwnd());
     if (hwnd != s_hwnd) return;
+
+    // Background FPS cap — simple sleep when the game window is not focused
+    float bg_cap = g_cfg.bg_fps_limit.load(std::memory_order_relaxed);
+    if (bg_cap > 0.0f && hwnd && GetForegroundWindow() != hwnd) {
+        static int64_t s_bg_next_ns = 0;
+        static HANDLE s_bg_timer = nullptr;
+        int64_t now_ns = ul_timing::NowNs();
+        int64_t interval_ns = static_cast<int64_t>(1'000'000'000.0 / bg_cap);
+        if (s_bg_next_ns > 0 && now_ns < s_bg_next_ns) {
+            ul_timing::SleepUntilNs(s_bg_next_ns, s_bg_timer);
+            now_ns = ul_timing::NowNs();
+        }
+        s_bg_next_ns = now_ns + interval_ns;
+        // Still update stats so the OSD doesn't freeze
+        UpdateStats();
+        return;
+    }
 
     __try {
         s_limiter.OnPresent();
