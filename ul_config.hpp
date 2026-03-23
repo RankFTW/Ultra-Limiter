@@ -12,22 +12,6 @@
 
 // --- Enums ---
 
-// How to handle frame generation when computing the real render rate
-enum class FGMultiplier : uint8_t {
-    Auto = 0,  // Detect from loaded DLLs
-    Off,       // No FG — target FPS = user FPS
-    X2,        // 2x FG (e.g. DLSS-G)
-    X3,        // 3x MFG
-    X4,        // 4x MFG
-};
-
-// Reflex boost override
-enum class BoostMode : uint8_t {
-    GameDefault = 0,  // Pass through whatever the game sets
-    ForceOn,
-    ForceOff,
-};
-
 // Window mode override
 enum class WindowMode : uint8_t {
     NoOverride = 0,
@@ -35,31 +19,14 @@ enum class WindowMode : uint8_t {
     ForceBorderless,
 };
 
-// Pacing strategy preset
-enum class PacingPreset : uint8_t {
-    NativePacing = 0,   // Pace on SIMULATION_START only, no queue limit
-    MarkerLowLat,       // Pace via Reflex markers, max queued = 1
-    MarkerBalanced,     // Pace via Reflex markers, max queued = 2
-    MarkerStability,    // Pace via Reflex markers, max queued = 3
-    StreamlineProxy,    // Pace generated frames via SL proxy hook
-    Custom,             // User controls all sub-settings
-};
-
 // --- Main config struct ---
 
 struct UlConfig {
     // Core limiter
-    std::atomic<float> fps_limit{0.0f};           // 0 = unlimited
-    std::atomic<float> bg_fps_limit{0.0f};        // 0 = disabled (use normal limit)
-    std::atomic<FGMultiplier> fg_mult{FGMultiplier::Auto};
-    std::atomic<BoostMode> boost{BoostMode::GameDefault};
-    std::atomic<PacingPreset> preset{PacingPreset::NativePacing};
+    std::atomic<float> fps_limit{0.0f};            // 0 = unlimited
+    std::atomic<float> bg_fps_limit{0.0f};         // 0 = disabled (use fps_limit/3 fallback)
 
-    // Custom sub-settings (only active when preset == Custom)
-    std::atomic<bool> use_marker_pacing{true};
-    std::atomic<int> max_queued_frames{0};
-    std::atomic<bool> delay_present{false};
-    std::atomic<float> delay_present_amount{1.0f};  // in frame-times
+    // Internal only (not exposed in UI)
     std::atomic<bool> use_sl_proxy{false};
 
     // OSD
@@ -87,8 +54,6 @@ struct UlConfig {
     std::atomic<int> vsync_override{0};
 
     // 5XXX Exclusive Pacing Optimization (flip metering)
-    // When enabled, overrides IDXGISwapChain2::SetMaximumFrameLatency to 1,
-    // forcing single-frame queue depth for lowest input latency on NVIDIA 5XXX.
     std::atomic<bool> exclusive_pacing{false};
 
     // Keybinds (virtual key codes)
@@ -99,16 +64,6 @@ struct UlConfig {
 };
 
 extern UlConfig g_cfg;
-
-// Resolved settings after expanding the preset
-struct ExpandedSettings {
-    bool use_marker_pacing;
-    int max_queued_frames;
-    bool delay_present;
-    bool use_sl_proxy;
-};
-
-ExpandedSettings ExpandPreset();
 
 // Load from INI next to addon DLL. Creates default INI if missing.
 void LoadSettings(HMODULE addon_module);

@@ -74,10 +74,10 @@ This is where the three projects diverge most significantly.
 - **Primary**: Reflex Sleep with adaptive interval from `BuildSleepParams()`
 - **Backstop**: Phase-locked timing grid (`target = epoch + k * interval`)
 - **Sleep method**: High-resolution waitable timer + busy-wait tail
-- **Adaptive**: Mode-dependent predictive sleep, cadence tracking, P2P feedback, interval adjustment, VRR ceiling
-- **FG-aware**: Cadence-based stabilization under FG/MFG (variance minimization instead of interval tightening)
+- **Adaptive**: Per-stage pipeline prediction, cadence tracking, P2P feedback, interval adjustment, VRR ceiling, dynamic queue depth, dynamic boost, bottleneck detection
+- **FG-aware**: Cadence-based stabilization under FG/MFG (variance minimization instead of interval tightening), unified FG adjustment combining overhead + cadence + headroom
 - **Grid behavior**: Late frames snap forward (no debt accumulation)
-- **Settings change**: Full adaptive reset (predictors, cadence, EMAs, P2P, grid, warmup)
+- **Settings change**: Full adaptive reset (predictors, cadence, EMAs, P2P, grid, queue voting, boost controller, warmup)
 
 ### Display Commander
 - **Primary**: Reflex Sleep as the FPS limiter (`ShouldUseReflexAsFpsLimiter`)
@@ -99,14 +99,20 @@ This is where the three projects diverge most significantly.
 
 ## 4. Interval Computation
 
-UL's `AdjustIntervalUs()` applies six corrections to the raw interval:
+UL's `AdjustIntervalUs()` applies mode-dependent corrections to the raw interval:
 
+**FG path** (when frame generation is active):
 1. **VRR floor** — clamp to GSync ceiling (`3600 * hz / (hz + 3600)`)
-2. **FG offset** — adaptive (measured from GetLatency) or static (+24 µs)
-3. **Queue pressure** — +4 µs when render queue is backing up
-4. **GPU headroom** — -3 µs when load < 70%, up to +4 µs when load > 90%
-5. **P2P feedback** — ±1 µs nudge from present cadence error (clamped ±8 µs)
-6. **Driver shave** — -2 µs to compensate for systematic driver overshoot
+2. **Unified FG adjustment** — single value combining measured FG overhead + cadence correction + GPU headroom + queue stress (from `ComputeFGAdjustment`)
+3. **Driver shave** — -2 µs to compensate for systematic driver overshoot
+
+**1:1 path** (no frame generation):
+1. **VRR floor** — clamp to GSync ceiling
+2. **Queue pressure** — +4 µs when render queue is backing up
+3. **GPU headroom** — -3 µs when load < 70%, up to +4 µs when load > 90%
+4. **P2P feedback** — ±1 µs nudge from present cadence error (clamped ±8 µs)
+5. **Driver shave** — -2 µs
+6. **Predictive sleep** — can only tighten the interval (1:1 GPU-bound only)
 
 DC applies none of these corrections. SK's interval computation is in a completely different subsystem with different logic.
 
@@ -116,14 +122,15 @@ DC applies none of these corrections. SK's interval computation is in a complete
 
 | | UL | DC | SK |
 |-|----|-----|-----|
-| Method | Auto from GPU load + FG state | Manual/preset | Different architecture |
-| GPU-bound (no FG) | SIM_START (lowest latency) | N/A | N/A |
-| CPU-bound (no FG) | PRESENT_FINISH (best pacing) | N/A | N/A |
+| Method | Auto from GPU load + bottleneck + FG state | Manual/preset | Different architecture |
+| GPU bottleneck (no FG) | SIM_START (lowest latency) | N/A | N/A |
+| CPU bottleneck (no FG) | PRESENT_FINISH (best pacing) | N/A | N/A |
 | FG active | PRESENT_FINISH (unless GPU < 60%) | N/A | N/A |
 | Deferred enforcement | Yes (FG + queue > 1 → PRESENT_BEGIN) | No | N/A |
 | Hysteresis | 65–85% band (no FG), 60% threshold (FG) | N/A | N/A |
+| Bottleneck input | 40% pipeline share threshold (5 stages) | N/A | N/A |
 
-UL dynamically selects the enforcement site based on real-time GPU load and FG state. Under frame generation, it biases toward PRESENT_FINISH to keep the interpolation pipeline fed, and defers sleep when queue depth > 1 so the queue wait fires first. Neither DC nor SK auto-detect the enforcement site or adapt it for FG.
+UL dynamically selects the enforcement site based on real-time bottleneck detection and FG state. The bottleneck detector tracks five pipeline stages (sim, render submit, driver, queue, GPU active) and flags whichever exceeds 40% of total pipeline time. Under frame generation, it biases toward PRESENT_FINISH to keep the interpolation pipeline fed, and defers sleep when dynamic queue depth > 1 so the queue wait fires first. Neither DC nor SK auto-detect the enforcement site or adapt it for FG.
 
 ---
 
@@ -133,9 +140,13 @@ These features exist in UL but not in DC or SK:
 
 | Feature | Description | DC | SK |
 |---------|-------------|----|----|
-| **GpuPredictor** | Trend-aware GPU time prediction with adaptive safety margins | ✗ | ✗ |
+| **Pipeline Predictor** | Per-stage trend-aware prediction (GPU, sim, FG) with adaptive safety margins | ✗ | ✗ |
 | **Cadence Tracker** | Output present-to-present variance measurement for pacing quality | ✗ | ✗ |
 | **FG/MFG Stabilization** | Cadence-based interval adjustment under frame generation (never tightens under 3x+) | ✗ | ✗ |
+| **Unified FG Adjustment** | Single adjustment combining FG overhead + cadence + headroom + queue stress | ✗ | ✗ |
+| **Dynamic Queue Depth** | Voting-window system (1–3 frames) with supermajority and hysteresis | ✗ | ✗ |
+| **Dynamic Boost Controller** | Auto-manages Reflex Boost from GPU idle gaps, utilization, and thermal detection | ✗ | ✗ |
+| **Bottleneck Detection** | 5-stage pipeline analysis (40% threshold) informing enforcement site | ✗ | ✗ |
 | **Mode-Dependent Predictive Sleep** | Tightens under 1:1, stabilizes under FG, holds under MFG | ✗ | ✗ |
 | **FG-Aware Enforcement Site** | Biases PRESENT_FINISH under FG, defers sleep when queue > 1 | ✗ | ✗ |
 | **Settings Change Reset** | Full adaptive state reset on FPS/VSync/exclusive changes | ✗ | ✗ |
@@ -143,7 +154,7 @@ These features exist in UL but not in DC or SK:
 | **Phase-Locked Grid** | Grid-based timing instead of relative-target advancement | ✗ | ✗ |
 | **Hybrid Queue Wait** | Waitable timer + busy-wait (DC/SK spin-loop) | ✗ | ✗ |
 | **Adaptive FG Offset** | Measured FG overhead replaces static +24 µs | ✗ | ✗ |
-| **Auto Enforcement Site** | GPU load drives SIM_START vs PRESENT_FINISH | ✗ | ✗ |
+| **Auto Enforcement Site** | Bottleneck + GPU load drives SIM_START vs PRESENT_FINISH | ✗ | ✗ |
 | **VRR Ceiling Formula** | `3600 * hz / (hz + 3600)` with safety margin | ✗ | ✗ |
 | **Queue Pressure Detection** | Render queue depth monitoring from GetLatency | ✗ | ✗ |
 | **Adaptive Interval Adjustment** | GPU headroom-based interval fine-tuning | ✗ | ✗ |
@@ -211,7 +222,7 @@ Ultra Limiter is an independent clean-room implementation. The evidence:
 - Always-swallow hook strategy (DC conditionally forwards)
 - Phase-locked grid algorithm (DC uses Reflex Sleep directly, SK uses scanline timing)
 - FG-aware cadence stabilization (neither DC nor SK adapt pacing behavior for frame generation)
-- 17+ unique features not found in either project
+- 21 unique features not found in either project
 - Different code style, naming conventions, and error handling patterns
 - Different VSync implementation (Present hook vs driver profiles)
 

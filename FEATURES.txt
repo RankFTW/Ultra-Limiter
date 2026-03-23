@@ -11,9 +11,10 @@ FPS Limit
 
 Background FPS Limit
   Slider 0-120. Caps frame rate when the game window is not focused.
-  0 = disabled (normal FPS limit applies even when unfocused).
+  0 = auto fallback (fps_limit/3, minimum 10 FPS).
   Uses simple sleep-based limiting, bypasses Reflex pacing.
-  Reduces GPU/CPU usage while alt-tabbed. Engages/disengages instantly.
+  All adaptive evaluation frozen while backgrounded.
+  Full adaptive state reset on refocus.
 
 VSync Override
   Game (passthrough), On (SyncInterval=1), Off (SyncInterval=0 + ALLOW_TEARING).
@@ -25,41 +26,27 @@ VSync Override
   Only on waitable swapchains. Game's original value captured and restored.
   Designed for NVIDIA 50-series GPUs with flip metering support.
 
-FG Mode
-  Auto-detects DLSS FG, FSR FG, Smooth Motion from loaded DLLs.
-  Manual override: Off, 2x, 3x, 4x.
-  Divides target FPS by multiplier for real render rate.
-
-Boost Override
-  Game (passthrough), On (force boost), Off (force no boost).
-  Controls Reflex Low Latency Boost (GPU clock management).
-
-Pacing Presets
-  Native Pacing    — SIM_START, no queue limit. Lowest latency.
-  Marker Low Lat   — Reflex markers, max 1 queued frame.
-  Balanced         — Reflex markers, max 2 queued frames.
-  Stability        — Reflex markers, max 3 queued frames.
-  SL Proxy         — Pace generated frames via Streamline proxy.
-  Custom           — Manual control of all sub-settings.
+FG Detection
+  Always auto-detected from loaded DLLs. No manual override.
+  DLSS FG: nvngx_dlssg.dll, _nvngx_dlssg.dll, sl.dlss_g.dll, dlss-g.dll
+  FSR FG: amd_fidelityfx_framegeneration.dll, ffx_framegeneration.dll
+  Smooth Motion: NvPresent64.dll
+  Multiplier inferred from output FPS / native FPS ratio (2x, 3x, 4x).
 
 
-UL-Exclusive Adaptive Features
-------------------------------
-
-These features are unique to Ultra Limiter. Neither Special K nor Display
-Commander implement any of them.
+Adaptive Features (All Automatic)
+----------------------------------
 
 1. Predictive Sleep
-   GPU-aware wake scheduling. Tracks 8-sample GPU time history with weighted
-   averaging (4x/3x/2x/1x). Detects upward trends (3+ frames rising) and
-   biases prediction upward. Adaptive safety margin: 500us start, +50us per
-   miss, -10us per 30 stable frames, clamped 200-2000us. Only active when
-   GPU-bound. Predictive interval can only tighten the base interval.
+   Per-stage StagePredictor instances (GPU, sim, FG) with 8-sample history.
+   Weighted averaging (4x/3x/2x/1x). Upward trend detection (3+ frames).
+   PipelinePredictor combines stages into total prediction.
+   Adaptive safety margin: 500us start, +50us/miss, -10us/30 stable, 200-2000us.
+   1:1 mode: tightens interval. FG mode: cadence-based stabilization only.
 
 2. Phase-Locked Timing Grid
    target[k] = epoch + k * interval. No drift accumulation. Late frames snap
    forward. Uses CREATE_WAITABLE_TIMER_HIGH_RESOLUTION + busy-wait tail.
-   ZwSetTimerResolution for max kernel timer precision.
 
 3. Present-to-Present Feedback Loop
    Closed-loop correction. Accumulates P2P error over 30 frames. Nudges
@@ -67,42 +54,76 @@ Commander implement any of them.
    Only active without FG. Resets on FPS limit change.
 
 4. Automatic Enforcement Site
-   GPU load > 85% -> SIM_START (lowest latency).
-   GPU load < 65% -> PRESENT_FINISH (best pacing).
+   FG active: PRESENT_FINISH (SIM_START only if GPU load < 60%).
+   No FG + GPU bottleneck: SIM_START. CPU bottleneck: PRESENT_FINISH.
    65-85% hysteresis band prevents flip-flopping.
+   Deferred to PRESENT_BEGIN when FG + queue depth > 1.
 
 5. Queue Pressure Detection
    Monitors OS render queue time from GetLatency. If avg queue time > 1.5x
-   target interval, adds 4us to sleep interval to throttle proactively.
+   target interval, adds 4us to sleep interval. Biases queue depth voting.
 
-6. Adaptive DLSS FG Pacing
+6. Adaptive FG Pacing
    Measures actual FG overhead (GPU render end to present end) via GetLatency.
-   EMA smoothed (alpha=0.1). Replaces static +24us offset. Clamped 4-60us.
+   EMA smoothed (alpha=0.1). Clamped 4-60us. Feeds unified FG adjustment.
 
-7. Hybrid Queue Wait
-   Two-phase: waitable timer sleeps (~0.5ms) then busy-wait for final <1ms.
-   50ms timeout. Saves CPU vs pure spin-loop used by SK and DC.
+7. Cadence Tracking & FG Stabilization
+   32-sample CadenceTracker. Rolling mean/stddev of present-to-present deltas.
+   Smooth: stddev < 3% target. Jittery: stddev > 8% target.
+   2x FG: moderate response, +/-10us range. 3x+ MFG: conservative, never
+   tightens below zero. Streak-based state tracking.
 
-8. Time-Based Warmup
-   2-second wall-clock warmup from first present. Consistent across frame
-   rates (frame-count warmup is 10s at 30fps but 1.25s at 240fps).
+8. Unified FG Adjustment
+   Combines FG overhead base + cadence correction + GPU headroom + queue stress.
+   Single fg_unified_adjust_us value applied to interval. Queue stress prevents
+   negative adjustments. MFG-aware conservatism.
 
-9. Proper Reflex Restore
-   Captures game's SetSleepMode params on hook. Restores on shutdown.
-   If game never called SetSleepMode, disables Reflex cleanly.
+9. Dynamic Queue Depth
+   Voting-window system (sized to ~2s of frames). Depth 1-3.
+   Suggested from safety margin, miss rate, FG state, queue pressure.
+   60% supermajority to go deeper, 80% to go shallower.
+   4-second hysteresis. FG minimum depth 2.
 
-10. VRR / GSync Awareness
-    Ceiling = 3600 * hz / (hz + 3600). 0.5% safety margin. Clamps interval
-    so limiter never exceeds VRR window. Cached 2s. Disabled when VSync off.
+10. Dynamic Boost Controller
+    Tracks GPU idle gaps and steady-state GPU time via EMAs.
+    Boost On: consistent idle gaps + post-idle ramp detected.
+    Boost Off: GPU load > 85% or thermal throttling suspected.
+    Thermal detection: GPU trend rising 3+ sec while sim flat/falling.
+    6-second hysteresis. Falls back to game's boost setting when deferring.
 
-11. Adaptive Interval Adjustment
-    GPU load < 70%: -3us (tighten). GPU load > 90%: up to +4us (buffer).
-    Driver shave: always -2us to compensate for systematic overshoot.
+11. Bottleneck Detection
+    Per-stage EMA tracking: sim, render submit, driver, queue, GPU active.
+    40% threshold: if any stage > 40% of total pipeline, flagged as bottleneck.
+    Categories: GPU, CpuSim, CpuSubmit, Driver, Queue, None.
+    Informs enforcement site selection.
 
-12. Flip Metering Block
-    Hooks nvapi_QueryInterface. Blocks ordinal 0xF3148C42 (SetFlipConfig)
-    by returning nullptr. Exception: Smooth Motion (needs flip metering).
-    UL's own lookups use original QI pointer. Always active, no toggle.
+12. Hybrid Queue Wait
+    Two-phase: waitable timer sleeps (~0.5ms) then busy-wait for final <1ms.
+    50ms timeout. Saves CPU vs pure spin-loop.
+
+13. Time-Based Warmup
+    2-second wall-clock warmup from first present. Consistent across frame rates.
+
+14. Proper Reflex Restore
+    Captures game's SetSleepMode params on hook. Restores on shutdown.
+
+15. VRR / GSync Awareness
+    Ceiling = 3600 * hz / (hz + 3600). 0.5% safety margin. Clamps interval.
+    Cached 2s. Disabled when VSync off.
+
+16. Adaptive Interval Adjustment
+    GPU load < 70%: -3us. GPU load > 90%: up to +4us.
+    Driver shave: always -2us.
+
+17. Flip Metering Block
+    Hooks nvapi_QueryInterface. Blocks ordinal 0xF3148C42 (SetFlipConfig).
+    Exception: Smooth Motion (needs flip metering).
+    Exception: REFramework + Streamline (crash prevention, QI hook skipped).
+
+18. Settings Change Reset
+    FPS limit, VSync, or exclusive pacing change triggers full reset:
+    pipeline predictor, pipeline stats, boost controller, P2P feedback,
+    timing grid, queue depth voting, sleep mode cache. Re-enters warmup.
 
 
 Interval Computation Pipeline
@@ -110,12 +131,10 @@ Interval Computation Pipeline
 
 Raw interval (from fps_limit / FG divisor)
   -> VRR floor clamp
-  -> FG offset (adaptive or +24us static)
-  -> Queue pressure (+4us if flagged)
-  -> GPU headroom adjustment (-3us to +4us)
-  -> P2P feedback correction (-8us to +8us)
+  -> FG path: unified FG adjustment (overhead + cadence + headroom)
+  -> 1:1 path: queue pressure (+4us) + adaptive interval + P2P correction
   -> Driver shave (-2us)
-  -> Predictive sleep (can only tighten)
+  -> Predictive sleep (1:1 only, can only tighten)
   = Final minimumIntervalUs sent to driver
 
 
@@ -123,11 +142,14 @@ Reflex Hook Summary
 -------------------
 
 SetSleepMode  — Swallowed. Game params captured. UL drives sleep mode.
+                Dynamic Boost Controller overrides boost flag when decided.
 Sleep         — Swallowed. UL calls Sleep on its own schedule.
 SetMarker     — Intercepted. RTSS filtered. INPUT_SAMPLE reordered.
                 Timestamps in 64-slot ring buffer. Dedup per frame.
 GetLatency    — Not hooked. Called directly for adaptive features.
+                Disabled when REFramework + Streamline detected.
 QueryInterface — Hooked. Blocks flip metering (SetFlipConfig).
+                 Skipped when REFramework detected (crash prevention).
 
 
 Smooth Motion

@@ -306,22 +306,22 @@ static void DrawOSD(reshade::api::effect_runtime*) {
     if (g_cfg.show_fg_mode.load(std::memory_order_relaxed)) {
         int64_t now = ul_timing::NowQpc();
         if (now - s_fg_check_qpc > ul_timing::g_qpc_freq) { UpdateFGString(); s_fg_check_qpc = now; }
-        snprintf(buf, sizeof(buf), "FG: %s", s_fg_str);
-        add_line(buf, gold);
+        // Hide FG line when nothing is detected
+        if (strcmp(s_fg_str, "None") != 0) {
+            snprintf(buf, sizeof(buf), "FG: %s", s_fg_str);
+            add_line(buf, gold);
+        }
     }
 
     if (g_cfg.show_resolution.load(std::memory_order_relaxed)) {
         uint32_t ow = s_out_w.load(), oh = s_out_h.load();
         uint32_t rw = s_rnd_w.load(), rh = s_rnd_h.load();
+        // Only show resolution when upscaling is detected (render < output)
         if (rw > 0 && rh > 0 && ow > 0 && rw < ow) {
             int pct = static_cast<int>(100.0f * rw / static_cast<float>(ow));
             snprintf(buf, sizeof(buf), "Res: %ux%u -> %ux%u (%d%%)", rw, rh, ow, oh, pct);
-        } else if (ow > 0) {
-            snprintf(buf, sizeof(buf), "Res: %ux%u (native)", ow, oh);
-        } else {
-            snprintf(buf, sizeof(buf), "Res: --");
+            add_line(buf, gold);
         }
-        add_line(buf, gold);
     }
 
     has_graph = g_cfg.show_graph.load(std::memory_order_relaxed) &&
@@ -550,13 +550,6 @@ static void ApplySavedMonitor(HWND hwnd) {
 // Overlay UI (ReShade settings panel)
 // ============================================================================
 
-static const char* kPresetLabels[] = {
-    "Low Latency (Native)", "Low Latency (Markers)",
-    "Balanced", "Stability", "Pace Generated (SL Proxy)", "Custom"
-};
-static const char* kFGLabels[] = { "Auto", "Off", "2x", "3x", "4x" };
-static const char* kBoostLabels[] = { "Game", "On", "Off" };
-
 static bool Combo(const char* label, int* cur, const char* const items[], int n) {
     bool changed = false;
     if (ImGui::BeginCombo(label, items[*cur], 0)) {
@@ -746,62 +739,6 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
 
     ImGui::Spacing();
 
-    // --- FG Mode ---
-    ImGui::TextDisabled("FG Mode");
-    ImGui::SameLine(); ImGui::TextDisabled("(?)");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("How to account for frame generation when computing render rate.\nAuto detects DLSS FG, FSR FG, and Smooth Motion.");
-
-    int fg = static_cast<int>(g_cfg.fg_mult.load());
-    if (Combo("##fg_mode", &fg, kFGLabels, 5)) { g_cfg.fg_mult.store(static_cast<FGMultiplier>(fg)); changed = true; }
-
-    ImGui::Spacing();
-
-    // --- Boost ---
-    ImGui::TextDisabled("Boost");
-    ImGui::SameLine(); ImGui::TextDisabled("(?)");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reflex low-latency boost override.\nGame: use the game's setting. On/Off: force.");
-
-    int boost = static_cast<int>(g_cfg.boost.load());
-    if (Combo("##boost", &boost, kBoostLabels, 3)) { g_cfg.boost.store(static_cast<BoostMode>(boost)); changed = true; }
-
-    ImGui::Spacing();
-
-    // --- Preset ---
-    ImGui::TextDisabled("Preset");
-    ImGui::SameLine(); ImGui::TextDisabled("(?)");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frame pacing strategy.\nNative: pace on sim start, lowest latency.\nMarkers: pace via Reflex markers with queue depth.\nSL Proxy: pace generated frames via Streamline.\nCustom: manual control of all sub-settings.");
-
-    int preset = static_cast<int>(g_cfg.preset.load());
-    if (Combo("##preset", &preset, kPresetLabels, 6)) { g_cfg.preset.store(static_cast<PacingPreset>(preset)); changed = true; }
-
-    if (static_cast<PacingPreset>(preset) == PacingPreset::Custom) {
-        ImGui::Indent(16);
-        bool mk = g_cfg.use_marker_pacing.load();
-        if (ImGui::Checkbox("Use Reflex Markers", &mk)) { g_cfg.use_marker_pacing.store(mk); changed = true; }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pace using Reflex latency markers from the game.");
-
-        int q = g_cfg.max_queued_frames.load();
-        if (ImGui::SliderInt("Max Queued Frames", &q, 0, 4)) { g_cfg.max_queued_frames.store(q); }
-        if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("How many frames can be in-flight before the limiter waits.");
-
-        bool dp = g_cfg.delay_present.load();
-        if (ImGui::Checkbox("Delay Present Start", &dp)) { g_cfg.delay_present.store(dp); changed = true; }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add a delay between sim start and present begin.");
-        if (dp) {
-            float da = g_cfg.delay_present_amount.load();
-            if (ImGui::SliderFloat("Delay (frames)", &da, 0, 3, "%.2f")) { g_cfg.delay_present_amount.store(da); }
-            if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
-        }
-
-        bool sl = g_cfg.use_sl_proxy.load();
-        if (ImGui::Checkbox("Streamline Proxy", &sl)) { g_cfg.use_sl_proxy.store(sl); changed = true; }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hook Streamline's swapchain Present for FG pacing.");
-        ImGui::Unindent(16);
-    }
-
-    ImGui::Spacing();
-
     // --- Display (collapsible) ---
     if (ImGui::CollapsingHeader("Display")) {
         ImGui::Indent(8);
@@ -915,14 +852,13 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
     ImGui::Text("Reflex: %s", ReflexActive() ? "Hooked" : "Not hooked");
     ImGui::Text("Native Reflex: %s", g_game_uses_reflex.load() ? "Detected" : "No");
 
-    ExpandedSettings es = ExpandPreset();
     bool native = g_game_uses_reflex.load();
     const char* mode = "Timing";
     if (!ReflexActive()) mode = "Timing (no Reflex)";
-    else if (es.use_sl_proxy) mode = "SL Proxy";
-    else if (es.use_marker_pacing && native) {
+    else if (native) {
         // Show the dynamically resolved enforcement site
-        int site = s_limiter.GetGpuStats().valid ? s_limiter.GetGpuStats().auto_site : PRESENT_FINISH;
+        const auto& ps = s_limiter.GetPipelineStats();
+        int site = ps.valid ? ps.auto_site : PRESENT_FINISH;
         mode = (site == SIM_START) ? "Marker (Sim Start)" : "Marker (Present)";
     }
     else mode = "Present-based (Reflex Sleep)";
@@ -995,14 +931,13 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
             ul_log::Write("OnInitSwapchain: ConnectReflex done");
         }
 
-        ExpandedSettings es = ExpandPreset();
-        if (es.use_sl_proxy && !IsStreamlineSafeMode()) {
+        if (g_cfg.use_sl_proxy.load(std::memory_order_relaxed) && !IsStreamlineSafeMode()) {
             auto nsc = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
             if (nsc) {
                 ul_log::Write("OnInitSwapchain: HookSLProxy...");
                 HookSLProxy(nsc);
             }
-        } else if (es.use_sl_proxy) {
+        } else if (g_cfg.use_sl_proxy.load(std::memory_order_relaxed)) {
             ul_log::Write("OnInitSwapchain: skipping SL proxy hook (Streamline safe mode)");
         }
 
@@ -1107,23 +1042,6 @@ static void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* sc,
     if (!sc) return;
     HWND hwnd = static_cast<HWND>(sc->get_hwnd());
     if (hwnd != s_hwnd) return;
-
-    // Background FPS cap — simple sleep when the game window is not focused
-    float bg_cap = g_cfg.bg_fps_limit.load(std::memory_order_relaxed);
-    if (bg_cap > 0.0f && hwnd && GetForegroundWindow() != hwnd) {
-        static int64_t s_bg_next_ns = 0;
-        static HANDLE s_bg_timer = nullptr;
-        int64_t now_ns = ul_timing::NowNs();
-        int64_t interval_ns = static_cast<int64_t>(1'000'000'000.0 / bg_cap);
-        if (s_bg_next_ns > 0 && now_ns < s_bg_next_ns) {
-            ul_timing::SleepUntilNs(s_bg_next_ns, s_bg_timer);
-            now_ns = ul_timing::NowNs();
-        }
-        s_bg_next_ns = now_ns + interval_ns;
-        // Still update stats so the OSD doesn't freeze
-        UpdateStats();
-        return;
-    }
 
     __try {
         s_limiter.OnPresent();

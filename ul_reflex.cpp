@@ -584,13 +584,8 @@ static HRESULT STDMETHODCALLTYPE Hook_SetMaxFrameLatency(IDXGISwapChain* sc, UIN
     if (g_cfg.exclusive_pacing.load(std::memory_order_relaxed)) {
         target = 1;
         reason = "exclusive_pacing";
-    } else {
-        ExpandedSettings es = ExpandPreset();
-        if (es.max_queued_frames > 0) {
-            target = static_cast<UINT>(es.max_queued_frames);
-            reason = "max_queued_frames";
-        }
     }
+    // else: passthrough — use whatever the game requested
 
     if (target != MaxLatency) {
         static UINT s_last_logged_game = UINT_MAX;
@@ -680,13 +675,6 @@ bool HookFrameLatency(IDXGISwapChain* sc) {
         if (g_cfg.exclusive_pacing.load(std::memory_order_relaxed)) {
             s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(sc2), 1);
             ul_log::Write("HookFrameLatency: applied initial override to 1 (exclusive pacing)");
-        } else {
-            ExpandedSettings es = ExpandPreset();
-            if (es.max_queued_frames > 0) {
-                UINT val = static_cast<UINT>(es.max_queued_frames);
-                s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(sc2), val);
-                ul_log::Write("HookFrameLatency: applied initial override to %u (max_queued_frames)", val);
-            }
         }
     }
 
@@ -704,17 +692,10 @@ void ApplyFrameLatency() {
         s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(s_latency_sc2), 1);
         ul_log::Write("ApplyFrameLatency: set to 1 (exclusive pacing ON)");
     } else {
-        ExpandedSettings es = ExpandPreset();
-        if (es.max_queued_frames > 0) {
-            UINT val = static_cast<UINT>(es.max_queued_frames);
-            s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(s_latency_sc2), val);
-            ul_log::Write("ApplyFrameLatency: set to %u (max_queued_frames)", val);
-        } else {
-            UINT restore = s_game_latency.load(std::memory_order_relaxed);
-            if (restore == 0) restore = 3;  // sensible default if game never called it
-            s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(s_latency_sc2), restore);
-            ul_log::Write("ApplyFrameLatency: restored to %u (game default)", restore);
-        }
+        UINT restore = s_game_latency.load(std::memory_order_relaxed);
+        if (restore == 0) restore = 3;  // sensible default if game never called it
+        s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(s_latency_sc2), restore);
+        ul_log::Write("ApplyFrameLatency: restored to %u (game default)", restore);
     }
 }
 
