@@ -74,8 +74,10 @@ This is where the three projects diverge most significantly.
 - **Primary**: Reflex Sleep with adaptive interval from `BuildSleepParams()`
 - **Backstop**: Phase-locked timing grid (`target = epoch + k * interval`)
 - **Sleep method**: High-resolution waitable timer + busy-wait tail
-- **Adaptive**: Predictive sleep, P2P feedback, interval adjustment, VRR ceiling
+- **Adaptive**: Mode-dependent predictive sleep, cadence tracking, P2P feedback, interval adjustment, VRR ceiling
+- **FG-aware**: Cadence-based stabilization under FG/MFG (variance minimization instead of interval tightening)
 - **Grid behavior**: Late frames snap forward (no debt accumulation)
+- **Settings change**: Full adaptive reset (predictors, cadence, EMAs, P2P, grid, warmup)
 
 ### Display Commander
 - **Primary**: Reflex Sleep as the FPS limiter (`ShouldUseReflexAsFpsLimiter`)
@@ -91,7 +93,7 @@ This is where the three projects diverge most significantly.
 - **Adaptive**: Scanline tracking (different approach entirely)
 - **NvDRS**: Manipulates driver settings for frame rate limits
 
-**Summary**: UL uses a phase-locked grid with GPU-aware prediction. DC uses Reflex Sleep directly. SK uses scanline-based timing. No algorithmic overlap.
+**Summary**: UL uses a phase-locked grid with GPU-aware prediction and FG-aware cadence stabilization. DC uses Reflex Sleep directly. SK uses scanline-based timing. No algorithmic overlap.
 
 ---
 
@@ -114,12 +116,14 @@ DC applies none of these corrections. SK's interval computation is in a complete
 
 | | UL | DC | SK |
 |-|----|-----|-----|
-| Method | Auto from GPU load ratio | Manual/preset | Different architecture |
-| GPU-bound | SIM_START (lowest latency) | N/A | N/A |
-| CPU-bound | PRESENT_FINISH (best pacing) | N/A | N/A |
-| Hysteresis | 65–85% band | N/A | N/A |
+| Method | Auto from GPU load + FG state | Manual/preset | Different architecture |
+| GPU-bound (no FG) | SIM_START (lowest latency) | N/A | N/A |
+| CPU-bound (no FG) | PRESENT_FINISH (best pacing) | N/A | N/A |
+| FG active | PRESENT_FINISH (unless GPU < 60%) | N/A | N/A |
+| Deferred enforcement | Yes (FG + queue > 1 → PRESENT_BEGIN) | No | N/A |
+| Hysteresis | 65–85% band (no FG), 60% threshold (FG) | N/A | N/A |
 
-UL dynamically selects the enforcement site based on real-time GPU load. Neither DC nor SK auto-detect the enforcement site.
+UL dynamically selects the enforcement site based on real-time GPU load and FG state. Under frame generation, it biases toward PRESENT_FINISH to keep the interpolation pipeline fed, and defers sleep when queue depth > 1 so the queue wait fires first. Neither DC nor SK auto-detect the enforcement site or adapt it for FG.
 
 ---
 
@@ -130,6 +134,11 @@ These features exist in UL but not in DC or SK:
 | Feature | Description | DC | SK |
 |---------|-------------|----|----|
 | **GpuPredictor** | Trend-aware GPU time prediction with adaptive safety margins | ✗ | ✗ |
+| **Cadence Tracker** | Output present-to-present variance measurement for pacing quality | ✗ | ✗ |
+| **FG/MFG Stabilization** | Cadence-based interval adjustment under frame generation (never tightens under 3x+) | ✗ | ✗ |
+| **Mode-Dependent Predictive Sleep** | Tightens under 1:1, stabilizes under FG, holds under MFG | ✗ | ✗ |
+| **FG-Aware Enforcement Site** | Biases PRESENT_FINISH under FG, defers sleep when queue > 1 | ✗ | ✗ |
+| **Settings Change Reset** | Full adaptive state reset on FPS/VSync/exclusive changes | ✗ | ✗ |
 | **P2P Feedback Loop** | Closed-loop correction from measured present cadence | ✗ | ✗ |
 | **Phase-Locked Grid** | Grid-based timing instead of relative-target advancement | ✗ | ✗ |
 | **Hybrid Queue Wait** | Waitable timer + busy-wait (DC/SK spin-loop) | ✗ | ✗ |
@@ -201,7 +210,8 @@ Ultra Limiter is an independent clean-room implementation. The evidence:
 - Custom NVAPI struct definitions (DC and SK use official headers)
 - Always-swallow hook strategy (DC conditionally forwards)
 - Phase-locked grid algorithm (DC uses Reflex Sleep directly, SK uses scanline timing)
-- 12+ unique features not found in either project
+- FG-aware cadence stabilization (neither DC nor SK adapt pacing behavior for frame generation)
+- 17+ unique features not found in either project
 - Different code style, naming conventions, and error handling patterns
 - Different VSync implementation (Present hook vs driver profiles)
 

@@ -2,6 +2,8 @@
 
 Ultra Limiter is a ReShade addon that provides GPU-aware frame rate limiting with deep NVIDIA Reflex integration, frame generation awareness, and adaptive pacing. It loads as a `.addon64` file through ReShade and works with any D3D11 or D3D12 game on NVIDIA GPUs.
 
+The pacing engine is FG-aware — it adapts its behavior based on whether frame generation is active, using cadence-based stabilization under FG/MFG instead of the latency-first approach used in native rendering. This prevents the limiter from fighting the interpolation pipeline, resulting in smooth output even at 3x and 4x frame generation.
+
 This guide covers every feature in detail, including the adaptive systems that run under the hood.
 
 ---
@@ -27,12 +29,14 @@ This guide covers every feature in detail, including the adaptive systems that r
     - [Automatic Enforcement Site](#4-automatic-enforcement-site)
     - [Queue Pressure Detection](#5-queue-pressure-detection)
     - [Adaptive DLSS FG Pacing](#6-adaptive-dlss-fg-pacing)
-    - [Hybrid Queue Wait](#7-hybrid-queue-wait)
-    - [Time-Based Warmup](#8-time-based-warmup)
-    - [Proper Reflex Restore](#9-proper-reflex-restore)
-    - [VRR / GSync Awareness](#10-vrr--gsync-awareness)
-    - [Adaptive Interval Adjustment](#11-adaptive-interval-adjustment)
-    - [Flip Metering Block](#12-flip-metering-block)
+    - [Cadence Tracking & FG Stabilization](#7-cadence-tracking--fg-stabilization)
+    - [Hybrid Queue Wait](#8-hybrid-queue-wait)
+    - [Time-Based Warmup](#9-time-based-warmup)
+    - [Proper Reflex Restore](#10-proper-reflex-restore)
+    - [VRR / GSync Awareness](#11-vrr--gsync-awareness)
+    - [Adaptive Interval Adjustment](#12-adaptive-interval-adjustment)
+    - [Flip Metering Block](#13-flip-metering-block)
+    - [Settings Change Reset](#14-settings-change-reset)
 14. [Reflex Hook Architecture](#reflex-hook-architecture)
 15. [Smooth Motion Handling](#smooth-motion-handling)
 16. [Status Display](#status-display)
@@ -138,6 +142,8 @@ Boost increases power consumption but reduces GPU render time, which directly re
 
 ## Pacing Presets
 
+> **Warning**: ReShade with addon support should not be used in online multiplayer games. Most anti-cheat systems (EAC, BattlEye, Vanguard, etc.) will flag or block DLL injection, and you risk account bans. Ultra Limiter is intended for single-player and offline use only.
+
 The preset selector controls the frame pacing strategy. Each preset configures a combination of sub-settings.
 
 ### Low Latency (Native)
@@ -227,7 +233,7 @@ These features run automatically under the hood. They are driven by data from `N
 
 ### 1. Predictive Sleep
 
-**What it does**: Instead of using a static sleep interval derived from the FPS limit, predictive sleep computes a per-frame interval based on how long the GPU is expected to take. This maximizes GPU utilization by waking the CPU closer to when the GPU will actually finish rendering.
+**What it does**: Instead of using a static sleep interval derived from the FPS limit, predictive sleep computes a per-frame interval based on how long the GPU is expected to take. The behavior is mode-dependent — it adapts differently for native rendering vs. frame generation.
 
 **How it works**:
 - Tracks recent GPU active render times in an 8-sample circular buffer from GetLatency reports.
@@ -235,12 +241,15 @@ These features run automatically under the hood. They are driven by data from `N
 - Detects upward trends (3+ consecutive frames rising) and adds the per-frame increase to the prediction. This anticipates continued rise from camera pans, entering heavier geometry, particle effects ramping up.
 - Does NOT bias downward for falling trends — being conservative on the way down is free (just slightly more GPU idle time), while being wrong on the way up causes a missed frame.
 - An adaptive safety margin starts at 500 µs, widens by 50 µs per prediction miss, tightens by 10 µs every 30 stable frames. Clamped to 200–2000 µs.
-- The predictive interval can only tighten (reduce) the base interval — it's a limiter, not an accelerator.
-- Only active when GPU-bound (auto enforcement site = SIM_START) and enough data is available (4+ samples).
 
-**Why it matters**: A static interval wastes GPU time when the workload varies. Predictive sleep adapts to the actual GPU workload, keeping frame times consistent while maximizing utilization.
+**Mode-dependent behavior**:
+- **1:1 (no FG)**: Tightens the interval based on predicted GPU time + safety margin. Only active when GPU-bound (enforcement site = SIM_START). The predictive interval can only reduce the base interval — it's a limiter, not an accelerator.
+- **FG (2x)**: Does NOT tighten the interval. Instead, applies cadence-based stabilization — adjusts the interval to minimize measured output variance (see Cadence Tracking below).
+- **MFG (3x+)**: Same as FG but more conservative — only widens the interval when output is jittery, never tightens. Holds at the best-known interval.
 
-**UL-exclusive**: Neither Special K nor Display Commander implement GPU time prediction for sleep scheduling.
+**Why it matters**: A static interval wastes GPU time when the workload varies. Under native rendering, predictive sleep adapts to the actual GPU workload. Under frame generation, tightening the interval fights the interpolation scheduler and causes choppy output — the mode-dependent approach works with the FG pipeline instead of against it.
+
+**UL-exclusive**: Neither Special K nor Display Commander implement GPU time prediction for sleep scheduling, nor mode-dependent FG/MFG interval stabilization.
 
 ### 2. Phase-Locked Timing Grid
 
@@ -279,17 +288,20 @@ These features run automatically under the hood. They are driven by data from `N
 
 ### 4. Automatic Enforcement Site
 
-**What it does**: Dynamically selects where in the frame pipeline to call Reflex Sleep, based on real-time GPU load.
+**What it does**: Dynamically selects where in the frame pipeline to call Reflex Sleep, based on real-time GPU load and whether frame generation is active.
 
 **How it works**:
 - Monitors GPU load ratio: `avg_gpu_active_us / target_interval_us`.
-- **GPU-bound (load > 85%)** → `SIM_START` — sleep fires at the start of simulation, giving the GPU maximum time to finish. Lowest latency.
-- **CPU-bound (load < 65%)** → `PRESENT_FINISH` — sleep fires at present, giving the CPU maximum time. Best frame pacing.
-- **65–85%** — hysteresis band, keeps the current site to prevent flip-flopping.
+- **When FG is active**: Biases toward `PRESENT_FINISH` to keep the interpolation pipeline fed. Only switches to `SIM_START` if GPU load is genuinely low (< 60%), meaning the GPU has plenty of headroom to serve both rendering and interpolation. This prevents the limiter from starving the FG chain.
+- **When FG is not active**:
+  - **GPU-bound (load > 85%)** → `SIM_START` — sleep fires at the start of simulation, giving the GPU maximum time to finish. Lowest latency.
+  - **CPU-bound (load < 65%)** → `PRESENT_FINISH` — sleep fires at present, giving the CPU maximum time. Best frame pacing.
+  - **65–85%** — hysteresis band, keeps the current site to prevent flip-flopping.
+- **Deferred enforcement under FG**: When FG is active and queue depth > 1, sleep is deferred from `SIM_START` to `PRESENT_BEGIN`. This ensures the queue wait fires first and the interpolation pipeline stays fed.
 
-**Why it matters**: The optimal enforcement site depends on whether the CPU or GPU is the bottleneck. Calling Sleep at the wrong point either wastes latency headroom (GPU-bound at PRESENT_FINISH) or causes frame pacing jitter (CPU-bound at SIM_START). Auto-detection adapts in real time.
+**Why it matters**: The optimal enforcement site depends on whether the CPU or GPU is the bottleneck, and critically, whether frame generation is active. Under FG, enforcing at SIM_START starves the interpolation chain — the GPU can't finish the current frame fast enough to feed the interpolator, causing uneven output cadence. The FG-aware logic keeps the pipeline flowing smoothly.
 
-**UL-exclusive**: Neither SK nor DC auto-detect the enforcement site from GPU load.
+**UL-exclusive**: Neither SK nor DC auto-detect the enforcement site from GPU load, nor do they adjust enforcement behavior based on FG state.
 
 ### 5. Queue Pressure Detection
 
@@ -320,7 +332,30 @@ These features run automatically under the hood. They are driven by data from `N
 
 **UL-exclusive**: SK uses a static +24 µs offset. DC does not have an FG pacing offset system.
 
-### 7. Hybrid Queue Wait
+### 7. Cadence Tracking & FG Stabilization
+
+**What it does**: Measures the actual output frame cadence (present-to-present timing) and uses it to stabilize pacing under frame generation. This is the core signal that drives the FG/MFG-aware predictive sleep behavior.
+
+**How it works**:
+- Feeds `presentEndTime` values from GetLatency reports into a 32-sample circular buffer.
+- Computes rolling mean and standard deviation of present-to-present deltas.
+- Classifies output quality:
+  - **Smooth**: stddev < 3% of the target output interval.
+  - **Jittery**: stddev > 8% of the target output interval.
+  - **Neutral**: in between.
+- Tracks streak counters for smooth and jittery states.
+- Tracks the best-known interval (the one that produced the lowest variance).
+- Automatically infers the effective FG multiplier from the ratio of render interval to measured output cadence — handles 2x, 3x, and 4x without configuration.
+
+**FG stabilization response**:
+- **2x FG**: Moderate response. Widens the interval by +2 µs per poll when jittery (up to +10 µs). Tightens by -1 µs per poll when confirmed smooth for 15+ consecutive polls (down to -4 µs). Holds when neutral.
+- **3x+ MFG**: Very conservative. Only widens when jittery (up to +12 µs). Never tightens — only cautiously reduces the back-off after very long stable streaks (30+ polls), and never goes below zero. This prevents the limiter from fighting the multi-frame interpolation scheduler.
+
+**Why it matters**: Under frame generation, the relationship between the Reflex sleep interval and actual output timing is non-linear. The interpolation scheduler has its own cadence, and tightening the interval disrupts it. Cadence tracking gives the limiter a direct measurement of output quality, so it can back off when the output is jittery and hold steady when it's smooth — instead of blindly tightening and making things worse.
+
+**UL-exclusive**: Neither SK nor DC measure output cadence variance or implement FG-aware interval stabilization.
+
+### 8. Hybrid Queue Wait
 
 **What it does**: When waiting for N-back frames to finish rendering (queue depth enforcement), uses a two-phase wait that saves CPU power.
 
@@ -333,7 +368,7 @@ These features run automatically under the hood. They are driven by data from `N
 
 **UL-exclusive**: Neither SK nor DC use hybrid waits for queue depth enforcement.
 
-### 8. Time-Based Warmup
+### 9. Time-Based Warmup
 
 **What it does**: Delays the start of frame limiting for 2 seconds after the first present, regardless of frame rate.
 
@@ -344,7 +379,7 @@ These features run automatically under the hood. They are driven by data from `N
 
 **Why it matters**: A frame-count warmup (e.g., "skip first 300 frames") is inconsistent — at 30 FPS that's 10 seconds, at 240 FPS it's 1.25 seconds. Time-based warmup is consistent regardless of the game's initial frame rate, which can vary wildly during loading screens and shader compilation.
 
-### 9. Proper Reflex Restore
+### 10. Proper Reflex Restore
 
 **What it does**: On shutdown, restores the game's original Reflex sleep mode parameters.
 
@@ -355,7 +390,7 @@ These features run automatically under the hood. They are driven by data from `N
 
 **Why it matters**: Without proper restore, unloading the addon mid-game could leave Reflex in an inconsistent state — either stuck with UL's parameters or disabled when the game expected it to be on.
 
-### 10. VRR / GSync Awareness
+### 11. VRR / GSync Awareness
 
 **What it does**: On VRR displays, clamps the sleep interval so the limiter never requests a rate above the VRR ceiling.
 
@@ -369,7 +404,7 @@ These features run automatically under the hood. They are driven by data from `N
 
 **Why it matters**: If the limiter requests a rate above the VRR window, the driver drops out of variable refresh and introduces judder. Clamping to the ceiling keeps the display in VRR mode.
 
-### 11. Adaptive Interval Adjustment
+### 12. Adaptive Interval Adjustment
 
 **What it does**: Fine-tunes the sleep interval based on GPU headroom.
 
@@ -380,7 +415,7 @@ These features run automatically under the hood. They are driven by data from `N
 - **70–90%** — no adjustment.
 - A separate -2 µs "driver shave" is always applied to compensate for the driver's tendency to overshoot by a couple microseconds.
 
-### 12. Flip Metering Block
+### 13. Flip Metering Block
 
 **What it does**: Blocks NVIDIA's flip metering pacer (`NvAPI_D3D12_SetFlipConfig`) to give UL full control over FG frame pacing.
 
@@ -393,6 +428,20 @@ These features run automatically under the hood. They are driven by data from `N
 - Always active, no user toggle.
 
 **Why it matters**: NVIDIA's flip metering pacer competes with UL's frame pacing. Blocking it ensures UL has sole control over when frames are presented.
+
+### 14. Settings Change Reset
+
+**What it does**: When the FPS limit, VSync override, or exclusive pacing setting changes, triggers a full reset of all adaptive state so no stale data influences the new configuration.
+
+**How it works**:
+- Detects changes to `fps_limit`, `vsync_override`, or `exclusive_pacing` every frame.
+- On change, resets: GPU predictor (history, trends, safety margin), cadence tracker (deltas, variance, streaks), GPU stats EMAs, present-to-present feedback loop, timing grid epoch, and the changed-params cache.
+- Re-enters the 2-second warmup period so the adaptive systems can re-converge from clean state.
+- Logged as `ResetAdaptiveState: full reset`.
+
+**Why it matters**: Adaptive systems accumulate state tuned to the current configuration. Changing the FPS limit without resetting leaves stale predictions, cadence data, and feedback corrections that can cause bad pacing for several seconds. A full reset ensures clean convergence every time.
+
+**UL-exclusive**: Neither SK nor DC perform a coordinated reset of all adaptive state on settings changes.
 
 ---
 
