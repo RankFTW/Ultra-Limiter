@@ -1013,7 +1013,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         }
 
         ul_log::Initialize(hModule);
-        ul_log::Write("=== Ultra Limiter v2.0 (clean-room) starting ===");
+        ul_log::Write("=== Ultra Limiter (clean-room) starting ===");
 
         if (!ul_timing::Init()) {
             ul_log::Write("FATAL: timing init failed");
