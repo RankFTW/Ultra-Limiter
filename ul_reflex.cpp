@@ -47,6 +47,10 @@ static std::atomic<bool> s_nvapi_ready{false};
 
 static GameReflexState s_game_state;
 
+// QueryInterface hook — block flip metering (NvAPI_D3D12_SetFlipConfig)
+static NvQueryInterface_fn s_orig_qi = nullptr;
+static constexpr NvU32 kSetFlipConfigId = 0xF3148C42;
+
 // Out-of-band INPUT_SAMPLE reordering state.
 // INPUT_SAMPLE must arrive between SIM_START and SIM_END to be valid.
 // If a game fires it at the wrong time, we queue it and re-inject it
@@ -92,6 +96,30 @@ static NvU32 FindFuncId(const char* name) {
 }
 
 // ============================================================================
+// QueryInterface detour — block flip metering pacer
+// ============================================================================
+// NvAPI_D3D12_SetFlipConfig (0xF3148C42) is NVIDIA's flip metering pacer
+// used by Streamline/DLSS FG to control frame presentation cadence.
+// Blocking it gives UL full control over FG frame pacing.
+// Exception: Smooth Motion requires flip metering, so allow it through.
+
+static void* __cdecl Hook_QueryInterface(NvU32 id) {
+    if (id == kSetFlipConfigId) {
+        // Allow through if Smooth Motion is active — it needs flip metering
+        if (GetModuleHandleW(L"NvPresent64.dll") != nullptr) {
+            return s_orig_qi ? s_orig_qi(id) : nullptr;
+        }
+        static bool s_logged = false;
+        if (!s_logged) {
+            ul_log::Write("Hook_QueryInterface: blocked SetFlipConfig (0x%08X)", id);
+            s_logged = true;
+        }
+        return nullptr;
+    }
+    return s_orig_qi ? s_orig_qi(id) : nullptr;
+}
+
+// ============================================================================
 // Load nvapi64.dll and initialize
 // ============================================================================
 
@@ -107,17 +135,35 @@ static bool LoadNvapi() {
     auto qi = reinterpret_cast<NvQueryInterface_fn>(GetProcAddress(dll, "nvapi_QueryInterface"));
     if (!qi) { ul_log::Write("LoadNvapi: nvapi_QueryInterface not found"); return false; }
 
+    // Hook QueryInterface to block flip metering (SetFlipConfig)
+    if (MH_CreateHook(reinterpret_cast<void*>(qi), reinterpret_cast<void*>(Hook_QueryInterface),
+                       reinterpret_cast<void**>(&s_orig_qi)) == MH_OK) {
+        if (MH_EnableHook(reinterpret_cast<void*>(qi)) == MH_OK) {
+            ul_log::Write("LoadNvapi: QueryInterface hooked (flip metering block active)");
+        } else {
+            MH_RemoveHook(reinterpret_cast<void*>(qi));
+            ul_log::Write("LoadNvapi: QueryInterface hook enable failed");
+            s_orig_qi = nullptr;
+        }
+    } else {
+        ul_log::Write("LoadNvapi: QueryInterface hook create failed");
+        s_orig_qi = nullptr;
+    }
+
+    // Use the original (unhooked) QI for our own internal lookups
+    NvQueryInterface_fn real_qi = s_orig_qi ? s_orig_qi : qi;
+
     NvU32 init_id = FindFuncId("NvAPI_Initialize");
     if (!init_id) { ul_log::Write("LoadNvapi: NvAPI_Initialize ID not in table"); return false; }
 
-    auto init_fn = reinterpret_cast<NvInitialize_fn>(qi(init_id));
+    auto init_fn = reinterpret_cast<NvInitialize_fn>(real_qi(init_id));
     if (!init_fn) { ul_log::Write("LoadNvapi: QueryInterface(Initialize) null"); return false; }
 
     NvStatus st = init_fn();
     if (st != NV_OK) { ul_log::Write("LoadNvapi: Initialize returned %d", st); return false; }
 
     s_nvapi_dll = dll;
-    s_qi = qi;
+    s_qi = real_qi;  // store the original QI for our own use
     s_nvapi_ready.store(true, std::memory_order_release);
     ul_log::Write("LoadNvapi: OK");
     return true;

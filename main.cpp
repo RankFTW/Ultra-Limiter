@@ -222,10 +222,13 @@ static void DrawOSD(reshade::api::effect_runtime*) {
 
     // When Smooth Motion is active, s_fps (from present) is the native render rate
     // and s_native_fps (from SIM_START) is the higher output rate. Swap for display.
+    // If the game doesn't use Reflex markers, s_native_fps will be 0 — fall back to
+    // s_fps so the OSD never shows 0.
     bool sm = GetModuleHandleW(L"NvPresent64.dll") != nullptr;
-    float disp_fps = sm ? s_native_fps : s_fps;
-    float disp_native_fps = sm ? s_fps : s_native_fps;
-    float disp_native_ft = sm ? s_ft_ms : s_native_ft_ms;
+    bool has_nat = s_has_native.load(std::memory_order_relaxed) && s_native_fps > 0.0f;
+    float disp_fps = (sm && has_nat) ? s_native_fps : s_fps;
+    float disp_native_fps = (sm && has_nat) ? s_fps : s_native_fps;
+    float disp_native_ft = (sm && has_nat) ? s_ft_ms : s_native_ft_ms;
 
     if (g_cfg.show_fps.load(std::memory_order_relaxed)) {
         snprintf(buf, sizeof(buf), "FPS: %.1f", disp_fps);
