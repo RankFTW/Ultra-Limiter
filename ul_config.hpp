@@ -49,7 +49,7 @@ enum class PacingPreset : uint8_t {
 
 struct UlConfig {
     // Core limiter
-    std::atomic<float> fps_limit{60.0f};           // 0 = unlimited
+    std::atomic<float> fps_limit{0.0f};           // 0 = unlimited
     std::atomic<FGMultiplier> fg_mult{FGMultiplier::Auto};
     std::atomic<BoostMode> boost{BoostMode::GameDefault};
     std::atomic<PacingPreset> preset{PacingPreset::NativePacing};

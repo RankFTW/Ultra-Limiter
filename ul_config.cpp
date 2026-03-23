@@ -129,7 +129,7 @@ static void WriteDefaults(const char* path) {
     if (!f) return;
     fprintf(f,
         "[UltraLimiter]\n"
-        "fps_limit=60\n"
+        "fps_limit=0\n"
         "fg_mult=auto\n"
         "boost=game\n"
         "preset=native_pacing\n"
@@ -177,7 +177,7 @@ void LoadSettings(HMODULE addon_module) {
     const char* ini = s_ini;
     char buf[64];
 
-    g_cfg.fps_limit.store(static_cast<float>(GetPrivateProfileIntA("UltraLimiter", "fps_limit", 60, ini)),
+    g_cfg.fps_limit.store(static_cast<float>(GetPrivateProfileIntA("UltraLimiter", "fps_limit", 0, ini)),
                           std::memory_order_relaxed);
 
     GetPrivateProfileStringA("UltraLimiter", "fg_mult", "auto", buf, sizeof(buf), ini);
