@@ -13,9 +13,12 @@ jobs:
   build:
     runs-on: windows-latest
 
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Clone dependencies
         run: |
@@ -31,13 +34,13 @@ jobs:
         run: cmake --build build --config Release
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: ultra_limiter
           path: build/Release/ultra_limiter.addon64
 
       - name: Create Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: Ultra_Limiter
           name: Ultra Limiter
