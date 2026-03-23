@@ -116,11 +116,23 @@ constexpr size_t kRingSize = 64;
 struct MarkerSlot {
     std::atomic<uint64_t> frame_id{0};
     std::atomic<int64_t> timestamp_ns[kMarkerCount]{};
-    std::atomic<uint64_t> seen_frame[kMarkerCount]{};  // dedup: last frame_id per marker type
+    // Dedup: last frame_id per marker type.
+    // Initialized to UINT64_MAX so frame 0 is never falsely matched as a duplicate.
+    std::atomic<uint64_t> seen_frame[kMarkerCount]{UINT64_MAX, UINT64_MAX, UINT64_MAX,
+                                                    UINT64_MAX, UINT64_MAX, UINT64_MAX,
+                                                    UINT64_MAX, UINT64_MAX, UINT64_MAX,
+                                                    UINT64_MAX, UINT64_MAX, UINT64_MAX,
+                                                    UINT64_MAX};
 };
 
 extern MarkerSlot g_ring[kRingSize];
 extern std::atomic<bool> g_game_uses_reflex;  // true once we see a SetLatencyMarker call
+
+// --- Frame counter for per-frame dedup (e.g. Sleep guard) ---
+
+// Monotonic frame counter incremented each present. Used by the Sleep hook
+// to prevent games from calling NvAPI_D3D_Sleep more than once per frame.
+extern std::atomic<uint64_t> g_present_count;
 
 // --- Public API ---
 
@@ -142,6 +154,15 @@ bool HookSLProxy(IDXGISwapChain* sc);
 // --- VSync override swapchain hook ---
 
 bool HookVSyncPresent(IDXGISwapChain* sc);
+
+// --- 5XXX Exclusive Pacing Optimization (frame latency override) ---
+
+// Hook IDXGISwapChain2::SetMaximumFrameLatency on the game's swapchain.
+// When exclusive_pacing is enabled, overrides the game's value to 1.
+bool HookFrameLatency(IDXGISwapChain* sc);
+
+// Re-apply the frame latency override (call after config changes at runtime).
+void ApplyFrameLatency();
 
 using SLPresentCb = void(*)();
 void SetSLPresentCb(SLPresentCb cb);

@@ -11,7 +11,7 @@ namespace ul_timing {
 
 // Conversion factors — set by Init()
 extern int64_t g_qpc_freq;      // QPC ticks per second
-extern int64_t g_ns_per_tick;   // nanoseconds per QPC tick (integer approx)
+extern int64_t g_ns_per_tick;   // nanoseconds per QPC tick (integer approx, for diagnostics only)
 
 // Must call once at startup. Returns false if QPC unavailable.
 bool Init();

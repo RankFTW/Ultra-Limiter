@@ -54,28 +54,27 @@ ExpandedSettings ExpandPreset() {
     switch (p) {
         case PacingPreset::NativePacing:
             e.use_marker_pacing = true; e.max_queued_frames = 0;
-            e.sim_start_only = true; e.delay_present = false; e.use_sl_proxy = false;
+            e.delay_present = false; e.use_sl_proxy = false;
             break;
         case PacingPreset::MarkerLowLat:
             e.use_marker_pacing = true; e.max_queued_frames = 1;
-            e.sim_start_only = false; e.delay_present = false; e.use_sl_proxy = false;
+            e.delay_present = false; e.use_sl_proxy = false;
             break;
         case PacingPreset::MarkerBalanced:
             e.use_marker_pacing = true; e.max_queued_frames = 2;
-            e.sim_start_only = false; e.delay_present = false; e.use_sl_proxy = false;
+            e.delay_present = false; e.use_sl_proxy = false;
             break;
         case PacingPreset::MarkerStability:
             e.use_marker_pacing = true; e.max_queued_frames = 3;
-            e.sim_start_only = false; e.delay_present = false; e.use_sl_proxy = false;
+            e.delay_present = false; e.use_sl_proxy = false;
             break;
         case PacingPreset::StreamlineProxy:
             e.use_marker_pacing = false; e.max_queued_frames = 0;
-            e.sim_start_only = false; e.delay_present = false; e.use_sl_proxy = true;
+            e.delay_present = false; e.use_sl_proxy = true;
             break;
         case PacingPreset::Custom:
             e.use_marker_pacing = g_cfg.use_marker_pacing.load(std::memory_order_relaxed);
             e.max_queued_frames = g_cfg.max_queued_frames.load(std::memory_order_relaxed);
-            e.sim_start_only = g_cfg.sim_start_only.load(std::memory_order_relaxed);
             e.delay_present = g_cfg.delay_present.load(std::memory_order_relaxed);
             e.use_sl_proxy = g_cfg.use_sl_proxy.load(std::memory_order_relaxed);
             break;
@@ -96,7 +95,6 @@ static void WriteDefaults(const char* path) {
         "preset=native_pacing\n"
         "use_marker_pacing=true\n"
         "max_queued_frames=0\n"
-        "sim_start_only=false\n"
         "delay_present=false\n"
         "delay_present_amount=1.0\n"
         "use_sl_proxy=false\n"
@@ -115,6 +113,7 @@ static void WriteDefaults(const char* path) {
         "target_monitor=\n"
         "window_mode=none\n"
         "vsync_override=0\n"
+        "exclusive_pacing=false\n"
         "osd_toggle_key=35\n"
     );
     fclose(f);
@@ -163,7 +162,6 @@ void LoadSettings(HMODULE addon_module) {
 
     g_cfg.use_marker_pacing.store(ReadBool(ini, "use_marker_pacing", true));
     g_cfg.max_queued_frames.store(GetPrivateProfileIntA("UltraLimiter", "max_queued_frames", 0, ini));
-    g_cfg.sim_start_only.store(ReadBool(ini, "sim_start_only", false));
     g_cfg.delay_present.store(ReadBool(ini, "delay_present", false));
     g_cfg.delay_present_amount.store(ReadFloat(ini, "delay_present_amount", 1.0f));
     g_cfg.use_sl_proxy.store(ReadBool(ini, "use_sl_proxy", false));
@@ -194,6 +192,7 @@ void LoadSettings(HMODULE addon_module) {
     else                                         g_cfg.window_mode.store(WindowMode::NoOverride);
 
     g_cfg.vsync_override.store(GetPrivateProfileIntA("UltraLimiter", "vsync_override", 0, ini));
+    g_cfg.exclusive_pacing.store(ReadBool(ini, "exclusive_pacing", false));
     g_cfg.osd_toggle_key.store(GetPrivateProfileIntA("UltraLimiter", "osd_toggle_key", VK_END, ini));
 
     ul_log::Write("LoadSettings: fps=%.0f preset=%d fg=%d boost=%d",
@@ -234,7 +233,6 @@ void SaveSettings() {
 
     WBool("use_marker_pacing", g_cfg.use_marker_pacing.load());
     WInt("max_queued_frames", g_cfg.max_queued_frames.load());
-    WBool("sim_start_only", g_cfg.sim_start_only.load());
     WBool("delay_present", g_cfg.delay_present.load());
     WFloat("delay_present_amount", g_cfg.delay_present_amount.load());
     WBool("use_sl_proxy", g_cfg.use_sl_proxy.load());
@@ -265,4 +263,5 @@ void SaveSettings() {
 
     WInt("osd_toggle_key", g_cfg.osd_toggle_key.load());
     WInt("vsync_override", g_cfg.vsync_override.load());
+    WBool("exclusive_pacing", g_cfg.exclusive_pacing.load());
 }

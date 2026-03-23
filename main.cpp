@@ -382,7 +382,18 @@ static void StartWorker() {
     if (s_wk_thread) return;
     s_wk_event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
     s_wk_stop = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    if (!s_wk_event || !s_wk_stop) {
+        ul_log::Write("StartWorker: CreateEvent failed");
+        if (s_wk_event) { CloseHandle(s_wk_event); s_wk_event = nullptr; }
+        if (s_wk_stop) { CloseHandle(s_wk_stop); s_wk_stop = nullptr; }
+        return;
+    }
     s_wk_thread = CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
+    if (!s_wk_thread) {
+        ul_log::Write("StartWorker: CreateThread failed");
+        CloseHandle(s_wk_event); CloseHandle(s_wk_stop);
+        s_wk_event = s_wk_stop = nullptr;
+    }
 }
 
 static void StopWorker() {
@@ -602,6 +613,23 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
 
     ImGui::Spacing();
 
+    // --- 5XXX Exclusive Pacing Optimization ---
+    ImGui::TextDisabled("5XXX Exclusive Pacing Optimization");
+    ImGui::SameLine(); ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Forces single-frame queue depth (SetMaximumFrameLatency = 1).\n"
+        "Reduces input latency by preventing the GPU from queuing extra frames.\n"
+        "Recommended for NVIDIA 50-series GPUs with flip metering support.");
+
+    bool ep = g_cfg.exclusive_pacing.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("Enable##excl_pacing", &ep)) {
+        g_cfg.exclusive_pacing.store(ep);
+        ApplyFrameLatency();
+        changed = true;
+    }
+
+    ImGui::Spacing();
+
     // --- FG Mode ---
     ImGui::TextDisabled("FG Mode");
     ImGui::SameLine(); ImGui::TextDisabled("(?)");
@@ -640,10 +668,6 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
         if (ImGui::SliderInt("Max Queued Frames", &q, 0, 4)) { g_cfg.max_queued_frames.store(q); }
         if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("How many frames can be in-flight before the limiter waits.");
-
-        bool so = g_cfg.sim_start_only.load();
-        if (ImGui::Checkbox("Sim Start Only", &so)) { g_cfg.sim_start_only.store(so); changed = true; }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Only pace on SIMULATION_START markers (lowest latency).");
 
         bool dp = g_cfg.delay_present.load();
         if (ImGui::Checkbox("Delay Present Start", &dp)) { g_cfg.delay_present.store(dp); changed = true; }
@@ -774,8 +798,11 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
     const char* mode = "Timing";
     if (!ReflexActive()) mode = "Timing (no Reflex)";
     else if (es.use_sl_proxy) mode = "SL Proxy";
-    else if (es.use_marker_pacing && native)
-        mode = es.sim_start_only ? "Marker (Sim Start)" : "Marker (Present)";
+    else if (es.use_marker_pacing && native) {
+        // Show the dynamically resolved enforcement site
+        int site = s_limiter.GetGpuStats().valid ? s_limiter.GetGpuStats().auto_site : PRESENT_FINISH;
+        mode = (site == SIM_START) ? "Marker (Sim Start)" : "Marker (Present)";
+    }
     else mode = "Present-based (Reflex Sleep)";
     ImGui::Text("Pacing: %s", mode);
     ImGui::Text("Target: %.0f FPS", g_cfg.fps_limit.load());
@@ -790,65 +817,87 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
 static void OnSLPresentCb() { s_limiter.OnSLPresent(); }
 
 static void OnMarkerCb(int mt, uint64_t fid) {
-    OnMarkerOSD(mt, fid);
-    s_limiter.OnMarker(mt, fid);
+    __try {
+        OnMarkerOSD(mt, fid);
+        s_limiter.OnMarker(mt, fid);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
     if (!sc) return;
 
-    HWND hwnd = static_cast<HWND>(sc->get_hwnd());
-    if (hwnd) s_hwnd = hwnd;
+    __try {
+        HWND hwnd = static_cast<HWND>(sc->get_hwnd());
+        if (hwnd) s_hwnd = hwnd;
+        if (hwnd) s_limiter.SetHwnd(hwnd);
 
-    if (hwnd) ApplySavedMonitor(hwnd);
-    if (hwnd) {
-        WindowMode wm = g_cfg.window_mode.load();
-        if (wm != WindowMode::NoOverride) RequestWindowMode(wm);
-    }
+        if (hwnd) ApplySavedMonitor(hwnd);
+        if (hwnd) {
+            WindowMode wm = g_cfg.window_mode.load();
+            if (wm != WindowMode::NoOverride) RequestWindowMode(wm);
+        }
 
-    reshade::api::device* dev = sc->get_device();
-    if (!dev) return;
+        reshade::api::device* dev = sc->get_device();
+        if (!dev) return;
 
-    auto api = dev->get_api();
-    ul_log::Write("OnInitSwapchain: api=%d", (int)api);
+        auto api = dev->get_api();
+        ul_log::Write("OnInitSwapchain: api=%d", (int)api);
 
-    if (api != reshade::api::device_api::d3d11 && api != reshade::api::device_api::d3d12) return;
+        if (api != reshade::api::device_api::d3d11 && api != reshade::api::device_api::d3d12) return;
 
-    IUnknown* native = reinterpret_cast<IUnknown*>(dev->get_native());
+        IUnknown* native = reinterpret_cast<IUnknown*>(dev->get_native());
 
-    // Capture output resolution from back buffer
-    {
-        reshade::api::resource bb = sc->get_back_buffer(0);
-        if (bb != reshade::api::resource{0}) {
-            reshade::api::resource_desc d = dev->get_resource_desc(bb);
-            if (d.texture.width > 0 && d.texture.height > 0) {
-                s_out_w.store(d.texture.width); s_out_h.store(d.texture.height);
-                ul_log::Write("OnInitSwapchain: output %ux%u", d.texture.width, d.texture.height);
+        // Capture output resolution from back buffer
+        {
+            reshade::api::resource bb = sc->get_back_buffer(0);
+            if (bb != reshade::api::resource{0}) {
+                reshade::api::resource_desc d = dev->get_resource_desc(bb);
+                if (d.texture.width > 0 && d.texture.height > 0) {
+                    s_out_w.store(d.texture.width); s_out_h.store(d.texture.height);
+                    ul_log::Write("OnInitSwapchain: output %ux%u", d.texture.width, d.texture.height);
+                }
             }
         }
-    }
 
-    UpdateFGString();
+        UpdateFGString();
 
-    if (native) {
-        s_reflex_dev = native;
-        s_limiter.ConnectReflex(native);
-    }
+        if (native) {
+            s_reflex_dev = native;
+            s_limiter.ConnectReflex(native);
+        }
 
-    ExpandedSettings es = ExpandPreset();
-    if (es.use_sl_proxy) {
-        auto nsc = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
-        if (nsc) HookSLProxy(nsc);
-    }
+        ExpandedSettings es = ExpandPreset();
+        if (es.use_sl_proxy) {
+            auto nsc = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
+            if (nsc) HookSLProxy(nsc);
+        }
 
-    // Hook Present for VSync override (only if SL proxy didn't already hook it)
-    {
-        auto nsc = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
-        if (nsc) HookVSyncPresent(nsc);
+        // Hook Present for VSync override (only if SL proxy didn't already hook it)
+        {
+            auto nsc = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
+            if (nsc) HookVSyncPresent(nsc);
+        }
+
+        // Hook SetMaximumFrameLatency for 5XXX Exclusive Pacing Optimization
+        {
+            auto nsc = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
+            if (nsc) HookFrameLatency(nsc);
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        ul_log::Write("OnInitSwapchain: exception 0x%08X", GetExceptionCode());
     }
 }
 
-static void OnDestroySwapchain(reshade::api::swapchain*, bool) {}
+static void OnDestroySwapchain(reshade::api::swapchain* sc, bool) {
+    // Reset VSync and frame-latency hooks so they can be re-installed on the
+    // next swapchain.  The vtable hooks themselves remain valid (MinHook patches
+    // the function prologue, not the vtable pointer), but the COM reference we
+    // hold to IDXGISwapChain2 must be released to avoid use-after-free.
+    // TeardownReflexHooks handles the latency hook cleanup.
+    // We intentionally do NOT tear down the NVAPI Reflex hooks here — those are
+    // function-level hooks that survive swapchain recreation.
+    ul_log::Write("OnDestroySwapchain");
+}
 
 // Track render resolution via viewport dimensions.
 // When DLSS/FSR is active, the game sets a viewport matching the internal
@@ -953,15 +1002,32 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     switch (reason) {
     case DLL_PROCESS_ATTACH:
-        if (!reshade::register_addon(hModule)) return FALSE;
+        s_prev_filter = SetUnhandledExceptionFilter(CrashHandler);
+
+        if (!reshade::register_addon(hModule)) {
+            SetUnhandledExceptionFilter(s_prev_filter);
+            return FALSE;
+        }
 
         ul_log::Initialize(hModule);
         ul_log::Write("=== Ultra Limiter v2.0 (clean-room) starting ===");
 
-        s_prev_filter = SetUnhandledExceptionFilter(CrashHandler);
-        ul_timing::Init();
+        if (!ul_timing::Init()) {
+            ul_log::Write("FATAL: timing init failed");
+            reshade::unregister_addon(hModule);
+            SetUnhandledExceptionFilter(s_prev_filter);
+            return FALSE;
+        }
+
         LoadSettings(hModule);
-        MH_Initialize();
+
+        if (MH_Initialize() != MH_OK) {
+            ul_log::Write("FATAL: MH_Initialize failed");
+            reshade::unregister_addon(hModule);
+            SetUnhandledExceptionFilter(s_prev_filter);
+            return FALSE;
+        }
+
         s_limiter.Init();
 
         SetSLPresentCb(OnSLPresentCb);

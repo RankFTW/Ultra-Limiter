@@ -16,6 +16,7 @@
 #include <dxgi.h>
 #include <dxgi1_5.h>
 #include <cstring>
+#include <intrin.h>  // _ReturnAddress for RTSS filter
 
 // ============================================================================
 // Globals
@@ -23,6 +24,7 @@
 
 MarkerSlot g_ring[kRingSize] = {};
 std::atomic<bool> g_game_uses_reflex{false};
+std::atomic<uint64_t> g_present_count{0};
 
 static HMODULE s_nvapi_dll = nullptr;
 static NvQueryInterface_fn s_qi = nullptr;
@@ -45,6 +47,16 @@ static std::atomic<bool> s_nvapi_ready{false};
 
 static GameReflexState s_game_state;
 
+// Out-of-band INPUT_SAMPLE reordering state.
+// INPUT_SAMPLE must arrive between SIM_START and SIM_END to be valid.
+// If a game fires it at the wrong time, we queue it and re-inject it
+// right after the next SIM_START.
+static std::atomic<bool> s_input_queued{false};
+static std::atomic<int> s_last_marker_type{PRESENT_FINISH};
+
+// Duplicate Sleep guard — track which present frame last called Sleep
+static std::atomic<uint64_t> s_last_sleep_frame{UINT64_MAX};
+
 // Streamline proxy
 static SLPresentCb s_sl_cb = nullptr;
 static MarkerCb s_marker_cb = nullptr;
@@ -57,6 +69,15 @@ static std::atomic<bool> s_sl_hooked{false};
 static PresentFn s_orig_game_present = nullptr;
 static std::atomic<bool> s_vsync_hooked{false};
 static std::atomic<bool> s_tearing_supported{false};
+
+// Frame-latency override (IDXGISwapChain2)
+using SetMaxFrameLatency_fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT);
+using GetMaxFrameLatency_fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT*);
+static SetMaxFrameLatency_fn s_orig_set_max_latency = nullptr;
+static GetMaxFrameLatency_fn s_orig_get_max_latency = nullptr;
+static std::atomic<bool> s_latency_hooked{false};
+static std::atomic<UINT> s_game_latency{0};
+static IDXGISwapChain2* s_latency_sc2 = nullptr;
 
 // ============================================================================
 // Interface table lookup
@@ -118,22 +139,114 @@ static NvStatus __cdecl Hook_SetSleepMode(IUnknown* dev, NvSleepParams* p) {
     return NV_OK;  // swallow — we set sleep mode on our own schedule
 }
 
-// Intercept Sleep: suppress — we call Sleep when we want to pace.
-static NvStatus __cdecl Hook_Sleep(IUnknown*) {
+// Intercept Sleep: track per-frame call count for diagnostics, swallow all.
+// Games like Monster Hunter Wilds call Sleep multiple times per frame.
+// We suppress everything here — UlLimiter calls InvokeSleep on its own schedule.
+// The dedup tracking lets us detect misbehaving games in logs if needed.
+static NvStatus __cdecl Hook_Sleep(IUnknown* dev) {
+    uint64_t cur = g_present_count.load(std::memory_order_relaxed);
+    s_last_sleep_frame.store(cur, std::memory_order_relaxed);
     return NV_OK;
 }
 
-// Intercept SetLatencyMarker: record timestamp, notify callback, forward to driver.
+// Forward a single marker to the driver, record it in the ring buffer,
+// and optionally notify the pacing callback.
+// Helper used by Hook_SetMarker and the input reordering logic.
+static NvStatus ForwardMarker(IUnknown* dev, NvMarkerParams* p, bool notify) {
+    int mt = static_cast<int>(p->markerType);
+    uint64_t fid = p->frameID;
+
+    // Record in ring buffer so pacing logic sees the timestamp
+    if (mt >= 0 && mt < kMarkerCount) {
+        size_t slot = static_cast<size_t>(fid % kRingSize);
+        g_ring[slot].frame_id.store(fid, std::memory_order_relaxed);
+        g_ring[slot].timestamp_ns[mt].store(ul_timing::NowNs(), std::memory_order_relaxed);
+        g_ring[slot].seen_frame[mt].store(fid, std::memory_order_relaxed);
+    }
+
+    NvStatus ret = NV_OK;
+    if (s_orig_marker) ret = s_orig_marker(dev, p);
+    if (notify && s_marker_cb)
+        s_marker_cb(mt, fid);
+    return ret;
+}
+
+// Intercept SetLatencyMarker: record timestamp, reorder out-of-band input
+// markers, notify callback, forward to driver.
 static NvStatus __cdecl Hook_SetMarker(IUnknown* dev, NvMarkerParams* p) {
     if (!dev || !p) {
         if (s_orig_marker) return s_orig_marker(dev, p);
         return NV_BAD_ARG;
     }
 
+    // Filter out RTSS (RivaTuner Statistics Server) — it fires latency
+    // markers but is NOT native Reflex.  Both SK and DC filter this.
+    // Re-check each call since RTSS can load after the game starts.
+    {
+        HMODULE rtss = GetModuleHandleW(L"RTSSHooks64.dll");
+        if (rtss) {
+            HMODULE caller = nullptr;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(_ReturnAddress()),
+                               &caller);
+            if (caller == rtss)
+                return NV_OK;
+        }
+    }
+
     g_game_uses_reflex.store(true, std::memory_order_relaxed);
 
     int mt = static_cast<int>(p->markerType);
     uint64_t fid = p->frameID;
+
+    // ----------------------------------------------------------------
+    // Out-of-band INPUT_SAMPLE reordering.
+    // INPUT_SAMPLE is only valid between SIM_START and SIM_END.
+    // If the game fires it at the wrong time we queue it and re-inject
+    // it at the next valid opportunity (SIM_START or SIM_END boundary).
+    // ----------------------------------------------------------------
+    if (mt == INPUT_SAMPLE) {
+        int prev = s_last_marker_type.load(std::memory_order_relaxed);
+        if (prev != SIM_START) {
+            // Not inside a simulation window — queue for later
+            s_input_queued.store(true, std::memory_order_relaxed);
+            return NV_OK;
+        }
+    }
+
+    // At SIM_START or SIM_END, flush any queued input marker.
+    // Use the CURRENT marker's frameID for the synthetic input marker.
+    // The original input's frameID is lost (we only store a boolean flag),
+    // but using the triggering marker's ID keeps the driver's per-frame
+    // accounting consistent — the input is attributed to the frame that
+    // will actually process it.
+    if ((mt == SIM_START || mt == SIM_END) &&
+        s_input_queued.exchange(false, std::memory_order_relaxed))
+    {
+        NvMarkerParams inp = *p;
+        inp.markerType = static_cast<LatencyMarker>(INPUT_SAMPLE);
+
+        // SIM_START: forward SIM_START first, then inject queued input after it
+        // SIM_END:   inject queued input before the end marker
+        bool before = (mt == SIM_START);
+        if (before) {
+            ForwardMarker(dev, p, true);
+            ForwardMarker(dev, &inp, true);
+        } else {
+            ForwardMarker(dev, &inp, true);
+            ForwardMarker(dev, p, true);
+        }
+
+        // Update tracking state
+        if (mt != INPUT_SAMPLE)
+            s_last_marker_type.store(mt, std::memory_order_relaxed);
+        return NV_OK;
+    }
+
+    // Track last non-INPUT marker type for the reordering logic
+    if (mt != INPUT_SAMPLE)
+        s_last_marker_type.store(mt, std::memory_order_relaxed);
 
     // Record in ring buffer
     if (mt >= 0 && mt < kMarkerCount) {
@@ -245,6 +358,14 @@ void TeardownReflexHooks() {
     s_orig_sleep_mode = nullptr;
     s_orig_sleep = nullptr;
     s_orig_marker = nullptr;
+
+    // Clean up frame latency hooks
+    if (s_latency_hooked.exchange(false, std::memory_order_acq_rel)) {
+        // MH_Uninitialize will handle the MinHook side, but release our COM ref
+        if (s_latency_sc2) { s_latency_sc2->Release(); s_latency_sc2 = nullptr; }
+        s_orig_set_max_latency = nullptr;
+        s_orig_get_max_latency = nullptr;
+    }
 }
 
 bool ReflexActive() { return s_hooked.load(std::memory_order_acquire); }
@@ -352,4 +473,123 @@ bool HookVSyncPresent(IDXGISwapChain* sc) {
     s_vsync_hooked.store(true, std::memory_order_release);
     ul_log::Write("HookVSyncPresent: Present hooked for VSync control");
     return true;
+}
+
+// ============================================================================
+// 5XXX Exclusive Pacing Optimization — frame latency override
+// ============================================================================
+
+// IDXGISwapChain2::SetMaximumFrameLatency hook.
+// When exclusive_pacing is enabled we force the value to 1 (single-frame
+// queue = lowest input latency). When disabled we pass through the game's
+// original value unchanged.
+
+static HRESULT STDMETHODCALLTYPE Hook_SetMaxFrameLatency(IDXGISwapChain* sc, UINT MaxLatency) {
+    // Remember what the game wanted so we can restore it if the user toggles off
+    s_game_latency.store(MaxLatency, std::memory_order_relaxed);
+
+    if (g_cfg.exclusive_pacing.load(std::memory_order_relaxed)) {
+        // Throttle logging — only log the first override and when the value changes
+        static UINT s_last_logged = UINT_MAX;
+        if (MaxLatency != s_last_logged) {
+            ul_log::Write("Hook_SetMaxFrameLatency: game requested %u, overriding to 1", MaxLatency);
+            s_last_logged = MaxLatency;
+        }
+        MaxLatency = 1;
+    }
+
+    return s_orig_set_max_latency ? s_orig_set_max_latency(sc, MaxLatency) : E_FAIL;
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_GetMaxFrameLatency(IDXGISwapChain* sc, UINT* pMaxLatency) {
+    // If we're overriding, report the game's original value back so it doesn't
+    // get confused by our override.
+    if (g_cfg.exclusive_pacing.load(std::memory_order_relaxed) && pMaxLatency) {
+        UINT game_val = s_game_latency.load(std::memory_order_relaxed);
+        if (game_val > 0) {
+            *pMaxLatency = game_val;
+            return S_OK;
+        }
+    }
+    return s_orig_get_max_latency ? s_orig_get_max_latency(sc, pMaxLatency) : E_FAIL;
+}
+
+bool HookFrameLatency(IDXGISwapChain* sc) {
+    if (!sc || s_latency_hooked.load(std::memory_order_acquire)) return false;
+
+    // Only hook if the swapchain was created with the waitable object flag.
+    // SetMaximumFrameLatency on IDXGISwapChain2 is only valid for waitable
+    // swapchains; calling it otherwise returns DXGI_ERROR_INVALID_CALL and
+    // can confuse some driver versions.
+    {
+        DXGI_SWAP_CHAIN_DESC desc{};
+        if (FAILED(sc->GetDesc(&desc)) ||
+            !(desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)) {
+            ul_log::Write("HookFrameLatency: skipped — swapchain not waitable (flags=0x%X)",
+                          desc.Flags);
+            return false;
+        }
+    }
+
+    // Need IDXGISwapChain2 for SetMaximumFrameLatency (vtable slots 31/32)
+    IDXGISwapChain2* sc2 = nullptr;
+    if (FAILED(sc->QueryInterface(__uuidof(IDXGISwapChain2), (void**)&sc2)) || !sc2)
+        return false;
+
+    void** vtable = *reinterpret_cast<void***>(sc2);
+    if (!vtable) { sc2->Release(); return false; }
+
+    // vtable[31] = SetMaximumFrameLatency, vtable[32] = GetMaximumFrameLatency
+    MH_STATUS st = MH_CreateHook(vtable[31], (void*)Hook_SetMaxFrameLatency,
+                                 (void**)&s_orig_set_max_latency);
+    if (st != MH_OK) {
+        ul_log::Write("HookFrameLatency: MH_CreateHook(Set) failed=%d", st);
+        sc2->Release();
+        return false;
+    }
+    if (MH_EnableHook(vtable[31]) != MH_OK) {
+        MH_RemoveHook(vtable[31]);
+        sc2->Release();
+        return false;
+    }
+
+    st = MH_CreateHook(vtable[32], (void*)Hook_GetMaxFrameLatency,
+                       (void**)&s_orig_get_max_latency);
+    if (st != MH_OK) {
+        ul_log::Write("HookFrameLatency: MH_CreateHook(Get) failed=%d", st);
+        // Set hook is already live, leave it — Get is optional
+    } else {
+        MH_EnableHook(vtable[32]);
+    }
+
+    s_latency_sc2 = sc2;  // keep the ref — do NOT Release here
+    s_latency_hooked.store(true, std::memory_order_release);
+
+    // If exclusive pacing is already enabled at startup, apply immediately.
+    // Call the trampoline directly to avoid going through our hook (which
+    // would overwrite s_game_latency with our override value).
+    if (g_cfg.exclusive_pacing.load(std::memory_order_relaxed) && s_orig_set_max_latency) {
+        s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(sc2), 1);
+        ul_log::Write("HookFrameLatency: applied initial override to 1");
+    }
+
+    ul_log::Write("HookFrameLatency: hooked SetMaximumFrameLatency/GetMaximumFrameLatency");
+    return true;
+}
+
+void ApplyFrameLatency() {
+    if (!s_latency_hooked.load(std::memory_order_acquire) || !s_latency_sc2) return;
+    if (!s_orig_set_max_latency) return;
+
+    // Call the trampoline directly — going through the vtable would hit our
+    // hook and corrupt s_game_latency with the override value.
+    if (g_cfg.exclusive_pacing.load(std::memory_order_relaxed)) {
+        s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(s_latency_sc2), 1);
+        ul_log::Write("ApplyFrameLatency: set to 1 (exclusive pacing ON)");
+    } else {
+        UINT restore = s_game_latency.load(std::memory_order_relaxed);
+        if (restore == 0) restore = 3;  // sensible default if game never called it
+        s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(s_latency_sc2), restore);
+        ul_log::Write("ApplyFrameLatency: restored to %u (exclusive pacing OFF)", restore);
+    }
 }

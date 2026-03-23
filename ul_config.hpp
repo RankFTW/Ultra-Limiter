@@ -57,7 +57,6 @@ struct UlConfig {
     // Custom sub-settings (only active when preset == Custom)
     std::atomic<bool> use_marker_pacing{true};
     std::atomic<int> max_queued_frames{0};
-    std::atomic<bool> sim_start_only{false};
     std::atomic<bool> delay_present{false};
     std::atomic<float> delay_present_amount{1.0f};  // in frame-times
     std::atomic<bool> use_sl_proxy{false};
@@ -86,6 +85,11 @@ struct UlConfig {
     // VSync override: 0 = no override, 1 = force on, 2 = force off
     std::atomic<int> vsync_override{0};
 
+    // 5XXX Exclusive Pacing Optimization (flip metering)
+    // When enabled, overrides IDXGISwapChain2::SetMaximumFrameLatency to 1,
+    // forcing single-frame queue depth for lowest input latency on NVIDIA 5XXX.
+    std::atomic<bool> exclusive_pacing{false};
+
     // Keybinds (virtual key codes)
     std::atomic<int> osd_toggle_key{VK_END};  // default: END
 };
@@ -96,7 +100,6 @@ extern UlConfig g_cfg;
 struct ExpandedSettings {
     bool use_marker_pacing;
     int max_queued_frames;
-    bool sim_start_only;
     bool delay_present;
     bool use_sl_proxy;
 };

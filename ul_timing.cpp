@@ -65,12 +65,29 @@ int64_t NowQpc() {
 }
 
 int64_t NowNs() {
-    return NowQpc() * g_ns_per_tick;
+    // Overflow-safe QPC-to-nanoseconds conversion.
+    // Naive `qpc * 1e9 / freq` overflows int64 after ~292 years at 1 GHz QPC,
+    // but `qpc * g_ns_per_tick` (the old code) loses precision when freq doesn't
+    // divide 1e9 evenly (e.g. 24 MHz → g_ns_per_tick=41 instead of 41.667,
+    // drifting ~0.27ms per 16ms frame).
+    //
+    // Split into whole-seconds + remainder to avoid both overflow and truncation:
+    //   ns = (qpc / freq) * 1e9  +  (qpc % freq) * 1e9 / freq
+    // The remainder term never exceeds freq * 1e9 which fits in int64 for any
+    // realistic QPC frequency (up to ~9.2 GHz).
+    int64_t qpc = NowQpc();
+    int64_t sec = qpc / g_qpc_freq;
+    int64_t rem = qpc % g_qpc_freq;
+    return sec * 1'000'000'000LL + rem * 1'000'000'000LL / g_qpc_freq;
 }
 
 void SleepUntilNs(int64_t target_ns, HANDLE& timer_handle) {
-    // Convert target to QPC ticks
-    int64_t target_qpc = target_ns / g_ns_per_tick;
+    // Convert target_ns to QPC ticks using the same overflow-safe approach.
+    // target_qpc = target_ns * freq / 1e9, split to avoid overflow.
+    int64_t target_sec = target_ns / 1'000'000'000LL;
+    int64_t target_rem = target_ns % 1'000'000'000LL;
+    int64_t target_qpc = target_sec * g_qpc_freq + target_rem * g_qpc_freq / 1'000'000'000LL;
+
     int64_t now = NowQpc();
     if (target_qpc <= now) return;
 
