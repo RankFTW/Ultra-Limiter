@@ -616,21 +616,45 @@ static const char* VkName(int vk) {
 
 // Returns a pressed VK code (scanning a useful range), or 0 if nothing pressed
 static int PollAnyKey() {
-    // F1-F12
-    for (int vk = VK_F1; vk <= VK_F12; vk++)
-        if (GetAsyncKeyState(vk) & 0x8000) return vk;
-    // Navigation keys
-    for (int vk : {VK_END, VK_HOME, VK_INSERT, VK_DELETE, VK_PAUSE, VK_SCROLL, VK_PRIOR, VK_NEXT})
-        if (GetAsyncKeyState(vk) & 0x8000) return vk;
-    // Numpad
-    for (int vk = VK_NUMPAD0; vk <= VK_DIVIDE; vk++)
-        if (GetAsyncKeyState(vk) & 0x8000) return vk;
-    // Letters
-    for (int vk = 0x41; vk <= 0x5A; vk++)
-        if (GetAsyncKeyState(vk) & 0x8000) return vk;
-    // Digits
-    for (int vk = 0x30; vk <= 0x39; vk++)
-        if (GetAsyncKeyState(vk) & 0x8000) return vk;
+    // Use ImGui key state — works reliably when the ReShade overlay is open.
+    // Returns a Windows VK code for storage in config.
+    struct { ImGuiKey imgui; int vk; } map[] = {
+        // F1-F12
+        {ImGuiKey_F1, VK_F1}, {ImGuiKey_F2, VK_F2}, {ImGuiKey_F3, VK_F3},
+        {ImGuiKey_F4, VK_F4}, {ImGuiKey_F5, VK_F5}, {ImGuiKey_F6, VK_F6},
+        {ImGuiKey_F7, VK_F7}, {ImGuiKey_F8, VK_F8}, {ImGuiKey_F9, VK_F9},
+        {ImGuiKey_F10, VK_F10}, {ImGuiKey_F11, VK_F11}, {ImGuiKey_F12, VK_F12},
+        // Navigation
+        {ImGuiKey_End, VK_END}, {ImGuiKey_Home, VK_HOME}, {ImGuiKey_Insert, VK_INSERT},
+        {ImGuiKey_Delete, VK_DELETE}, {ImGuiKey_Pause, VK_PAUSE},
+        {ImGuiKey_ScrollLock, VK_SCROLL}, {ImGuiKey_PageUp, VK_PRIOR},
+        {ImGuiKey_PageDown, VK_NEXT},
+        // Numpad
+        {ImGuiKey_Keypad0, VK_NUMPAD0}, {ImGuiKey_Keypad1, VK_NUMPAD1},
+        {ImGuiKey_Keypad2, VK_NUMPAD2}, {ImGuiKey_Keypad3, VK_NUMPAD3},
+        {ImGuiKey_Keypad4, VK_NUMPAD4}, {ImGuiKey_Keypad5, VK_NUMPAD5},
+        {ImGuiKey_Keypad6, VK_NUMPAD6}, {ImGuiKey_Keypad7, VK_NUMPAD7},
+        {ImGuiKey_Keypad8, VK_NUMPAD8}, {ImGuiKey_Keypad9, VK_NUMPAD9},
+        {ImGuiKey_KeypadMultiply, VK_MULTIPLY}, {ImGuiKey_KeypadAdd, VK_ADD},
+        {ImGuiKey_KeypadSubtract, VK_SUBTRACT}, {ImGuiKey_KeypadDecimal, VK_DECIMAL},
+        {ImGuiKey_KeypadDivide, VK_DIVIDE},
+        // Letters
+        {ImGuiKey_A, 0x41}, {ImGuiKey_B, 0x42}, {ImGuiKey_C, 0x43}, {ImGuiKey_D, 0x44},
+        {ImGuiKey_E, 0x45}, {ImGuiKey_F, 0x46}, {ImGuiKey_G, 0x47}, {ImGuiKey_H, 0x48},
+        {ImGuiKey_I, 0x49}, {ImGuiKey_J, 0x4A}, {ImGuiKey_K, 0x4B}, {ImGuiKey_L, 0x4C},
+        {ImGuiKey_M, 0x4D}, {ImGuiKey_N, 0x4E}, {ImGuiKey_O, 0x4F}, {ImGuiKey_P, 0x50},
+        {ImGuiKey_Q, 0x51}, {ImGuiKey_R, 0x52}, {ImGuiKey_S, 0x53}, {ImGuiKey_T, 0x54},
+        {ImGuiKey_U, 0x55}, {ImGuiKey_V, 0x56}, {ImGuiKey_W, 0x57}, {ImGuiKey_X, 0x58},
+        {ImGuiKey_Y, 0x59}, {ImGuiKey_Z, 0x5A},
+        // Digits
+        {ImGuiKey_0, 0x30}, {ImGuiKey_1, 0x31}, {ImGuiKey_2, 0x32}, {ImGuiKey_3, 0x33},
+        {ImGuiKey_4, 0x34}, {ImGuiKey_5, 0x35}, {ImGuiKey_6, 0x36}, {ImGuiKey_7, 0x37},
+        {ImGuiKey_8, 0x38}, {ImGuiKey_9, 0x39},
+    };
+    for (auto& m : map) {
+        if (ImGui::IsKeyPressed(m.imgui, false))
+            return m.vk;
+    }
     return 0;
 }
 
