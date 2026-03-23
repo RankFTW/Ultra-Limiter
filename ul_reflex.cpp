@@ -73,11 +73,13 @@ static MarkerCb s_marker_cb = nullptr;
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
 static PresentFn s_orig_present = nullptr;
 static std::atomic<bool> s_sl_hooked{false};
+static void* s_sl_hook_target = nullptr;  // vtable[8] address for SL proxy
 
 // VSync override Present hook (game's main swapchain)
 static PresentFn s_orig_game_present = nullptr;
 static std::atomic<bool> s_vsync_hooked{false};
 static std::atomic<bool> s_tearing_supported{false};
+static void* s_vsync_hook_target = nullptr;  // vtable[8] address for VSync
 
 // Frame-latency override (IDXGISwapChain2)
 using SetMaxFrameLatency_fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT);
@@ -87,6 +89,8 @@ static GetMaxFrameLatency_fn s_orig_get_max_latency = nullptr;
 static std::atomic<bool> s_latency_hooked{false};
 static std::atomic<UINT> s_game_latency{0};
 static IDXGISwapChain2* s_latency_sc2 = nullptr;
+static void* s_latency_set_target = nullptr;  // vtable[31] address
+static void* s_latency_get_target = nullptr;  // vtable[32] address
 
 // ============================================================================
 // Interface table lookup
@@ -432,13 +436,10 @@ void TeardownReflexHooks() {
     s_orig_sleep = nullptr;
     s_orig_marker = nullptr;
 
-    // Clean up frame latency hooks
-    if (s_latency_hooked.exchange(false, std::memory_order_acq_rel)) {
-        // MH_Uninitialize will handle the MinHook side, but release our COM ref
-        if (s_latency_sc2) { s_latency_sc2->Release(); s_latency_sc2 = nullptr; }
-        s_orig_set_max_latency = nullptr;
-        s_orig_get_max_latency = nullptr;
-    }
+    // Swapchain vtable hooks (latency, VSync, SL proxy) are cleaned up by
+    // ReleaseSwapchainHooks() in OnDestroySwapchain. But if we get here
+    // without that having run (e.g. abnormal shutdown), clean up anyway.
+    ReleaseSwapchainHooks();
 }
 
 bool ReflexActive() { return s_hooked.load(std::memory_order_acquire); }
@@ -488,6 +489,7 @@ bool HookSLProxy(IDXGISwapChain* sc) {
         return false;
     if (MH_EnableHook(vtable[8]) != MH_OK) { MH_RemoveHook(vtable[8]); return false; }
 
+    s_sl_hook_target = vtable[8];
     s_sl_hooked.store(true, std::memory_order_release);
     ul_log::Write("HookSLProxy: Present hooked");
     return true;
@@ -555,6 +557,7 @@ bool HookVSyncPresent(IDXGISwapChain* sc) {
         return false;
     if (MH_EnableHook(vtable[8]) != MH_OK) { MH_RemoveHook(vtable[8]); return false; }
 
+    s_vsync_hook_target = vtable[8];
     s_vsync_hooked.store(true, std::memory_order_release);
     ul_log::Write("HookVSyncPresent: Present hooked for VSync control");
     return true;
@@ -573,14 +576,32 @@ static HRESULT STDMETHODCALLTYPE Hook_SetMaxFrameLatency(IDXGISwapChain* sc, UIN
     // Remember what the game wanted so we can restore it if the user toggles off
     s_game_latency.store(MaxLatency, std::memory_order_relaxed);
 
+    // Determine the desired override value.
+    // Priority: exclusive_pacing (force 1) > max_queued_frames from preset > passthrough.
+    UINT target = MaxLatency;
+    const char* reason = nullptr;
+
     if (g_cfg.exclusive_pacing.load(std::memory_order_relaxed)) {
-        // Throttle logging — only log the first override and when the value changes
-        static UINT s_last_logged = UINT_MAX;
-        if (MaxLatency != s_last_logged) {
-            ul_log::Write("Hook_SetMaxFrameLatency: game requested %u, overriding to 1", MaxLatency);
-            s_last_logged = MaxLatency;
+        target = 1;
+        reason = "exclusive_pacing";
+    } else {
+        ExpandedSettings es = ExpandPreset();
+        if (es.max_queued_frames > 0) {
+            target = static_cast<UINT>(es.max_queued_frames);
+            reason = "max_queued_frames";
         }
-        MaxLatency = 1;
+    }
+
+    if (target != MaxLatency) {
+        static UINT s_last_logged_game = UINT_MAX;
+        static UINT s_last_logged_target = UINT_MAX;
+        if (MaxLatency != s_last_logged_game || target != s_last_logged_target) {
+            ul_log::Write("Hook_SetMaxFrameLatency: game requested %u, overriding to %u (%s)",
+                          MaxLatency, target, reason);
+            s_last_logged_game = MaxLatency;
+            s_last_logged_target = target;
+        }
+        MaxLatency = target;
     }
 
     return s_orig_set_max_latency ? s_orig_set_max_latency(sc, MaxLatency) : E_FAIL;
@@ -637,6 +658,7 @@ bool HookFrameLatency(IDXGISwapChain* sc) {
         sc2->Release();
         return false;
     }
+    s_latency_set_target = vtable[31];
 
     st = MH_CreateHook(vtable[32], (void*)Hook_GetMaxFrameLatency,
                        (void**)&s_orig_get_max_latency);
@@ -645,17 +667,27 @@ bool HookFrameLatency(IDXGISwapChain* sc) {
         // Set hook is already live, leave it — Get is optional
     } else {
         MH_EnableHook(vtable[32]);
+        s_latency_get_target = vtable[32];
     }
 
     s_latency_sc2 = sc2;  // keep the ref — do NOT Release here
     s_latency_hooked.store(true, std::memory_order_release);
 
-    // If exclusive pacing is already enabled at startup, apply immediately.
+    // Apply initial override if needed at startup.
     // Call the trampoline directly to avoid going through our hook (which
     // would overwrite s_game_latency with our override value).
-    if (g_cfg.exclusive_pacing.load(std::memory_order_relaxed) && s_orig_set_max_latency) {
-        s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(sc2), 1);
-        ul_log::Write("HookFrameLatency: applied initial override to 1");
+    if (s_orig_set_max_latency) {
+        if (g_cfg.exclusive_pacing.load(std::memory_order_relaxed)) {
+            s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(sc2), 1);
+            ul_log::Write("HookFrameLatency: applied initial override to 1 (exclusive pacing)");
+        } else {
+            ExpandedSettings es = ExpandPreset();
+            if (es.max_queued_frames > 0) {
+                UINT val = static_cast<UINT>(es.max_queued_frames);
+                s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(sc2), val);
+                ul_log::Write("HookFrameLatency: applied initial override to %u (max_queued_frames)", val);
+            }
+        }
     }
 
     ul_log::Write("HookFrameLatency: hooked SetMaximumFrameLatency/GetMaximumFrameLatency");
@@ -672,9 +704,58 @@ void ApplyFrameLatency() {
         s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(s_latency_sc2), 1);
         ul_log::Write("ApplyFrameLatency: set to 1 (exclusive pacing ON)");
     } else {
-        UINT restore = s_game_latency.load(std::memory_order_relaxed);
-        if (restore == 0) restore = 3;  // sensible default if game never called it
-        s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(s_latency_sc2), restore);
-        ul_log::Write("ApplyFrameLatency: restored to %u (exclusive pacing OFF)", restore);
+        ExpandedSettings es = ExpandPreset();
+        if (es.max_queued_frames > 0) {
+            UINT val = static_cast<UINT>(es.max_queued_frames);
+            s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(s_latency_sc2), val);
+            ul_log::Write("ApplyFrameLatency: set to %u (max_queued_frames)", val);
+        } else {
+            UINT restore = s_game_latency.load(std::memory_order_relaxed);
+            if (restore == 0) restore = 3;  // sensible default if game never called it
+            s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(s_latency_sc2), restore);
+            ul_log::Write("ApplyFrameLatency: restored to %u (game default)", restore);
+        }
+    }
+}
+
+void ReleaseSwapchainHooks() {
+    // Disable and remove swapchain vtable hooks before the swapchain is freed.
+    // This prevents MH_Uninitialize from touching stale memory during shutdown.
+
+    if (s_sl_hooked.exchange(false, std::memory_order_acq_rel)) {
+        if (s_sl_hook_target) {
+            MH_DisableHook(s_sl_hook_target);
+            MH_RemoveHook(s_sl_hook_target);
+            s_sl_hook_target = nullptr;
+        }
+        s_orig_present = nullptr;
+        ul_log::Write("ReleaseSwapchainHooks: SL proxy released");
+    }
+
+    if (s_vsync_hooked.exchange(false, std::memory_order_acq_rel)) {
+        if (s_vsync_hook_target) {
+            MH_DisableHook(s_vsync_hook_target);
+            MH_RemoveHook(s_vsync_hook_target);
+            s_vsync_hook_target = nullptr;
+        }
+        s_orig_game_present = nullptr;
+        ul_log::Write("ReleaseSwapchainHooks: VSync present released");
+    }
+
+    if (s_latency_hooked.exchange(false, std::memory_order_acq_rel)) {
+        if (s_latency_set_target) {
+            MH_DisableHook(s_latency_set_target);
+            MH_RemoveHook(s_latency_set_target);
+            s_latency_set_target = nullptr;
+        }
+        if (s_latency_get_target) {
+            MH_DisableHook(s_latency_get_target);
+            MH_RemoveHook(s_latency_get_target);
+            s_latency_get_target = nullptr;
+        }
+        s_orig_set_max_latency = nullptr;
+        s_orig_get_max_latency = nullptr;
+        if (s_latency_sc2) { s_latency_sc2->Release(); s_latency_sc2 = nullptr; }
+        ul_log::Write("ReleaseSwapchainHooks: frame latency released");
     }
 }

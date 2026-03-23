@@ -205,8 +205,14 @@ int UlLimiter::DetectFGDivisor() const {
         case FGMultiplier::X3:  return 3;
         case FGMultiplier::X4:  return 4;
         case FGMultiplier::Auto:
-            // Check if DLSS Frame Generation DLL is loaded
-            if (GetModuleHandleW(L"nvngx_dlssg.dll")) return 2;
+            // Check all known DLSS Frame Generation DLL variants
+            if (GetModuleHandleW(L"nvngx_dlssg.dll"))  return 2;
+            if (GetModuleHandleW(L"_nvngx_dlssg.dll")) return 2;
+            if (GetModuleHandleW(L"sl.dlss_g.dll"))    return 2;
+            if (GetModuleHandleW(L"dlss-g.dll"))       return 2;
+            // FSR Frame Generation
+            if (GetModuleHandleW(L"amd_fidelityfx_framegeneration.dll")) return 2;
+            if (GetModuleHandleW(L"ffx_framegeneration.dll"))            return 2;
             return 1;
     }
     return 1;

@@ -1000,14 +1000,12 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
 }
 
 static void OnDestroySwapchain(reshade::api::swapchain* sc, bool) {
-    // Reset VSync and frame-latency hooks so they can be re-installed on the
-    // next swapchain.  The vtable hooks themselves remain valid (MinHook patches
-    // the function prologue, not the vtable pointer), but the COM reference we
-    // hold to IDXGISwapChain2 must be released to avoid use-after-free.
-    // TeardownReflexHooks handles the latency hook cleanup.
-    // We intentionally do NOT tear down the NVAPI Reflex hooks here — those are
-    // function-level hooks that survive swapchain recreation.
     ul_log::Write("OnDestroySwapchain");
+    // Release swapchain vtable hooks (SL proxy, VSync, frame latency) before
+    // the swapchain is freed. This prevents use-after-free when MinHook tries
+    // to restore the original function prologues during MH_Uninitialize.
+    // NVAPI Reflex hooks are function-level (not vtable) and survive this.
+    ReleaseSwapchainHooks();
 }
 
 // Track render resolution via viewport dimensions.
