@@ -603,9 +603,9 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
     if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
 
     // Quick-select buttons
-    // Reflex cap formula: fps = refresh - (refresh^2 / 4096)
+    // Reflex cap formula: fps = refresh - (refresh^2 / 3600)
     int hz = GetMonitorRefreshRate();
-    float reflex_cap = static_cast<float>(hz) - (static_cast<float>(hz) * static_cast<float>(hz) / 4096.0f);
+    float reflex_cap = static_cast<float>(hz) - (static_cast<float>(hz) * static_cast<float>(hz) / 3600.0f);
     reflex_cap = std::floor(reflex_cap);  // always round down
     if (reflex_cap < 1.0f) reflex_cap = 57.0f;
     int presets[] = { 30, 60, 120, 240, static_cast<int>(reflex_cap) };

@@ -6,8 +6,8 @@ Core Features
 
 FPS Limit
   Slider 0-500. Quick buttons: 30, 60, 120, 240, Reflex Cap.
-  Reflex Cap formula: fps = refresh - (refresh^2 / 4096), floored.
-  Example: 165 Hz -> 165 - (27225/4096) = 165 - 6.64 = 158.
+  Reflex Cap formula: fps = refresh - (refresh^2 / 3600), floored.
+  Example: 165 Hz -> 165 - (27225/3600) = 165 - 7.56 = 157.
 
 VSync Override
   Game (passthrough), On (SyncInterval=1), Off (SyncInterval=0 + ALLOW_TEARING).

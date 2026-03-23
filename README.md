@@ -59,10 +59,10 @@ Quick-select buttons are provided for common targets:
 - **Reflex (N)** — calculated from your monitor's refresh rate using the Reflex cap formula:
 
 ```
-FPS Cap = Refresh Rate - (Refresh Rate² / 4096)
+FPS Cap = Refresh Rate - (Refresh Rate² / 3600)
 ```
 
-For a 165 Hz monitor: 165² = 27,225 → 27,225 / 4096 ≈ 6.64 → 165 - 6.64 = 158.36 → floored to **158 FPS**.
+For a 165 Hz monitor: 165² = 27,225 → 27,225 / 3600 ≈ 7.56 → 165 - 7.56 = 157.44 → floored to **157 FPS**.
 
 This is the sweet spot for Reflex-based pacing — just below the display's native rate so the driver always has a frame ready without exceeding the VSync window.
 
