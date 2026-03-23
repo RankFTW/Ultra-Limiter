@@ -20,9 +20,9 @@ jobs:
       - name: Clone dependencies
         run: |
           git clone --depth 1 https://github.com/TsudaKageyu/minhook external/minhook
-          git clone --depth 1 https://github.com/crosire/reshade external/reshade
+          git clone --depth 1 --branch v6.7.3 https://github.com/crosire/reshade external/reshade
           git clone --depth 1 https://github.com/NVIDIA/nvapi external/nvapi
-          git clone --depth 1 https://github.com/ocornut/imgui external/imgui
+          git clone --depth 1 --branch v1.92.5-docking https://github.com/ocornut/imgui external/imgui
 
       - name: Configure
         run: cmake -B build -G "Visual Studio 17 2022" -A x64
