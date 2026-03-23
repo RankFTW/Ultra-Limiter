@@ -51,6 +51,11 @@ static GameReflexState s_game_state;
 static NvQueryInterface_fn s_orig_qi = nullptr;
 static constexpr NvU32 kSetFlipConfigId = 0xF3148C42;
 
+// Safe mode: REFramework + Streamline detected.
+// When set, swapchain vtable hooks are skipped to avoid crashing Streamline's
+// internal swapchain management during recreation.
+static std::atomic<bool> s_streamline_safe_mode{false};
+
 // Out-of-band INPUT_SAMPLE reordering state.
 // INPUT_SAMPLE must arrive between SIM_START and SIM_END to be valid.
 // If a game fires it at the wrong time, we queue it and re-inject it
@@ -136,7 +141,29 @@ static bool LoadNvapi() {
     if (!qi) { ul_log::Write("LoadNvapi: nvapi_QueryInterface not found"); return false; }
 
     // Hook QueryInterface to block flip metering (SetFlipConfig)
-    if (MH_CreateHook(reinterpret_cast<void*>(qi), reinterpret_cast<void*>(Hook_QueryInterface),
+    // Skip entirely when REFramework is present — its Streamline integration
+    // calls nvapi_QueryInterface during swapchain recreation and blocking
+    // SetFlipConfig at that point causes a hard crash in sl.dlss_g.dll.
+    // REFramework can appear as reframework.dll or load via dinput8.dll.
+    // When dinput8.dll is present alongside Streamline (sl.common.dll), the
+    // QI hook blocking SetFlipConfig during swapchain recreation crashes
+    // sl.dlss_g.dll. Check all known indicators.
+    bool reframework = GetModuleHandleW(L"reframework.dll") != nullptr
+                    || GetModuleHandleW(L"REFramework.dll") != nullptr;
+    if (!reframework) {
+        // dinput8.dll is REFramework's proxy DLL in RE Engine games.
+        // Only treat it as REFramework if Streamline is also present —
+        // dinput8.dll alone (e.g. from other mods) is harmless.
+        bool dinput8 = GetModuleHandleW(L"dinput8.dll") != nullptr;
+        bool streamline = GetModuleHandleW(L"sl.common.dll") != nullptr
+                       || GetModuleHandleW(L"sl.dlss_g.dll") != nullptr;
+        if (dinput8 && streamline) reframework = true;
+    }
+    if (reframework) {
+        ul_log::Write("LoadNvapi: REFramework detected — skipping QueryInterface hook (crash prevention)");
+        s_orig_qi = nullptr;
+        s_streamline_safe_mode.store(true, std::memory_order_release);
+    } else if (MH_CreateHook(reinterpret_cast<void*>(qi), reinterpret_cast<void*>(Hook_QueryInterface),
                        reinterpret_cast<void**>(&s_orig_qi)) == MH_OK) {
         if (MH_EnableHook(reinterpret_cast<void*>(qi)) == MH_OK) {
             ul_log::Write("LoadNvapi: QueryInterface hooked (flip metering block active)");
@@ -428,8 +455,20 @@ NvStatus InvokeSetMarker(IUnknown* dev, NvMarkerParams* p) {
     return (s_orig_marker && dev) ? s_orig_marker(dev, p) : NV_NO_IMPL;
 }
 
+// Global flag to disable GetLatency calls (set when conflicting frameworks detected)
+static std::atomic<bool> s_getlatency_blocked{false};
+
 NvStatus InvokeGetLatency(IUnknown* dev, NvLatencyResult* p) {
+    if (s_getlatency_blocked.load(std::memory_order_relaxed)) return NV_NO_IMPL;
     return (s_get_latency && dev) ? s_get_latency(dev, p) : NV_NO_IMPL;
+}
+
+void BlockGetLatency() {
+    s_getlatency_blocked.store(true, std::memory_order_relaxed);
+}
+
+bool IsStreamlineSafeMode() {
+    return s_streamline_safe_mode.load(std::memory_order_acquire);
 }
 
 const GameReflexState& GetGameState() { return s_game_state; }

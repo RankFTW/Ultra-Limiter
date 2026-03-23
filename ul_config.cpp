@@ -13,9 +13,49 @@ static char s_ini[MAX_PATH] = {};
 // --- Helpers ---
 
 static bool BuildIniPath(HMODULE mod, char* out, size_t sz) {
-    if (!GetModuleFileNameA(mod, out, static_cast<DWORD>(sz))) return false;
-    char* dot = strrchr(out, '.');
-    if (dot && sz - static_cast<size_t>(dot - out) >= 5) { strcpy(dot, ".ini"); return true; }
+    wchar_t wpath[MAX_PATH] = {};
+
+    // Try next to the game executable first.
+    // The addon DLL may be loaded from a proxy directory (e.g. REFramework's
+    // _storage_ folder), so the game exe directory is the most predictable
+    // and user-visible location.
+    if (GetModuleFileNameW(nullptr, wpath, MAX_PATH)) {
+        wchar_t* slash = wcsrchr(wpath, L'\\');
+        if (slash) {
+            wcscpy(slash + 1, L"ultra_limiter.ini");
+            HANDLE h = CreateFileW(wpath, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                   OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                CloseHandle(h);
+                WideCharToMultiByte(CP_ACP, 0, wpath, -1, out, static_cast<int>(sz), nullptr, nullptr);
+                OutputDebugStringA("[UL] INI path: next to game exe");
+                return true;
+            }
+            {
+                char dbg[256];
+                snprintf(dbg, sizeof(dbg), "[UL] BuildIniPath: game dir write failed, err=%lu", GetLastError());
+                OutputDebugStringA(dbg);
+            }
+        }
+    }
+
+    // Fallback: next to the addon DLL
+    wpath[0] = L'\0';
+    if (mod && GetModuleFileNameW(mod, wpath, MAX_PATH)) {
+        wchar_t* dot = wcsrchr(wpath, L'.');
+        if (dot) {
+            wcscpy(dot, L".ini");
+            HANDLE h = CreateFileW(wpath, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                   OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                CloseHandle(h);
+                WideCharToMultiByte(CP_ACP, 0, wpath, -1, out, static_cast<int>(sz), nullptr, nullptr);
+                OutputDebugStringA("[UL] INI path: next to addon DLL");
+                return true;
+            }
+        }
+    }
+    OutputDebugStringA("[UL] BuildIniPath: all paths failed");
     return false;
 }
 

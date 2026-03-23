@@ -128,6 +128,34 @@ static void OnMarkerOSD(int mt, uint64_t) {
 // GPU latency polling
 // ============================================================================
 
+// Detect hook-heavy frameworks that conflict with GetLatency calls.
+// REFramework (dinput8.dll) hooks deeply into the rendering pipeline and
+// can cause hard crashes when GetLatency reads the driver's frame report
+// ring buffer. When detected, all GetLatency calls are disabled.
+static bool s_reframework_checked = false;
+
+static void DetectConflictingFrameworks() {
+    if (s_reframework_checked) return;
+
+    bool reframework = GetModuleHandleW(L"reframework.dll") != nullptr
+                    || GetModuleHandleW(L"REFramework.dll") != nullptr;
+
+    // dinput8.dll is REFramework's proxy DLL in RE Engine games.
+    // Only treat as REFramework if Streamline is also present.
+    if (!reframework) {
+        bool dinput8 = GetModuleHandleW(L"dinput8.dll") != nullptr;
+        bool streamline = GetModuleHandleW(L"sl.common.dll") != nullptr
+                       || GetModuleHandleW(L"sl.dlss_g.dll") != nullptr;
+        if (dinput8 && streamline) reframework = true;
+    }
+
+    if (reframework) {
+        BlockGetLatency();
+        ul_log::Write("REFramework detected — GetLatency disabled (crash prevention)");
+        s_reframework_checked = true;
+    }
+}
+
 static NvStatus SafeGetLatency(IUnknown* dev, NvLatencyResult* r) {
     __try { return InvokeGetLatency(dev, r); }
     __except(EXCEPTION_EXECUTE_HANDLER) { return NV_NO_IMPL; }
@@ -830,6 +858,10 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
     if (!sc) return;
 
     __try {
+        ul_log::Write("OnInitSwapchain: enter");
+
+        DetectConflictingFrameworks();
+
         HWND hwnd = static_cast<HWND>(sc->get_hwnd());
         if (hwnd) s_hwnd = hwnd;
         if (hwnd) s_limiter.SetHwnd(hwnd);
@@ -841,7 +873,7 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
         }
 
         reshade::api::device* dev = sc->get_device();
-        if (!dev) return;
+        if (!dev) { ul_log::Write("OnInitSwapchain: no device"); return; }
 
         auto api = dev->get_api();
         ul_log::Write("OnInitSwapchain: api=%d", (int)api);
@@ -863,29 +895,52 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
         }
 
         UpdateFGString();
+        ul_log::Write("OnInitSwapchain: FG=%s", s_fg_str);
 
         if (native) {
             s_reflex_dev = native;
+            ul_log::Write("OnInitSwapchain: ConnectReflex...");
             s_limiter.ConnectReflex(native);
+            ul_log::Write("OnInitSwapchain: ConnectReflex done");
         }
 
         ExpandedSettings es = ExpandPreset();
-        if (es.use_sl_proxy) {
+        if (es.use_sl_proxy && !IsStreamlineSafeMode()) {
             auto nsc = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
-            if (nsc) HookSLProxy(nsc);
+            if (nsc) {
+                ul_log::Write("OnInitSwapchain: HookSLProxy...");
+                HookSLProxy(nsc);
+            }
+        } else if (es.use_sl_proxy) {
+            ul_log::Write("OnInitSwapchain: skipping SL proxy hook (Streamline safe mode)");
         }
 
         // Hook Present for VSync override (only if SL proxy didn't already hook it)
-        {
+        // Skip when in Streamline safe mode — vtable hooks on Streamline-managed
+        // swapchains cause crashes during swapchain recreation.
+        if (!IsStreamlineSafeMode()) {
             auto nsc = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
-            if (nsc) HookVSyncPresent(nsc);
+            if (nsc) {
+                ul_log::Write("OnInitSwapchain: HookVSyncPresent...");
+                HookVSyncPresent(nsc);
+            }
+        } else {
+            ul_log::Write("OnInitSwapchain: skipping VSync hook (Streamline safe mode)");
         }
 
         // Hook SetMaximumFrameLatency for 5XXX Exclusive Pacing Optimization
-        {
+        // Also skip in Streamline safe mode.
+        if (!IsStreamlineSafeMode()) {
             auto nsc = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
-            if (nsc) HookFrameLatency(nsc);
+            if (nsc) {
+                ul_log::Write("OnInitSwapchain: HookFrameLatency...");
+                HookFrameLatency(nsc);
+            }
+        } else {
+            ul_log::Write("OnInitSwapchain: skipping FrameLatency hook (Streamline safe mode)");
         }
+
+        ul_log::Write("OnInitSwapchain: done");
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         ul_log::Write("OnInitSwapchain: exception 0x%08X", GetExceptionCode());
     }
@@ -1005,15 +1060,20 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     switch (reason) {
     case DLL_PROCESS_ATTACH:
+        // Initialize logging FIRST so any crash during startup is captured.
+        ul_log::Initialize(hModule);
+
         s_prev_filter = SetUnhandledExceptionFilter(CrashHandler);
 
         if (!reshade::register_addon(hModule)) {
+            ul_log::Write("FATAL: reshade::register_addon failed");
             SetUnhandledExceptionFilter(s_prev_filter);
             return FALSE;
         }
 
-        ul_log::Initialize(hModule);
         ul_log::Write("=== Ultra Limiter (clean-room) starting ===");
+
+        DetectConflictingFrameworks();
 
         if (!ul_timing::Init()) {
             ul_log::Write("FATAL: timing init failed");
@@ -1022,7 +1082,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             return FALSE;
         }
 
-        LoadSettings(hModule);
+        __try {
+            LoadSettings(hModule);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            ul_log::Write("FATAL: LoadSettings exception 0x%08X", GetExceptionCode());
+            reshade::unregister_addon(hModule);
+            SetUnhandledExceptionFilter(s_prev_filter);
+            return FALSE;
+        }
 
         if (MH_Initialize() != MH_OK) {
             ul_log::Write("FATAL: MH_Initialize failed");
@@ -1031,18 +1098,26 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             return FALSE;
         }
 
-        s_limiter.Init();
+        __try {
+            s_limiter.Init();
 
-        SetSLPresentCb(OnSLPresentCb);
-        SetMarkerCb(OnMarkerCb);
-        StartWorker();
+            SetSLPresentCb(OnSLPresentCb);
+            SetMarkerCb(OnMarkerCb);
+            StartWorker();
 
-        reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
-        reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
-        reshade::register_event<reshade::addon_event::bind_viewports>(OnBindViewports);
-        reshade::register_event<reshade::addon_event::present>(OnPresent);
-        reshade::register_overlay("Ultra Limiter", DrawOverlay);
-        reshade::register_event<reshade::addon_event::reshade_overlay>(DrawOSD);
+            reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+            reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
+            reshade::register_event<reshade::addon_event::bind_viewports>(OnBindViewports);
+            reshade::register_event<reshade::addon_event::present>(OnPresent);
+            reshade::register_overlay("Ultra Limiter", DrawOverlay);
+            reshade::register_event<reshade::addon_event::reshade_overlay>(DrawOSD);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            ul_log::Write("FATAL: event registration exception 0x%08X", GetExceptionCode());
+            MH_Uninitialize();
+            reshade::unregister_addon(hModule);
+            SetUnhandledExceptionFilter(s_prev_filter);
+            return FALSE;
+        }
         ul_log::Write("All events registered");
         break;
 

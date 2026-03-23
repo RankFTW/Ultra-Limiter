@@ -144,6 +144,7 @@ NvStatus InvokeSetSleepMode(IUnknown* dev, NvSleepParams* p);
 NvStatus InvokeSleep(IUnknown* dev);
 NvStatus InvokeSetMarker(IUnknown* dev, NvMarkerParams* p);
 NvStatus InvokeGetLatency(IUnknown* dev, NvLatencyResult* p);
+void BlockGetLatency();  // Disable all GetLatency calls (crash prevention)
 
 const GameReflexState& GetGameState();
 
@@ -163,6 +164,11 @@ bool HookFrameLatency(IDXGISwapChain* sc);
 
 // Re-apply the frame latency override (call after config changes at runtime).
 void ApplyFrameLatency();
+
+// Returns true when REFramework + Streamline is detected.
+// In this mode, swapchain vtable hooks (VSync Present, FrameLatency) are
+// skipped to avoid crashing Streamline's swapchain management.
+bool IsStreamlineSafeMode();
 
 using SLPresentCb = void(*)();
 void SetSLPresentCb(SLPresentCb cb);
