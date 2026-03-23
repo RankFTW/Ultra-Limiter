@@ -240,7 +240,8 @@ static void DrawOSD(reshade::api::effect_runtime*) {
     if (!dl) return;
 
     float x = g_cfg.osd_x.load(std::memory_order_relaxed);
-    float y = g_cfg.osd_y.load(std::memory_order_relaxed) + 8.0f;
+    float y_start = g_cfg.osd_y.load(std::memory_order_relaxed) + 8.0f;
+    float y = y_start;
     constexpr float lh = 18.0f, gap = 4.0f, pad = 8.0f;
     const ImU32 white = IM_COL32(255, 255, 255, 255);
     const ImU32 green = IM_COL32(100, 255, 100, 200);
@@ -258,38 +259,55 @@ static void DrawOSD(reshade::api::effect_runtime*) {
     float disp_native_fps = (sm && has_nat) ? s_fps : s_native_fps;
     float disp_native_ft = (sm && has_nat) ? s_ft_ms : s_native_ft_ms;
 
+    // --- Measure pass: compute text lines and track max width ---
+    struct OsdLine { char text[64]; ImU32 color; };
+    OsdLine lines[16];
+    int line_count = 0;
+    float max_w = 0.0f;
+    bool has_graph = false;
+
+    auto add_line = [&](const char* txt, ImU32 col) {
+        if (line_count >= 16) return;
+        strncpy(lines[line_count].text, txt, sizeof(lines[0].text) - 1);
+        lines[line_count].text[sizeof(lines[0].text) - 1] = '\0';
+        lines[line_count].color = col;
+        ImVec2 sz = ImGui::CalcTextSize(lines[line_count].text);
+        if (sz.x > max_w) max_w = sz.x;
+        line_count++;
+    };
+
     if (g_cfg.show_fps.load(std::memory_order_relaxed)) {
         snprintf(buf, sizeof(buf), "FPS: %.1f", disp_fps);
-        dl->AddText(ImVec2(x + pad, y), white, buf); y += lh + gap;
+        add_line(buf, white);
     }
     if (g_cfg.show_native_fps.load(std::memory_order_relaxed) && s_has_native.load(std::memory_order_relaxed)) {
         snprintf(buf, sizeof(buf), "Native: %.1f FPS (%.2f ms)", disp_native_fps, disp_native_ft);
-        dl->AddText(ImVec2(x + pad, y), white, buf); y += lh + gap;
+        add_line(buf, white);
     }
     if (g_cfg.show_frametime.load(std::memory_order_relaxed)) {
         snprintf(buf, sizeof(buf), "Frame: %.2f ms", s_ft_ms);
-        dl->AddText(ImVec2(x + pad, y), white, buf); y += lh + gap;
+        add_line(buf, white);
     }
 
     bool gpu = s_has_gpu.load(std::memory_order_relaxed);
     if (gpu && g_cfg.show_gpu_time.load(std::memory_order_relaxed)) {
         snprintf(buf, sizeof(buf), "GPU: %.2f ms", s_gpu_ms);
-        dl->AddText(ImVec2(x + pad, y), cyan, buf); y += lh + gap;
+        add_line(buf, cyan);
     }
     if (gpu && g_cfg.show_render_lat.load(std::memory_order_relaxed)) {
         snprintf(buf, sizeof(buf), "Render Lat: %.2f ms", s_render_lat_ms);
-        dl->AddText(ImVec2(x + pad, y), cyan, buf); y += lh + gap;
+        add_line(buf, cyan);
     }
     if (gpu && g_cfg.show_present_lat.load(std::memory_order_relaxed)) {
         snprintf(buf, sizeof(buf), "Present Lat: %.2f ms", s_present_lat_ms);
-        dl->AddText(ImVec2(x + pad, y), cyan, buf); y += lh + gap;
+        add_line(buf, cyan);
     }
 
     if (g_cfg.show_fg_mode.load(std::memory_order_relaxed)) {
         int64_t now = ul_timing::NowQpc();
         if (now - s_fg_check_qpc > ul_timing::g_qpc_freq) { UpdateFGString(); s_fg_check_qpc = now; }
         snprintf(buf, sizeof(buf), "FG: %s", s_fg_str);
-        dl->AddText(ImVec2(x + pad, y), gold, buf); y += lh + gap;
+        add_line(buf, gold);
     }
 
     if (g_cfg.show_resolution.load(std::memory_order_relaxed)) {
@@ -303,24 +321,53 @@ static void DrawOSD(reshade::api::effect_runtime*) {
         } else {
             snprintf(buf, sizeof(buf), "Res: --");
         }
-        dl->AddText(ImVec2(x + pad, y), gold, buf); y += lh + gap;
+        add_line(buf, gold);
     }
 
-    // Frametime graph
-    if (g_cfg.show_graph.load(std::memory_order_relaxed)) {
+    has_graph = g_cfg.show_graph.load(std::memory_order_relaxed) &&
+                ((s_ft_idx < kHistLen ? s_ft_idx : kHistLen) > 1);
+
+    if (line_count == 0 && !has_graph) return;
+
+    // --- Compute bounding box ---
+    float content_h = line_count * (lh + gap);
+    constexpr float graph_w = 160.0f, graph_h = 40.0f;
+    if (has_graph) content_h += graph_h + gap;
+    float content_w = max_w + pad * 2;
+    if (has_graph && (graph_w + pad * 2) > content_w) content_w = graph_w + pad * 2;
+
+    // --- Draw background ---
+    int bg_pct = g_cfg.osd_bg_opacity.load(std::memory_order_relaxed);
+    if (bg_pct > 0) {
+        if (bg_pct > 100) bg_pct = 100;
+        uint8_t alpha = static_cast<uint8_t>(bg_pct * 255 / 100);
+        ImU32 bg_col = IM_COL32(0, 0, 0, alpha);
+        float margin = 4.0f;
+        dl->AddRectFilled(
+            ImVec2(x, y_start - margin),
+            ImVec2(x + content_w, y_start + content_h + margin),
+            bg_col, 4.0f);
+    }
+
+    // --- Draw text lines ---
+    for (int i = 0; i < line_count; i++) {
+        dl->AddText(ImVec2(x + pad, y), lines[i].color, lines[i].text);
+        y += lh + gap;
+    }
+
+    // --- Frametime graph ---
+    if (has_graph) {
         int count = (s_ft_idx < kHistLen) ? s_ft_idx : kHistLen;
-        if (count > 1) {
-            float gmax = 33.3f;
-            for (int i = 0; i < count; i++) if (s_ft_hist[i] > gmax) gmax = s_ft_hist[i];
-            float gx = x + pad, step = 160.0f / static_cast<float>(count - 1);
-            for (int i = 0; i < count - 1; i++) {
-                int i0 = (s_ft_idx - count + i + kHistLen) % kHistLen;
-                int i1 = (s_ft_idx - count + i + 1 + kHistLen) % kHistLen;
-                float v0 = s_ft_hist[i0] / (gmax * 1.1f); if (v0 > 1) v0 = 1;
-                float v1 = s_ft_hist[i1] / (gmax * 1.1f); if (v1 > 1) v1 = 1;
-                dl->AddLine(ImVec2(gx + step * i, y + 40 * (1 - v0)),
-                            ImVec2(gx + step * (i + 1), y + 40 * (1 - v1)), green, 1.5f);
-            }
+        float gmax = 33.3f;
+        for (int i = 0; i < count; i++) if (s_ft_hist[i] > gmax) gmax = s_ft_hist[i];
+        float gx = x + pad, step = graph_w / static_cast<float>(count - 1);
+        for (int i = 0; i < count - 1; i++) {
+            int i0 = (s_ft_idx - count + i + kHistLen) % kHistLen;
+            int i1 = (s_ft_idx - count + i + 1 + kHistLen) % kHistLen;
+            float v0 = s_ft_hist[i0] / (gmax * 1.1f); if (v0 > 1) v0 = 1;
+            float v1 = s_ft_hist[i1] / (gmax * 1.1f); if (v1 > 1) v1 = 1;
+            dl->AddLine(ImVec2(gx + step * i, y + graph_h * (1 - v0)),
+                        ImVec2(gx + step * (i + 1), y + graph_h * (1 - v1)), green, 1.5f);
         }
     }
 }
@@ -746,6 +793,12 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
             toggle("Present Latency", g_cfg.show_present_lat, "Present start-to-end latency.");
             toggle("FG Mode", g_cfg.show_fg_mode, "Detected frame generation technology.");
             toggle("Output Resolution", g_cfg.show_resolution, "Render and output resolution with scale %.");
+
+            ImGui::Spacing();
+            int bg_op = g_cfg.osd_bg_opacity.load(std::memory_order_relaxed);
+            if (ImGui::SliderInt("Background", &bg_op, 0, 100, "%d%%")) { g_cfg.osd_bg_opacity.store(bg_op); }
+            if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("OSD background opacity. 0 = transparent, 100 = solid black.");
         }
         ImGui::Unindent(8);
     }

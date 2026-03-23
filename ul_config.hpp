@@ -92,6 +92,9 @@ struct UlConfig {
 
     // Keybinds (virtual key codes)
     std::atomic<int> osd_toggle_key{VK_END};  // default: END
+
+    // OSD background opacity (0 = invisible, 100 = solid black)
+    std::atomic<int> osd_bg_opacity{0};
 };
 
 extern UlConfig g_cfg;
