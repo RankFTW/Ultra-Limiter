@@ -10,16 +10,17 @@ This guide covers every feature in detail, including the adaptive systems that r
 
 1. [Installation](#installation)
 2. [FPS Limit](#fps-limit)
-3. [VSync Override](#vsync-override)
-4. [5XXX Exclusive Pacing Optimization](#5xxx-exclusive-pacing-optimization)
-5. [FG Mode (Frame Generation)](#fg-mode-frame-generation)
-6. [Boost Override](#boost-override)
-7. [Pacing Presets](#pacing-presets)
-8. [Display & OSD](#display--osd)
-9. [Monitor Switching](#monitor-switching)
-10. [Window Mode Override](#window-mode-override)
-11. [Keybinds](#keybinds)
-12. [Adaptive Features](#adaptive-features)
+3. [Background FPS Limit](#background-fps-limit)
+4. [VSync Override](#vsync-override)
+5. [5XXX Exclusive Pacing Optimization](#5xxx-exclusive-pacing-optimization)
+6. [FG Mode (Frame Generation)](#fg-mode-frame-generation)
+7. [Boost Override](#boost-override)
+8. [Pacing Presets](#pacing-presets)
+9. [Display & OSD](#display--osd)
+10. [Monitor Switching](#monitor-switching)
+11. [Window Mode Override](#window-mode-override)
+12. [Keybinds](#keybinds)
+13. [Adaptive Features](#adaptive-features)
     - [Predictive Sleep](#1-predictive-sleep)
     - [Phase-Locked Timing Grid](#2-phase-locked-timing-grid)
     - [Present-to-Present Feedback Loop](#3-present-to-present-feedback-loop)
@@ -32,11 +33,11 @@ This guide covers every feature in detail, including the adaptive systems that r
     - [VRR / GSync Awareness](#10-vrr--gsync-awareness)
     - [Adaptive Interval Adjustment](#11-adaptive-interval-adjustment)
     - [Flip Metering Block](#12-flip-metering-block)
-13. [Reflex Hook Architecture](#reflex-hook-architecture)
-14. [Smooth Motion Handling](#smooth-motion-handling)
-15. [Status Display](#status-display)
-16. [INI Reference](#ini-reference)
-17. [Logging](#logging)
+14. [Reflex Hook Architecture](#reflex-hook-architecture)
+15. [Smooth Motion Handling](#smooth-motion-handling)
+16. [Status Display](#status-display)
+17. [INI Reference](#ini-reference)
+18. [Logging](#logging)
 
 ---
 
@@ -67,6 +68,16 @@ For a 165 Hz monitor: 165² = 27,225 → 27,225 / 3600 ≈ 7.56 → 165 - 7.56 =
 This is the sweet spot for Reflex-based pacing — just below the display's native rate so the driver always has a frame ready without exceeding the VSync window.
 
 When frame generation is active, the limiter automatically divides the target by the FG multiplier to compute the real render rate. For example, at 120 FPS with DLSS FG 2x, the GPU renders at 60 FPS and the driver interpolates the rest.
+
+---
+
+## Background FPS Limit
+
+Caps the frame rate when the game window is not focused (alt-tabbed). Set with a slider (0–120). Setting 0 disables the background cap, so the normal FPS limit applies even when unfocused.
+
+When active, the background cap bypasses the normal Reflex-based pacing and uses a simple sleep-based limiter. This keeps GPU and CPU usage low while the game is in the background — useful for saving power and reducing heat when you're browsing or on Discord.
+
+The cap engages automatically when `GetForegroundWindow()` doesn't match the game's HWND, and disengages instantly when you click back into the game. The OSD continues to update while backgrounded.
 
 ---
 
@@ -437,6 +448,7 @@ All settings are stored in `ultra_limiter.ini` under the `[UltraLimiter]` sectio
 ```ini
 [UltraLimiter]
 fps_limit=60              # 0 = unlimited, 1-500
+bg_fps_limit=0            # 0 = disabled, 1-120 (background FPS cap when unfocused)
 fg_mult=auto              # auto / off / 2x / 3x / 4x
 boost=game                # game / on / off
 preset=native_pacing      # native_pacing / marker_lowlat / marker_balanced / marker_stability / sl_proxy / custom

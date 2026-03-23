@@ -9,6 +9,12 @@ FPS Limit
   Reflex Cap formula: fps = refresh - (refresh^2 / 3600), floored.
   Example: 165 Hz -> 165 - (27225/3600) = 165 - 7.56 = 157.
 
+Background FPS Limit
+  Slider 0-120. Caps frame rate when the game window is not focused.
+  0 = disabled (normal FPS limit applies even when unfocused).
+  Uses simple sleep-based limiting, bypasses Reflex pacing.
+  Reduces GPU/CPU usage while alt-tabbed. Engages/disengages instantly.
+
 VSync Override
   Game (passthrough), On (SyncInterval=1), Off (SyncInterval=0 + ALLOW_TEARING).
   Hooks IDXGISwapChain::Present. Tearing auto-detected via IDXGIFactory5.
