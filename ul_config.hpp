@@ -1,5 +1,5 @@
 #pragma once
-// Ultra Limiter — Configuration
+// ReLimiter — Configuration
 // Clean-room implementation. Settings designed from the feature requirements:
 //   FPS limiting, FG-aware pacing, Reflex integration, OSD, monitor, fullscreen.
 // INI persistence via Windows WritePrivateProfileString / GetPrivateProfileString.

@@ -1,5 +1,5 @@
 #pragma once
-// Ultra Limiter — Frame limiter orchestrator
+// ReLimiter — Frame limiter orchestrator
 // Clean-room implementation from public API docs:
 //   - NVAPI: SetSleepMode + Sleep for Reflex-based pacing, GetLatency for adaptive tuning
 //   - Windows: QPC timing for fallback pacing

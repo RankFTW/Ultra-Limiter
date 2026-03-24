@@ -1,4 +1,4 @@
-# Ultra Limiter — Credits
+# ReLimiter — Credits
 
 ## Authors
 

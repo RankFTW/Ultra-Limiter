@@ -14,13 +14,13 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "CompanyName",      "Ultra Limiter"
+            VALUE "CompanyName",      "ReLimiter"
             VALUE "FileDescription",  "FG-aware frame rate limiter with NVIDIA Reflex integration"
             VALUE "FileVersion",      UL_VERSION_STRING
             VALUE "InternalName",     "ultra_limiter"
             VALUE "LegalCopyright",   "MIT License"
             VALUE "OriginalFilename", "ultra_limiter.addon64"
-            VALUE "ProductName",      "Ultra Limiter"
+            VALUE "ProductName",      "ReLimiter"
             VALUE "ProductVersion",   UL_VERSION_STRING
         END
     END

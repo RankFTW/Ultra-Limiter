@@ -1,5 +1,5 @@
 #pragma once
-// Ultra Limiter — NVIDIA Reflex hook layer
+// ReLimiter — NVIDIA Reflex hook layer
 // Clean-room implementation from public documentation:
 //   - NVIDIA NVAPI SDK (MIT): nvapi.h struct definitions, nvapi_interface.h IDs
 //   - MinHook API: MH_CreateHook / MH_EnableHook / MH_DisableHook / MH_RemoveHook

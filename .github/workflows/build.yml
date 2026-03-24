@@ -97,7 +97,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "v${{ steps.version.outputs.version }}"
-          name: "Ultra Limiter v${{ steps.version.outputs.version }}"
+          name: "ReLimiter v${{ steps.version.outputs.version }}"
           body_path: release_notes.txt
           files: |
             build/Release/ultra_limiter.addon64

@@ -1,4 +1,4 @@
-// Ultra Limiter - Configuration implementation
+// ReLimiter - Configuration implementation
 #include "ul_config.hpp"
 #include "ul_log.hpp"
 #include <cstdio>

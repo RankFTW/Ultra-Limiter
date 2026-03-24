@@ -1,5 +1,5 @@
 #pragma once
-// Ultra Limiter — File logging
+// ReLimiter — File logging
 // Clean-room implementation using standard C I/O and Windows QPC.
 
 #include <windows.h>

@@ -1,4 +1,4 @@
-// Ultra Limiter — Frame limiter implementation
+// ReLimiter — Frame limiter implementation
 // Clean-room from public API docs:
 //   - NVAPI SDK (MIT): NvAPI_D3D_SetSleepMode params, NvAPI_D3D_Sleep
 //   - Windows: GetModuleHandleW for DLL detection, QPC for timing,

@@ -1,4 +1,4 @@
-// Ultra Limiter — File logging implementation
+// ReLimiter — File logging implementation
 // Uses raw Win32 file APIs to avoid CRT initialization issues in DllMain.
 
 #include "ul_log.hpp"
@@ -113,7 +113,7 @@ opened:
     char header[512];
     char apath[MAX_PATH] = {};
     WideCharToMultiByte(CP_UTF8, 0, wpath, -1, apath, sizeof(apath), nullptr, nullptr);
-    int n = snprintf(header, sizeof(header), "=== Ultra Limiter Log ===\r\nLog file: %s\r\n", apath);
+    int n = snprintf(header, sizeof(header), "=== ReLimiter Log ===\r\nLog file: %s\r\n", apath);
     if (n > 0) RawWrite(header, n);
     RawFlush();
     DebugOut("Log opened");

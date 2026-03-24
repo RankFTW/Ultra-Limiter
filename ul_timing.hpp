@@ -1,5 +1,5 @@
 #pragma once
-// Ultra Limiter — High-precision timing
+// ReLimiter — High-precision timing
 // Clean-room implementation from Windows API documentation:
 //   QueryPerformanceCounter/Frequency, CreateWaitableTimerEx,
 //   ZwSetTimerResolution (ntdll, undocumented but widely known).

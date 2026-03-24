@@ -1,4 +1,4 @@
-// Ultra Limiter — NVIDIA Reflex hook implementation
+// ReLimiter — NVIDIA Reflex hook implementation
 // Clean-room from public docs:
 //   - NVAPI SDK (MIT): nvapi_interface.h for function IDs, nvapi.h for structs
 //   - MinHook (BSD-2): MH_CreateHook, MH_EnableHook, MH_DisableHook, MH_RemoveHook

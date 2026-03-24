@@ -1,5 +1,5 @@
 @echo off
-echo === Ultra Limiter — Build ===
+echo === ReLimiter — Build ===
 
 set CMAKE="C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
 

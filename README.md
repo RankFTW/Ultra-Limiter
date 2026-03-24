@@ -1,12 +1,12 @@
-# Ultra Limiter — Comprehensive Feature Guide
+# ReLimiter — Comprehensive Feature Guide
 
-Ultra Limiter is a ReShade addon that provides GPU-aware frame rate limiting with deep NVIDIA Reflex integration, frame generation awareness, and adaptive pacing. It loads as a `.addon64` file through ReShade and works with 64-bit D3D11 or D3D12 games on NVIDIA GPUs. Not all games are compatible — titles with aggressive anti-cheat, custom rendering pipelines, or non-standard DXGI usage may not work correctly.
+ReLimiter is a ReShade addon that provides GPU-aware frame rate limiting with deep NVIDIA Reflex integration, frame generation awareness, and adaptive pacing. It loads as a `.addon64` file through ReShade and works with 64-bit D3D11 or D3D12 games on NVIDIA GPUs. Not all games are compatible — titles with aggressive anti-cheat, custom rendering pipelines, or non-standard DXGI usage may not work correctly.
 
 The pacing engine is fully dynamic — it automatically detects frame generation, selects the optimal enforcement site, adjusts queue depth, manages Reflex Boost, and stabilizes output cadence. There are no presets or manual FG multiplier controls. Everything adapts in real time based on pipeline telemetry from `NvAPI_D3D_GetLatency`.
 
 This guide covers every feature in detail, including the adaptive systems that run under the hood.
 
-> **Warning**: ReShade with addon support should not be used in online multiplayer games. Most anti-cheat systems (EAC, BattlEye, Vanguard, etc.) will flag or block DLL injection, and you risk account bans. Ultra Limiter is intended for single-player and offline use only.
+> **Warning**: ReShade with addon support should not be used in online multiplayer games. Most anti-cheat systems (EAC, BattlEye, Vanguard, etc.) will flag or block DLL injection, and you risk account bans. ReLimiter is intended for single-player and offline use only.
 
 ---
 
@@ -52,8 +52,8 @@ This guide covers every feature in detail, including the adaptive systems that r
 ## Installation
 
 1. Place `ultra_limiter.addon64` in your ReShade addon directory (typically next to the game executable alongside ReShade).
-2. Launch the game. Ultra Limiter registers itself automatically.
-3. Open the ReShade overlay (default: Home key) and find the "Ultra Limiter" tab.
+2. Launch the game. ReLimiter registers itself automatically.
+3. Open the ReShade overlay (default: Home key) and find the "ReLimiter" tab.
 4. A configuration file (`ultra_limiter.ini`) is created next to the game executable on first launch (falls back to the addon directory if the game directory is not writable).
 5. A log file (`ultra_limiter.log`) is written alongside the INI for diagnostics.
 
@@ -404,7 +404,7 @@ These features run automatically under the hood. They are driven by data from `N
 
 ## Reflex Hook Architecture
 
-Ultra Limiter hooks three NVAPI functions via MinHook:
+ReLimiter hooks three NVAPI functions via MinHook:
 
 1. **NvAPI_D3D_SetSleepMode** — swallowed. The game's calls are captured (low latency mode, boost, marker optimization flags) but not forwarded. UL controls sleep mode on its own schedule via `MaybeUpdateSleepMode`, which only calls the driver when parameters actually change. The dynamic Boost Controller overrides the boost flag when it has a decision; otherwise the game's original value is used.
 

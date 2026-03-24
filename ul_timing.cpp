@@ -1,4 +1,4 @@
-// Ultra Limiter — High-precision timing implementation
+// ReLimiter — High-precision timing implementation
 // Clean-room from Windows API docs:
 //   - QueryPerformanceCounter / QueryPerformanceFrequency (MSDN)
 //   - CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Win10 1803+, MSDN)

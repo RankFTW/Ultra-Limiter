@@ -1,4 +1,4 @@
-// Ultra Limiter — ReShade addon entry point
+// ReLimiter — ReShade addon entry point
 // Clean-room implementation. All code written from public API documentation:
 //   - ReShade addon API: register_addon, events, overlay (BSD-3)
 //   - Dear ImGui: GetForegroundDrawList, SliderInt, Checkbox, BeginCombo (MIT)
@@ -27,7 +27,7 @@
 
 // Addon metadata
 #include "version.h"
-extern "C" __declspec(dllexport) const char *NAME = "Ultra Limiter";
+extern "C" __declspec(dllexport) const char *NAME = "ReLimiter";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "FG-aware frame rate limiter with NVIDIA Reflex integration. v" UL_VERSION_STRING;
 
@@ -1096,7 +1096,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             return FALSE;
         }
 
-        ul_log::Write("=== Ultra Limiter (clean-room) starting ===");
+        ul_log::Write("=== ReLimiter (clean-room) starting ===");
 
         DetectConflictingFrameworks();
 
@@ -1134,7 +1134,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
             reshade::register_event<reshade::addon_event::bind_viewports>(OnBindViewports);
             reshade::register_event<reshade::addon_event::present>(OnPresent);
-            reshade::register_overlay("Ultra Limiter", DrawOverlay);
+            reshade::register_overlay("ReLimiter", DrawOverlay);
             reshade::register_event<reshade::addon_event::reshade_overlay>(DrawOSD);
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             ul_log::Write("FATAL: event registration exception 0x%08X", GetExceptionCode());
@@ -1150,7 +1150,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         ul_log::Write("Shutting down");
         SetUnhandledExceptionFilter(s_prev_filter);
         StopWorker();
-        reshade::unregister_overlay("Ultra Limiter", DrawOverlay);
+        reshade::unregister_overlay("ReLimiter", DrawOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_overlay>(DrawOSD);
         s_limiter.Shutdown();
         MH_Uninitialize();

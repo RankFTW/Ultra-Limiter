@@ -1,4 +1,4 @@
-# Ultra Limiter — Clean-room ReShade addon
+# ReLimiter — Clean-room ReShade addon
 # Written from public API documentation only (NVAPI, ReShade, MinHook, Windows).
 # No Display Commander code. See ORIGINS.txt for full provenance.
 cmake_minimum_required(VERSION 3.15)
@@ -11,7 +11,7 @@ string(REPLACE "." ";" UL_VERSION_PARTS "${UL_VERSION}")
 list(GET UL_VERSION_PARTS 0 UL_VERSION_MAJOR)
 list(GET UL_VERSION_PARTS 1 UL_VERSION_MINOR)
 list(GET UL_VERSION_PARTS 2 UL_VERSION_PATCH)
-message(STATUS "Ultra Limiter version: ${UL_VERSION}")
+message(STATUS "ReLimiter version: ${UL_VERSION}")
 
 # Generate version.h from version.txt
 file(WRITE "${CMAKE_CURRENT_LIST_DIR}/version.h"

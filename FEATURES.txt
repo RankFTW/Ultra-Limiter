@@ -1,4 +1,4 @@
-Ultra Limiter — Feature Reference
+ReLimiter — Feature Reference
 ==================================
 
 Core Features
