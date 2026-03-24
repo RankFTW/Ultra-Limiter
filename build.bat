@@ -13,7 +13,7 @@ echo Building...
 
 if %ERRORLEVEL% EQU 0 (
     echo.
-    echo Build successful: build\Release\ultra_limiter.addon64
+    echo Build successful: build\Release\relimiter.addon64
 ) else (
     echo.
     echo Build FAILED.

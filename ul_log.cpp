@@ -50,7 +50,7 @@ void Initialize(HMODULE addon_module) {
     if (GetModuleFileNameW(nullptr, wpath, MAX_PATH)) {
         wchar_t* slash = wcsrchr(wpath, L'\\');
         if (slash) {
-            wcscpy(slash + 1, L"ultra_limiter.log");
+            wcscpy(slash + 1, L"relimiter.log");
             if (TryOpen(wpath)) goto opened;
             {
                 char dbg[256];
@@ -92,7 +92,7 @@ void Initialize(HMODULE addon_module) {
         wchar_t tmp[MAX_PATH] = {};
         DWORD len = GetTempPathW(MAX_PATH, tmp);
         if (len > 0 && len < MAX_PATH - 32) {
-            wcscat(tmp, L"ultra_limiter.log");
+            wcscat(tmp, L"relimiter.log");
             wcscpy(wpath, tmp);
             if (TryOpen(wpath)) goto opened;
             {

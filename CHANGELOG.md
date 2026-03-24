@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.0.2
+
+- Rebranded from Ultra Limiter to ReLimiter
+- Renamed addon output to `relimiter.addon64`
+- Renamed INI file to `relimiter.ini`
+- Renamed log file to `relimiter.log`
+- Embedded version metadata in DLL file properties
+- Added auto-incrementing version system with CHANGELOG-based release notes
+
 ## v2.0.0
 
 Fully dynamic pacing engine rewrite.
@@ -15,5 +24,3 @@ Fully dynamic pacing engine rewrite.
 - Auto-derive Reflex cap from monitor refresh rate when FPS limit is unlimited and FG is active
 - OSD auto-hides FG line when no frame generation detected
 - OSD auto-hides resolution line when no upscaling detected
-- Embedded version metadata in DLL (visible in file properties)
-- Removed: pacing presets, manual FG multiplier, manual boost override, and related INI keys

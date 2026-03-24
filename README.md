@@ -51,11 +51,11 @@ This guide covers every feature in detail, including the adaptive systems that r
 
 ## Installation
 
-1. Place `ultra_limiter.addon64` in your ReShade addon directory (typically next to the game executable alongside ReShade).
+1. Place `relimiter.addon64` in your ReShade addon directory (typically next to the game executable alongside ReShade).
 2. Launch the game. ReLimiter registers itself automatically.
 3. Open the ReShade overlay (default: Home key) and find the "ReLimiter" tab.
-4. A configuration file (`ultra_limiter.ini`) is created next to the game executable on first launch (falls back to the addon directory if the game directory is not writable).
-5. A log file (`ultra_limiter.log`) is written alongside the INI for diagnostics.
+4. A configuration file (`relimiter.ini`) is created next to the game executable on first launch (falls back to the addon directory if the game directory is not writable).
+5. A log file (`relimiter.log`) is written alongside the INI for diagnostics.
 
 ---
 
@@ -453,7 +453,7 @@ The bottom of the overlay shows:
 
 ## INI Reference
 
-All settings are stored in `ultra_limiter.ini` under the `[UltraLimiter]` section:
+All settings are stored in `relimiter.ini` under the `[UltraLimiter]` section:
 
 ```ini
 [UltraLimiter]
@@ -483,7 +483,7 @@ osd_bg_opacity=0          # 0-100 (OSD background darkness percentage)
 
 ## Logging
 
-A timestamped log file is written to `ultra_limiter.log` next to the INI file. It records:
+A timestamped log file is written to `relimiter.log` next to the INI file. It records:
 - Startup/shutdown events
 - NVAPI initialization and hook status
 - QueryInterface hook status (flip metering block)

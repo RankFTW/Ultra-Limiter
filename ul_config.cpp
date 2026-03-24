@@ -12,7 +12,7 @@ static bool BuildIniPath(HMODULE mod, char* out, size_t sz) {
     if (GetModuleFileNameW(nullptr, wpath, MAX_PATH)) {
         wchar_t* slash = wcsrchr(wpath, L'\\');
         if (slash) {
-            wcscpy(slash + 1, L"ultra_limiter.ini");
+            wcscpy(slash + 1, L"relimiter.ini");
             HANDLE h = CreateFileW(wpath, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                                    OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (h != INVALID_HANDLE_VALUE) {
@@ -95,7 +95,64 @@ static void WriteDefaults(const char* path) {
     );
     fclose(f);
 }
+// Migrate ultra_limiter.ini → relimiter.ini if the old file exists.
+// Checks both the game exe directory and the addon DLL directory.
+static void MigrateOldIni(HMODULE mod) {
+    wchar_t wpath[MAX_PATH] = {};
+
+    // Check game exe directory
+    if (GetModuleFileNameW(nullptr, wpath, MAX_PATH)) {
+        wchar_t* slash = wcsrchr(wpath, L'\\');
+        if (slash) {
+            // Build old path
+            wcscpy(slash + 1, L"ultra_limiter.ini");
+            if (GetFileAttributesW(wpath) != INVALID_FILE_ATTRIBUTES) {
+                // Old file exists — build new path in same directory
+                wchar_t newpath[MAX_PATH] = {};
+                wcsncpy(newpath, wpath, MAX_PATH);
+                wchar_t* ns = wcsrchr(newpath, L'\\');
+                if (ns) {
+                    wcscpy(ns + 1, L"relimiter.ini");
+                    // Only migrate if new file doesn't already exist
+                    if (GetFileAttributesW(newpath) == INVALID_FILE_ATTRIBUTES) {
+                        if (CopyFileW(wpath, newpath, TRUE))
+                            OutputDebugStringA("[UL] Migrated ultra_limiter.ini -> relimiter.ini (game dir)");
+                    }
+                    DeleteFileW(wpath);
+                    OutputDebugStringA("[UL] Deleted old ultra_limiter.ini (game dir)");
+                }
+            }
+        }
+    }
+
+    // Check addon DLL directory
+    if (mod) {
+        wpath[0] = L'\0';
+        if (GetModuleFileNameW(mod, wpath, MAX_PATH)) {
+            wchar_t* slash = wcsrchr(wpath, L'\\');
+            if (slash) {
+                wcscpy(slash + 1, L"ultra_limiter.ini");
+                if (GetFileAttributesW(wpath) != INVALID_FILE_ATTRIBUTES) {
+                    wchar_t newpath[MAX_PATH] = {};
+                    wcsncpy(newpath, wpath, MAX_PATH);
+                    wchar_t* ns = wcsrchr(newpath, L'\\');
+                    if (ns) {
+                        wcscpy(ns + 1, L"relimiter.ini");
+                        if (GetFileAttributesW(newpath) == INVALID_FILE_ATTRIBUTES) {
+                            if (CopyFileW(wpath, newpath, TRUE))
+                                OutputDebugStringA("[UL] Migrated ultra_limiter.ini -> relimiter.ini (addon dir)");
+                        }
+                        DeleteFileW(wpath);
+                        OutputDebugStringA("[UL] Deleted old ultra_limiter.ini (addon dir)");
+                    }
+                }
+            }
+        }
+    }
+}
+
 void LoadSettings(HMODULE addon_module) {
+    MigrateOldIni(addon_module);
     if (!BuildIniPath(addon_module, s_ini, sizeof(s_ini))) {
         ul_log::Write("LoadSettings: failed to build INI path");
         return;

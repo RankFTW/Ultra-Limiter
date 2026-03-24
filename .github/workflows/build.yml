@@ -77,21 +77,19 @@ jobs:
         id: changelog
         shell: bash
         run: |
-          # Extract the latest version section from CHANGELOG.md
-          VERSION="v${{ steps.version.outputs.version }}"
-          # Get everything between the first ## and the next ## (or EOF)
-          NOTES=$(awk '/^## /{if(found)exit; found=1; next} found{print}' CHANGELOG.md)
+          # Extract only the FIRST version section from CHANGELOG.md
+          # (everything between the first ## and the second ##, excluding headers)
+          NOTES=$(awk '/^## /{if(found){exit}; found=1; next} found{print}' CHANGELOG.md)
           if [ -z "$NOTES" ]; then
-            NOTES="Release $VERSION"
+            NOTES="Release v${{ steps.version.outputs.version }}"
           fi
-          # Write to file for the release action (avoids escaping issues)
           echo "$NOTES" > release_notes.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ultra_limiter
-          path: build/Release/ultra_limiter.addon64
+          name: relimiter
+          path: build/Release/relimiter.addon64
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -100,7 +98,7 @@ jobs:
           name: "ReLimiter v${{ steps.version.outputs.version }}"
           body_path: release_notes.txt
           files: |
-            build/Release/ultra_limiter.addon64
+            build/Release/relimiter.addon64
             CHANGELOG.md
           make_latest: true
           prerelease: false

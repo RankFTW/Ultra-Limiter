@@ -81,7 +81,7 @@ endif()
 
 # Output as .addon64
 set_target_properties(ultra_limiter PROPERTIES
-    OUTPUT_NAME "ultra_limiter"
+    OUTPUT_NAME "relimiter"
     SUFFIX ".addon64"
     PREFIX ""
 )
