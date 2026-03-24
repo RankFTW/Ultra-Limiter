@@ -92,6 +92,8 @@ static void WriteDefaults(const char* path) {
         "exclusive_pacing=false\n"
         "osd_toggle_key=35\n"
         "osd_bg_opacity=0\n"
+        "osd_drop_shadow=false\n"
+        "osd_text_brightness=100\n"
     );
     fclose(f);
 }
@@ -195,6 +197,8 @@ void LoadSettings(HMODULE addon_module) {
     g_cfg.exclusive_pacing.store(ReadBool(ini, "exclusive_pacing", false));
     g_cfg.osd_toggle_key.store(GetPrivateProfileIntA("UltraLimiter", "osd_toggle_key", VK_END, ini));
     g_cfg.osd_bg_opacity.store(GetPrivateProfileIntA("UltraLimiter", "osd_bg_opacity", 0, ini));
+    g_cfg.osd_drop_shadow.store(ReadBool(ini, "osd_drop_shadow", false));
+    g_cfg.osd_text_brightness.store(GetPrivateProfileIntA("UltraLimiter", "osd_text_brightness", 100, ini));
     ul_log::Write("LoadSettings: fps=%.0f bg_fps=%.0f",
                   g_cfg.fps_limit.load(), g_cfg.bg_fps_limit.load());
 }
@@ -227,6 +231,8 @@ void SaveSettings() {
     }
     WInt("osd_toggle_key", g_cfg.osd_toggle_key.load());
     WInt("osd_bg_opacity", g_cfg.osd_bg_opacity.load());
+    WBool("osd_drop_shadow", g_cfg.osd_drop_shadow.load());
+    WInt("osd_text_brightness", g_cfg.osd_text_brightness.load());
     WInt("vsync_override", g_cfg.vsync_override.load());
     WBool("exclusive_pacing", g_cfg.exclusive_pacing.load());
 }

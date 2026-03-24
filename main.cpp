@@ -244,10 +244,19 @@ static void DrawOSD(reshade::api::effect_runtime*) {
     float y_start = g_cfg.osd_y.load(std::memory_order_relaxed) + 8.0f;
     float y = y_start;
     constexpr float lh = 18.0f, gap = 4.0f, pad = 8.0f;
-    const ImU32 white = IM_COL32(255, 255, 255, 255);
-    const ImU32 green = IM_COL32(100, 255, 100, 200);
-    const ImU32 cyan  = IM_COL32(100, 200, 255, 255);
-    const ImU32 gold  = IM_COL32(200, 200, 100, 255);
+
+    // Text brightness scaling (0–100 → 0.0–1.0)
+    int bri_pct = g_cfg.osd_text_brightness.load(std::memory_order_relaxed);
+    if (bri_pct < 0) bri_pct = 0; if (bri_pct > 100) bri_pct = 100;
+    float bri = bri_pct / 100.0f;
+    auto scale = [&](uint8_t c) -> uint8_t { return static_cast<uint8_t>(c * bri); };
+
+    const ImU32 white = IM_COL32(scale(255), scale(255), scale(255), 255);
+    const ImU32 green = IM_COL32(scale(100), scale(255), scale(100), 200);
+    const ImU32 cyan  = IM_COL32(scale(100), scale(200), scale(255), 255);
+    const ImU32 gold  = IM_COL32(scale(200), scale(200), scale(100), 255);
+    const ImU32 shadow_col = IM_COL32(0, 0, 0, static_cast<uint8_t>(180 * bri));
+    bool drop_shadow = g_cfg.osd_drop_shadow.load(std::memory_order_relaxed);
     char buf[64];
 
     // When Smooth Motion is active, s_fps (from present) is the native render rate
@@ -351,7 +360,10 @@ static void DrawOSD(reshade::api::effect_runtime*) {
     }
 
     // --- Draw text lines ---
+    constexpr float sh_off = 1.5f;  // shadow offset in pixels
     for (int i = 0; i < line_count; i++) {
+        if (drop_shadow)
+            dl->AddText(ImVec2(x + pad + sh_off, y + sh_off), shadow_col, lines[i].text);
         dl->AddText(ImVec2(x + pad, y), lines[i].color, lines[i].text);
         y += lh + gap;
     }
@@ -775,6 +787,15 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
             if (ImGui::SliderInt("Background", &bg_op, 0, 100, "%d%%")) { g_cfg.osd_bg_opacity.store(bg_op); }
             if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("OSD background opacity. 0 = transparent, 100 = solid black.");
+
+            bool ds = g_cfg.osd_drop_shadow.load(std::memory_order_relaxed);
+            if (ImGui::Checkbox("Drop Shadow", &ds)) { g_cfg.osd_drop_shadow.store(ds); changed = true; }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add a drop shadow behind OSD text for readability.");
+
+            int tbri = g_cfg.osd_text_brightness.load(std::memory_order_relaxed);
+            if (ImGui::SliderInt("Text Brightness", &tbri, 0, 100, "%d%%")) { g_cfg.osd_text_brightness.store(tbri); }
+            if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("OSD text brightness. 100 = full, 0 = invisible.");
         }
         ImGui::Unindent(8);
     }

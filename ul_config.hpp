@@ -61,6 +61,12 @@ struct UlConfig {
 
     // OSD background opacity (0 = invisible, 100 = solid black)
     std::atomic<int> osd_bg_opacity{0};
+
+    // OSD drop shadow on text (true = enabled)
+    std::atomic<bool> osd_drop_shadow{false};
+
+    // OSD text brightness (0–100, default 100 = full white)
+    std::atomic<int> osd_text_brightness{100};
 };
 
 extern UlConfig g_cfg;

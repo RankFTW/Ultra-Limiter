@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.0.3
+
+- Added OSD drop shadow option for improved text readability
+- Added OSD text brightness slider (0–100%)
+
 ## v2.0.2
 
 - Rebranded from Ultra Limiter to ReLimiter
