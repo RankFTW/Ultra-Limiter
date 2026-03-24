@@ -26,9 +26,10 @@
 #include <mutex>
 
 // Addon metadata
+#include "version.h"
 extern "C" __declspec(dllexport) const char *NAME = "Ultra Limiter";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "FG-aware frame rate limiter with NVIDIA Reflex integration.";
+    "FG-aware frame rate limiter with NVIDIA Reflex integration. v" UL_VERSION_STRING;
 
 static UlLimiter s_limiter;
 static HWND s_hwnd = nullptr;

@@ -19,6 +19,46 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Auto-increment patch version
+        id: version
+        shell: bash
+        run: |
+          # Read current version
+          VERSION=$(cat version.txt | tr -d '[:space:]')
+          echo "Current version: $VERSION"
+
+          # Split into parts
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+
+          # Check commit message for version override
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          if echo "$COMMIT_MSG" | grep -qiE '\[major\]'; then
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+          elif echo "$COMMIT_MSG" | grep -qiE '\[minor\]'; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
+          else
+            PATCH=$((PATCH + 1))
+          fi
+
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "New version: $NEW_VERSION"
+          echo "$NEW_VERSION" > version.txt
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Commit version bump
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add version.txt
+          git diff --cached --quiet || git commit -m "[skip ci] bump version to v${{ steps.version.outputs.version }}"
+          git push
 
       - name: Clone dependencies
         run: |
@@ -33,6 +73,20 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
+      - name: Extract changelog for release
+        id: changelog
+        shell: bash
+        run: |
+          # Extract the latest version section from CHANGELOG.md
+          VERSION="v${{ steps.version.outputs.version }}"
+          # Get everything between the first ## and the next ## (or EOF)
+          NOTES=$(awk '/^## /{if(found)exit; found=1; next} found{print}' CHANGELOG.md)
+          if [ -z "$NOTES" ]; then
+            NOTES="Release $VERSION"
+          fi
+          # Write to file for the release action (avoids escaping issues)
+          echo "$NOTES" > release_notes.txt
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -42,8 +96,11 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: Ultra_Limiter
-          name: Ultra Limiter
-          files: build/Release/ultra_limiter.addon64
+          tag_name: "v${{ steps.version.outputs.version }}"
+          name: "Ultra Limiter v${{ steps.version.outputs.version }}"
+          body_path: release_notes.txt
+          files: |
+            build/Release/ultra_limiter.addon64
+            CHANGELOG.md
           make_latest: true
           prerelease: false

@@ -1,0 +1,31 @@
+#include <winver.h>
+#include "version.h"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION    UL_VERSION_MAJOR, UL_VERSION_MINOR, UL_VERSION_PATCH, 0
+PRODUCTVERSION UL_VERSION_MAJOR, UL_VERSION_MINOR, UL_VERSION_PATCH, 0
+FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+FILEFLAGS      0
+FILEOS         VOS_NT_WINDOWS32
+FILETYPE       VFT_DLL
+FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Ultra Limiter"
+            VALUE "FileDescription",  "FG-aware frame rate limiter with NVIDIA Reflex integration"
+            VALUE "FileVersion",      UL_VERSION_STRING
+            VALUE "InternalName",     "ultra_limiter"
+            VALUE "LegalCopyright",   "MIT License"
+            VALUE "OriginalFilename", "ultra_limiter.addon64"
+            VALUE "ProductName",      "Ultra Limiter"
+            VALUE "ProductVersion",   UL_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END
