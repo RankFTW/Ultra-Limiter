@@ -1,15 +1,13 @@
 # Changelog
 
-## v2.0.4
+## v2.0.5
 
-- Added Vulkan Reflex backend (VK_NV_low_latency2)
-- Hooks vkCreateDevice to inject VK_NV_low_latency2 extension automatically
-- Hybrid pacing for Vulkan games without native Reflex markers: driver low-latency hints + QPC timing fallback
-- Full Reflex sleep pacing for Vulkan games with native markers (vkLatencySleepNV + timeline semaphore)
-- Fixed Vulkan viewport Y-flip (negative height) breaking render resolution detection
-- OSD now shows output resolution when no upscaling is detected
-- OSD FG detection works on Vulkan via DLL-based identification
-- No changes to DX pacing paths
+- Native Reflex detection via vkGetDeviceProcAddr hook (intercepts game's vkSetLatencySleepModeNV calls)
+- Deferred SetSleepMode — no longer called eagerly during swapchain attach, avoids conflicts with native Reflex games
+- Native Reflex VK games: ReLimiter is hands-off (no SetSleepMode/Sleep calls), timing fallback as backstop only
+- Non-native Reflex VK games: driver low-latency hints + QPC timing fallback (no semaphore wait)
+- Added GPU render time, render latency, and present latency OSD metrics for Vulkan games
+- Fixed Vulkan OSD render latency showing inflated values due to stale cross-frame timestamps
 
 ## v2.0.3
 

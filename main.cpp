@@ -199,6 +199,48 @@ static void PollGpuLatency() {
     }
 }
 
+// Vulkan equivalent — uses VkReflex::GetLatencyTimings instead of NVAPI
+static void PollVkGpuLatency() {
+    if (!g_vk_reflex.IsActive()) return;
+
+    static NvLatencyResult* buf = nullptr;
+    if (!buf) { buf = new (std::nothrow) NvLatencyResult{}; if (!buf) return; }
+
+    if (!g_vk_reflex.GetLatencyTimings(buf)) return;
+
+    float gpu = 0, rlat = 0, plat = 0;
+    int n_gpu = 0, n_rlat = 0, n_plat = 0;
+    for (int i = 63; i >= 0 && n_gpu < 8; i--) {
+        auto& f = buf->frameReport[i];
+        if (!f.frameID) continue;
+        if (f.gpuActiveRenderTimeUs > 0 && f.gpuActiveRenderTimeUs < 200'000) {
+            gpu += static_cast<float>(f.gpuActiveRenderTimeUs) / 1000.0f;
+            n_gpu++;
+        }
+        // Render latency: sim start → gpu render end.
+        // On Vulkan the driver may report stale/cross-frame timestamps when
+        // the game doesn't set its own markers. Clamp to 100ms to reject junk.
+        if (f.simStartTime > 0 && f.gpuRenderEndTime > f.simStartTime) {
+            uint64_t delta = f.gpuRenderEndTime - f.simStartTime;
+            if (delta < 100'000) {  // < 100ms — plausible
+                rlat += static_cast<float>(delta) / 1000.0f;
+                n_rlat++;
+            }
+        }
+        if (f.presentStartTime > 0 && f.presentEndTime > f.presentStartTime) {
+            uint64_t delta = f.presentEndTime - f.presentStartTime;
+            if (delta < 100'000) {
+                plat += static_cast<float>(delta) / 1000.0f;
+                n_plat++;
+            }
+        }
+    }
+    if (n_gpu > 0) s_gpu_ms = gpu / n_gpu;
+    if (n_rlat > 0) s_render_lat_ms = rlat / n_rlat;
+    if (n_plat > 0) s_present_lat_ms = plat / n_plat;
+    if (n_gpu > 0) s_has_gpu.store(true, std::memory_order_relaxed);
+}
+
 // ============================================================================
 // Frametime stats
 // ============================================================================
@@ -885,9 +927,7 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
     const char* mode = "Timing";
     if (vk_active) {
         if (native) {
-            const auto& ps = s_limiter.GetPipelineStats();
-            int site = ps.valid ? ps.auto_site : PRESENT_FINISH;
-            mode = (site == SIM_START) ? "Vulkan Reflex (Sim Start)" : "Vulkan Reflex (Present)";
+            mode = "Vulkan Reflex (Native)";
         } else {
             mode = "Vulkan Low-Latency + Timing";
         }
@@ -1143,6 +1183,7 @@ static void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* sc,
         s_limiter.OnPresent();
         UpdateStats();
         if (cnt > 300 && cnt % 30 == 0) PollGpuLatency();
+        if (cnt > 300 && cnt % 30 == 0) PollVkGpuLatency();
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         ul_log::Write("OnPresent: exception 0x%08X", GetExceptionCode());
     }

@@ -7,7 +7,9 @@
 #include "ul_vk_reflex.hpp"
 #include "ul_log.hpp"
 
+#include <MinHook.h>
 #include <cstring>
+#include <vector>
 
 VkReflex g_vk_reflex;
 
@@ -15,7 +17,6 @@ bool VkReflex::Init(VkDevice device) {
     if (!device) return false;
     device_ = device;
 
-    // Load vkGetDeviceProcAddr from vulkan-1.dll
     HMODULE vk_dll = GetModuleHandleW(L"vulkan-1.dll");
     if (!vk_dll) {
         ul_log::Write("VkReflex::Init: vulkan-1.dll not loaded");
@@ -29,7 +30,6 @@ bool VkReflex::Init(VkDevice device) {
         return false;
     }
 
-    // Load VK_NV_low_latency2 functions
     pfn_SetLatencySleepMode_ = reinterpret_cast<PFN_vkSetLatencySleepModeNV>(
         vkGetDeviceProcAddr(device, "vkSetLatencySleepModeNV"));
     pfn_LatencySleep_ = reinterpret_cast<PFN_vkLatencySleepNV>(
@@ -45,7 +45,6 @@ bool VkReflex::Init(VkDevice device) {
         return false;
     }
 
-    // Load core Vulkan functions for timeline semaphore
     pfn_CreateSemaphore_ = reinterpret_cast<PFN_vkCreateSemaphore>(
         vkGetDeviceProcAddr(device, "vkCreateSemaphore"));
     pfn_DestroySemaphore_ = reinterpret_cast<PFN_vkDestroySemaphore>(
@@ -68,7 +67,6 @@ bool VkReflex::AttachSwapchain(VkSwapchainKHR swapchain) {
     swapchain_ = swapchain;
     semaphore_value_ = 0;
 
-    // Create a timeline semaphore for vkLatencySleepNV signaling
     VkSemaphoreTypeCreateInfo type_info = {};
     type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
     type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
@@ -85,20 +83,8 @@ bool VkReflex::AttachSwapchain(VkSwapchainKHR swapchain) {
         return false;
     }
 
-    // Enable low latency mode on this swapchain
-    VkLatencySleepModeInfoNV mode = {};
-    mode.sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV;
-    mode.lowLatencyMode = 1;
-    mode.lowLatencyBoost = 0;
-    mode.minimumIntervalUs = 0;
-
-    res = pfn_SetLatencySleepMode_(device_, swapchain_, &mode);
-    if (res != VK_SUCCESS) {
-        ul_log::Write("VkReflex::AttachSwapchain: SetLatencySleepMode failed (%d)", res);
-        pfn_DestroySemaphore_(device_, sleep_semaphore_, nullptr);
-        sleep_semaphore_ = 0;
-        return false;
-    }
+    // Don't call SetSleepMode here — defer to DoReflexSleep on first present.
+    // Calling it eagerly can conflict with games that manage their own Reflex.
 
     active_ = true;
     ul_log::Write("VkReflex::AttachSwapchain: active (swapchain=%llu)", swapchain);
@@ -108,17 +94,10 @@ bool VkReflex::AttachSwapchain(VkSwapchainKHR swapchain) {
 void VkReflex::DetachSwapchain() {
     if (!active_) return;
 
-    // Do NOT call vkSetLatencySleepModeNV here — the swapchain is being
-    // destroyed by the game/driver. Calling into it during destruction
-    // causes crashes. The driver cleans up low-latency state automatically
-    // when the swapchain is destroyed.
-
-    // Destroy the timeline semaphore (safe — it's our own object)
     if (device_ && sleep_semaphore_ && pfn_DestroySemaphore_) {
         __try {
             pfn_DestroySemaphore_(device_, sleep_semaphore_, nullptr);
         } __except(EXCEPTION_EXECUTE_HANDLER) {
-            // Semaphore may already be invalid if device is being torn down
         }
     }
 
@@ -164,7 +143,6 @@ bool VkReflex::Sleep() {
     if (!active_ || !pfn_LatencySleep_ || !pfn_WaitSemaphores_ || !sleep_semaphore_)
         return false;
 
-    // Increment the timeline semaphore value for this sleep cycle
     semaphore_value_++;
 
     VkLatencySleepInfoNV sleep_info = {};
@@ -174,8 +152,6 @@ bool VkReflex::Sleep() {
 
     VkResult res;
     __try {
-        // vkLatencySleepNV returns immediately — the driver will signal the
-        // semaphore when it's time for the application to resume CPU work.
         res = pfn_LatencySleep_(device_, swapchain_, &sleep_info);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         active_ = false;
@@ -183,8 +159,6 @@ bool VkReflex::Sleep() {
     }
     if (res != VK_SUCCESS) return false;
 
-    // Wait on the timeline semaphore for the driver's wake signal.
-    // Timeout: 100ms — prevents infinite hangs if the driver misbehaves.
     VkSemaphoreWaitInfo wait = {};
     wait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
     wait.semaphoreCount = 1;
@@ -219,7 +193,6 @@ void VkReflex::SetMarker(uint64_t present_id, VkLatencyMarkerNV marker) {
 bool VkReflex::GetLatencyTimings(NvLatencyResult* out) {
     if (!active_ || !pfn_GetLatencyTimings_ || !out) return false;
 
-    // First query: get the count of available timing reports
     VkGetLatencyMarkerInfoNV marker_info = {};
     marker_info.sType = VK_STRUCTURE_TYPE_GET_LATENCY_MARKER_INFO_NV;
     marker_info.timingCount = 0;
@@ -234,11 +207,9 @@ bool VkReflex::GetLatencyTimings(NvLatencyResult* out) {
 
     if (marker_info.timingCount == 0) return false;
 
-    // Cap to 64 reports (matches NvLatencyResult's frameReport array size)
     uint32_t count = marker_info.timingCount;
     if (count > 64) count = 64;
 
-    // Allocate VK frame reports on the stack
     VkLatencyTimingsFrameReportNV vk_reports[64] = {};
     for (uint32_t i = 0; i < count; i++) {
         vk_reports[i].sType = VK_STRUCTURE_TYPE_LATENCY_TIMINGS_FRAME_REPORT_NV;
@@ -255,11 +226,6 @@ bool VkReflex::GetLatencyTimings(NvLatencyResult* out) {
         return false;
     }
 
-    // Convert VK frame reports → NvLatencyResult for compatibility with
-    // the existing pacing engine. The VK struct uses microsecond timestamps
-    // directly, while NVAPI uses QPC-based timestamps. The pacing engine
-    // only uses deltas between timestamps, so the absolute base doesn't matter
-    // as long as it's consistent within a report.
     memset(out, 0, sizeof(*out));
     out->version = NV_LATENCY_RESULT_VER;
 
@@ -285,7 +251,6 @@ bool VkReflex::GetLatencyTimings(NvLatencyResult* out) {
         nv.gpuRenderStartTime = vk.gpuRenderStartTimeUs;
         nv.gpuRenderEndTime = vk.gpuRenderEndTimeUs;
 
-        // Compute gpuActiveRenderTimeUs from GPU render start/end
         if (vk.gpuRenderEndTimeUs > vk.gpuRenderStartTimeUs) {
             uint64_t delta = vk.gpuRenderEndTimeUs - vk.gpuRenderStartTimeUs;
             nv.gpuActiveRenderTimeUs = (delta < 200'000) ? static_cast<NvU32>(delta) : 0;
@@ -296,17 +261,91 @@ bool VkReflex::GetLatencyTimings(NvLatencyResult* out) {
 }
 
 // ============================================================================
-// vkCreateDevice hook — injects VK_NV_low_latency2 into the extension list
+// Native Reflex detection — hooks vkGetDeviceProcAddr to intercept the game's
+// resolution of VK_NV_low_latency2 functions. When the game asks for
+// vkSetLatencySleepModeNV, we return a wrapper that sets g_game_uses_reflex
+// and forwards to the real function.
 // ============================================================================
 
-#include <MinHook.h>
-#include <vector>
+static PFN_vkSetLatencySleepModeNV s_real_vkSetLatencySleepMode = nullptr;
+static PFN_vkGetDeviceProcAddr s_orig_vkGetDeviceProcAddr = nullptr;
+static std::atomic<bool> s_gdpa_hook_installed{false};
+
+static VkResult Wrapped_vkSetLatencySleepModeNV(
+    VkDevice device,
+    VkSwapchainKHR swapchain,
+    const VkLatencySleepModeInfoNV* pSleepModeInfo)
+{
+    if (!g_game_uses_reflex.load(std::memory_order_relaxed)) {
+        g_game_uses_reflex.store(true, std::memory_order_relaxed);
+        ul_log::Write("VkHook: game uses native Reflex (vkSetLatencySleepModeNV)");
+    }
+    if (s_real_vkSetLatencySleepMode)
+        return s_real_vkSetLatencySleepMode(device, swapchain, pSleepModeInfo);
+    return VK_SUCCESS;
+}
+
+static void* Hooked_vkGetDeviceProcAddr(VkDevice device, const char* pName) {
+    if (pName && strcmp(pName, "vkSetLatencySleepModeNV") == 0) {
+        if (!s_real_vkSetLatencySleepMode && s_orig_vkGetDeviceProcAddr) {
+            s_real_vkSetLatencySleepMode = reinterpret_cast<PFN_vkSetLatencySleepModeNV>(
+                s_orig_vkGetDeviceProcAddr(device, pName));
+        }
+        if (s_real_vkSetLatencySleepMode)
+            return reinterpret_cast<void*>(&Wrapped_vkSetLatencySleepModeNV);
+    }
+    return s_orig_vkGetDeviceProcAddr ? s_orig_vkGetDeviceProcAddr(device, pName) : nullptr;
+}
+
+static void HookVkGetDeviceProcAddr() {
+    if (s_gdpa_hook_installed.load(std::memory_order_relaxed)) return;
+
+    HMODULE vk_dll = GetModuleHandleW(L"vulkan-1.dll");
+    if (!vk_dll) return;
+
+    auto target = reinterpret_cast<void*>(GetProcAddress(vk_dll, "vkGetDeviceProcAddr"));
+    if (!target) return;
+
+    MH_STATUS st = MH_CreateHook(target,
+                                  reinterpret_cast<void*>(&Hooked_vkGetDeviceProcAddr),
+                                  reinterpret_cast<void**>(&s_orig_vkGetDeviceProcAddr));
+    if (st != MH_OK) {
+        ul_log::Write("VkHook: MH_CreateHook vkGetDeviceProcAddr failed (%d)", st);
+        return;
+    }
+    st = MH_EnableHook(target);
+    if (st != MH_OK) {
+        ul_log::Write("VkHook: MH_EnableHook vkGetDeviceProcAddr failed (%d)", st);
+        MH_RemoveHook(target);
+        return;
+    }
+    s_gdpa_hook_installed.store(true, std::memory_order_relaxed);
+    ul_log::Write("VkHook: vkGetDeviceProcAddr hook installed");
+}
+
+static void UnhookVkGetDeviceProcAddr() {
+    if (!s_gdpa_hook_installed.load(std::memory_order_relaxed)) return;
+    HMODULE vk_dll = GetModuleHandleW(L"vulkan-1.dll");
+    if (vk_dll) {
+        auto target = reinterpret_cast<void*>(GetProcAddress(vk_dll, "vkGetDeviceProcAddr"));
+        if (target) {
+            MH_DisableHook(target);
+            MH_RemoveHook(target);
+        }
+    }
+    s_gdpa_hook_installed.store(false, std::memory_order_relaxed);
+    s_orig_vkGetDeviceProcAddr = nullptr;
+    s_real_vkSetLatencySleepMode = nullptr;
+}
+
+// ============================================================================
+// vkCreateDevice hook — injects VK_NV_low_latency2 into the extension list
+// ============================================================================
 
 static PFN_vkCreateDevice s_orig_vkCreateDevice = nullptr;
 static std::atomic<bool> s_extension_injected{false};
 static std::atomic<bool> s_hook_installed{false};
 
-// Check if the physical device supports VK_NV_low_latency2
 static bool PhysicalDeviceSupportsLL2(VkPhysicalDevice physDev) {
     HMODULE vk_dll = GetModuleHandleW(L"vulkan-1.dll");
     if (!vk_dll) return false;
@@ -353,18 +392,17 @@ static VkResult Hooked_vkCreateDevice(
     }
 
     if (already_enabled) {
-        ul_log::Write("VkHook: game already enables VK_NV_low_latency2");
+        ul_log::Write("VkHook: game already enables VK_NV_low_latency2 — native Reflex detected");
         s_extension_injected.store(true, std::memory_order_relaxed);
+        g_game_uses_reflex.store(true, std::memory_order_relaxed);
         return s_orig_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
     }
 
-    // Check if the physical device supports the extension
     if (!PhysicalDeviceSupportsLL2(physicalDevice)) {
         ul_log::Write("VkHook: VK_NV_low_latency2 not supported by physical device");
         return s_orig_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
     }
 
-    // Inject VK_NV_low_latency2 into the extension list
     ul_log::Write("VkHook: injecting VK_NV_low_latency2 into vkCreateDevice");
 
     uint32_t new_count = pCreateInfo->enabledExtensionCount + 1;
@@ -373,7 +411,6 @@ static VkResult Hooked_vkCreateDevice(
         ext_names[i] = pCreateInfo->ppEnabledExtensionNames[i];
     ext_names[pCreateInfo->enabledExtensionCount] = "VK_NV_low_latency2";
 
-    // Make a shallow copy of VkDeviceCreateInfo with the new extension list
     VkDeviceCreateInfo modified = *pCreateInfo;
     modified.enabledExtensionCount = new_count;
     modified.ppEnabledExtensionNames = ext_names.data();
@@ -384,7 +421,6 @@ static VkResult Hooked_vkCreateDevice(
         ul_log::Write("VkHook: VK_NV_low_latency2 injected successfully");
     } else {
         ul_log::Write("VkHook: vkCreateDevice with injected ext failed (%d), retrying without", res);
-        // Fall back to original call without injection
         res = s_orig_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
     }
 
@@ -393,10 +429,7 @@ static VkResult Hooked_vkCreateDevice(
 
 bool VkReflexHookCreateDevice() {
     HMODULE vk_dll = GetModuleHandleW(L"vulkan-1.dll");
-    if (!vk_dll) {
-        // Vulkan not loaded yet — that's fine, game might be DX
-        return false;
-    }
+    if (!vk_dll) return false;
 
     auto target = reinterpret_cast<void*>(GetProcAddress(vk_dll, "vkCreateDevice"));
     if (!target) {
@@ -420,11 +453,16 @@ bool VkReflexHookCreateDevice() {
 
     s_hook_installed.store(true, std::memory_order_relaxed);
     ul_log::Write("VkReflexHookCreateDevice: hook installed");
+
+    HookVkGetDeviceProcAddr();
+
     return true;
 }
 
 void VkReflexUnhookCreateDevice() {
     if (!s_hook_installed.load(std::memory_order_relaxed)) return;
+
+    UnhookVkGetDeviceProcAddr();
 
     HMODULE vk_dll = GetModuleHandleW(L"vulkan-1.dll");
     if (vk_dll) {

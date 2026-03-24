@@ -996,18 +996,20 @@ int UlLimiter::ResolveEnforcementSite() const {
 void UlLimiter::DoReflexSleep() {
     // Vulkan path: use VK_NV_low_latency2
     if (vk_reflex_ && vk_reflex_->IsActive()) {
+        // When the game uses native Reflex (calls vkSetLatencySleepModeNV /
+        // vkLatencySleepNV itself), do NOT call SetSleepMode or Sleep — our
+        // calls would conflict with the game's own sleep cycle and crash.
+        // The game handles its own pacing; we just provide timing backstop.
+        if (g_game_uses_reflex.load(std::memory_order_relaxed))
+            return;
+
+        // Non-native: update driver hints only, no semaphore wait.
+        // DoTimingFallback handles actual pacing.
         NvSleepParams p = BuildSleepParams();
-        // Always update the driver's low-latency mode / interval / boost hints
         vk_reflex_->SetSleepMode(
             p.bLowLatencyMode != 0,
             p.bLowLatencyBoost != 0,
             p.minimumIntervalUs);
-        // Only block on the timeline semaphore when the game uses native Reflex
-        // markers. Without markers the driver has no frame timing context, so
-        // vkWaitSemaphores blocks for the wrong duration → low FPS.
-        // In that case we let DoTimingFallback() handle the actual pacing.
-        if (g_game_uses_reflex.load(std::memory_order_relaxed))
-            vk_reflex_->Sleep();
         return;
     }
 
@@ -1282,11 +1284,10 @@ void UlLimiter::OnPresent() {
     bool vk_active = (vk_reflex_ && vk_reflex_->IsActive());
     bool vk_native = vk_active && g_game_uses_reflex.load(std::memory_order_relaxed);
     if (vk_active) {
-        // Only call DoReflexSleep (SetSleepMode + Sleep) when the game uses
-        // native Reflex markers. Without markers, SetSleepMode's halved
-        // minimumIntervalUs causes the driver to throttle at render rate
-        // instead of output rate. Let DoTimingFallback handle pacing instead.
-        if (vk_native)
+        // When the game uses native Reflex, it handles its own sleep cycle.
+        // We don't call SetSleepMode or Sleep to avoid conflicts/crashes.
+        // For non-native games, update driver hints only (no semaphore wait).
+        if (!vk_native)
             DoReflexSleep();
     } else if (ReflexActive() && dev_) {
         if (g_game_uses_reflex.load(std::memory_order_relaxed)) {
@@ -1297,13 +1298,13 @@ void UlLimiter::OnPresent() {
         }
     }
 
-    // Timing fallback as hard backstop
-    // When Vulkan Reflex is active AND the game uses native markers,
-    // vkLatencySleepNV + vkWaitSemaphores already blocks for the full
-    // interval — skip DoTimingFallback to avoid double-sleep.
-    // When VK Reflex is active but the game does NOT use native markers,
-    // Sleep() was skipped above, so we need the timing fallback for pacing.
-    if (!vk_native)
+    // Timing fallback as hard backstop.
+    // Always run for Vulkan (native or not) — native Reflex games handle
+    // their own sleep but we still provide a timing backstop if the user
+    // sets an FPS limit. For non-native VK, this is the primary pacer.
+    // Skip only for DX Reflex without native markers (DoReflexSleep already
+    // called InvokeSleep which blocks).
+    if (vk_active || !(ReflexActive() && dev_) || g_game_uses_reflex.load(std::memory_order_relaxed))
         DoTimingFallback();
 }
 
