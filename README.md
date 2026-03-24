@@ -1,6 +1,6 @@
 # Ultra Limiter — Comprehensive Feature Guide
 
-Ultra Limiter is a ReShade addon that provides GPU-aware frame rate limiting with deep NVIDIA Reflex integration, frame generation awareness, and adaptive pacing. It loads as a `.addon64` file through ReShade and works with any D3D11 or D3D12 game on NVIDIA GPUs.
+Ultra Limiter is a ReShade addon that provides GPU-aware frame rate limiting with deep NVIDIA Reflex integration, frame generation awareness, and adaptive pacing. It loads as a `.addon64` file through ReShade and works with 64-bit D3D11 or D3D12 games on NVIDIA GPUs. Not all games are compatible — titles with aggressive anti-cheat, custom rendering pipelines, or non-standard DXGI usage may not work correctly.
 
 The pacing engine is fully dynamic — it automatically detects frame generation, selects the optimal enforcement site, adjusts queue depth, manages Reflex Boost, and stabilizes output cadence. There are no presets or manual FG multiplier controls. Everything adapts in real time based on pipeline telemetry from `NvAPI_D3D_GetLatency`.
 
