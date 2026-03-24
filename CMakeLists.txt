@@ -29,6 +29,7 @@ add_library(ultra_limiter SHARED
     ul_limiter.cpp
     ul_log.cpp
     ul_reflex.cpp
+    ul_vk_reflex.cpp
     ul_timing.cpp
     version.rc
 )

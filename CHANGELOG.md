@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.0.4
+
+- Added Vulkan Reflex backend (VK_NV_low_latency2)
+- Hooks vkCreateDevice to inject VK_NV_low_latency2 extension automatically
+- Hybrid pacing for Vulkan games without native Reflex markers: driver low-latency hints + QPC timing fallback
+- Full Reflex sleep pacing for Vulkan games with native markers (vkLatencySleepNV + timeline semaphore)
+- Fixed Vulkan viewport Y-flip (negative height) breaking render resolution detection
+- OSD now shows output resolution when no upscaling is detected
+- OSD FG detection works on Vulkan via DLL-based identification
+- No changes to DX pacing paths
+
 ## v2.0.3
 
 - Added OSD drop shadow option for improved text readability

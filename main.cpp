@@ -13,6 +13,7 @@
 #include "ul_limiter.hpp"
 #include "ul_log.hpp"
 #include "ul_timing.hpp"
+#include "ul_vk_reflex.hpp"
 
 #include <reshade.hpp>
 
@@ -326,10 +327,14 @@ static void DrawOSD(reshade::api::effect_runtime*) {
     if (g_cfg.show_resolution.load(std::memory_order_relaxed)) {
         uint32_t ow = s_out_w.load(), oh = s_out_h.load();
         uint32_t rw = s_rnd_w.load(), rh = s_rnd_h.load();
-        // Only show resolution when upscaling is detected (render < output)
         if (rw > 0 && rh > 0 && ow > 0 && rw < ow) {
+            // Upscaling detected — show render → output
             int pct = static_cast<int>(100.0f * rw / static_cast<float>(ow));
             snprintf(buf, sizeof(buf), "Res: %ux%u -> %ux%u (%d%%)", rw, rh, ow, oh, pct);
+            add_line(buf, gold);
+        } else if (ow > 0 && oh > 0) {
+            // No upscaling — just show output resolution
+            snprintf(buf, sizeof(buf), "Res: %ux%u", ow, oh);
             add_line(buf, gold);
         }
     }
@@ -871,12 +876,23 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
     // --- Status ---
     ImGui::Spacing();
     ImGui::TextDisabled("Status");
-    ImGui::Text("Reflex: %s", ReflexActive() ? "Hooked" : "Not hooked");
+    ImGui::Text("Reflex: %s", g_vk_reflex.IsActive() ? "Vulkan (VK_NV_low_latency2)" :
+                              ReflexActive() ? "Hooked" : "Not hooked");
     ImGui::Text("Native Reflex: %s", g_game_uses_reflex.load() ? "Detected" : "No");
 
     bool native = g_game_uses_reflex.load();
+    bool vk_active = g_vk_reflex.IsActive();
     const char* mode = "Timing";
-    if (!ReflexActive()) mode = "Timing (no Reflex)";
+    if (vk_active) {
+        if (native) {
+            const auto& ps = s_limiter.GetPipelineStats();
+            int site = ps.valid ? ps.auto_site : PRESENT_FINISH;
+            mode = (site == SIM_START) ? "Vulkan Reflex (Sim Start)" : "Vulkan Reflex (Present)";
+        } else {
+            mode = "Vulkan Low-Latency + Timing";
+        }
+    }
+    else if (!ReflexActive()) mode = "Timing (no Reflex)";
     else if (native) {
         // Show the dynamically resolved enforcement site
         const auto& ps = s_limiter.GetPipelineStats();
@@ -927,11 +943,7 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
         auto api = dev->get_api();
         ul_log::Write("OnInitSwapchain: api=%d", (int)api);
 
-        if (api != reshade::api::device_api::d3d11 && api != reshade::api::device_api::d3d12) return;
-
-        IUnknown* native = reinterpret_cast<IUnknown*>(dev->get_native());
-
-        // Capture output resolution from back buffer
+        // Capture output resolution from back buffer (works for all APIs)
         {
             reshade::api::resource bb = sc->get_back_buffer(0);
             if (bb != reshade::api::resource{0}) {
@@ -945,6 +957,34 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
 
         UpdateFGString();
         ul_log::Write("OnInitSwapchain: FG=%s", s_fg_str);
+
+        // --- Vulkan path ---
+        if (api == reshade::api::device_api::vulkan) {
+            VkDevice vk_dev = reinterpret_cast<VkDevice>(static_cast<uintptr_t>(dev->get_native()));
+            if (vk_dev) {
+                ul_log::Write("OnInitSwapchain: Vulkan device detected (ext injected=%d)",
+                              VkReflexExtensionInjected() ? 1 : 0);
+                if (g_vk_reflex.Init(vk_dev)) {
+                    // ReShade exposes VkSwapchainKHR as the native swapchain handle
+                    VkSwapchainKHR vk_sc = sc->get_native();
+                    if (vk_sc && g_vk_reflex.AttachSwapchain(vk_sc)) {
+                        s_limiter.ConnectVulkanReflex(&g_vk_reflex);
+                        ul_log::Write("OnInitSwapchain: Vulkan Reflex active");
+                    } else {
+                        ul_log::Write("OnInitSwapchain: Vulkan swapchain attach failed — timing fallback");
+                    }
+                } else {
+                    ul_log::Write("OnInitSwapchain: VK_NV_low_latency2 not available — timing fallback");
+                }
+            }
+            ul_log::Write("OnInitSwapchain: done (Vulkan)");
+            return;
+        }
+
+        // --- DX path ---
+        if (api != reshade::api::device_api::d3d11 && api != reshade::api::device_api::d3d12) return;
+
+        IUnknown* native = reinterpret_cast<IUnknown*>(dev->get_native());
 
         if (native) {
             s_reflex_dev = native;
@@ -996,6 +1036,11 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
 
 static void OnDestroySwapchain(reshade::api::swapchain* sc, bool) {
     ul_log::Write("OnDestroySwapchain");
+    // Detach Vulkan Reflex if active
+    if (g_vk_reflex.IsActive()) {
+        g_vk_reflex.DetachSwapchain();
+        ul_log::Write("OnDestroySwapchain: Vulkan Reflex detached");
+    }
     // Release swapchain vtable hooks (SL proxy, VSync, frame latency) before
     // the swapchain is freed. This prevents use-after-free when MinHook tries
     // to restore the original function prologues during MH_Uninitialize.
@@ -1016,19 +1061,42 @@ static constexpr int kMaxVpBuckets = 8;
 static VpBucket s_vp_buckets[kMaxVpBuckets] = {};
 static int s_vp_bucket_count = 0;
 
+static std::atomic<int> s_vp_calls{0};
+static bool s_vp_logged = false;
+static bool s_vp_sub_logged = false;
+
 static void OnBindViewports(reshade::api::command_list*,
                             uint32_t first,
                             uint32_t count,
                             const reshade::api::viewport* viewports) {
     if (!count || !viewports) return;
 
+    s_vp_calls.fetch_add(1, std::memory_order_relaxed);
+
     uint32_t ow = s_out_w.load(std::memory_order_relaxed);
     uint32_t oh = s_out_h.load(std::memory_order_relaxed);
     if (!ow || !oh) return;
 
+    // One-time log of first viewport seen
+    if (!s_vp_logged) {
+        float fw0 = viewports[0].width;
+        float fh0 = viewports[0].height;
+        if (fh0 < 0.0f) fh0 = -fh0;
+        ul_log::Write("Viewport: first seen %.0fx%.0f (output %ux%u, count=%u)",
+                      fw0, fh0, ow, oh, count);
+        s_vp_logged = true;
+    }
+
     for (uint32_t i = 0; i < count; i++) {
-        uint32_t w = static_cast<uint32_t>(viewports[i].width);
-        uint32_t h = static_cast<uint32_t>(viewports[i].height);
+        // Vulkan allows negative viewport height (Y-flip convention).
+        // Use absolute values so the sub-native detection works correctly.
+        float fw = viewports[i].width;
+        float fh = viewports[i].height;
+        if (fw <= 0.0f) fw = -fw;
+        if (fh <= 0.0f) fh = -fh;
+        if (fw < 1.0f || fh < 1.0f) continue;
+        uint32_t w = static_cast<uint32_t>(fw);
+        uint32_t h = static_cast<uint32_t>(fh);
 
         // Must be smaller than output (this is the upscale source)
         if (w >= ow || h >= oh) continue;
@@ -1041,6 +1109,12 @@ static void OnBindViewports(reshade::api::command_list*,
         float out_ar = static_cast<float>(ow) / oh;
         float vp_ar = static_cast<float>(w) / h;
         if (std::abs(vp_ar - out_ar) / out_ar > 0.10f) continue;
+
+        // One-time log of first sub-native viewport
+        if (!s_vp_sub_logged) {
+            ul_log::Write("Viewport: sub-native %ux%u detected (output %ux%u)", w, h, ow, oh);
+            s_vp_sub_logged = true;
+        }
 
         // Tally in per-frame buckets
         bool found = false;
@@ -1071,6 +1145,13 @@ static void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* sc,
         if (cnt > 300 && cnt % 30 == 0) PollGpuLatency();
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         ul_log::Write("OnPresent: exception 0x%08X", GetExceptionCode());
+    }
+
+    // Log viewport event status after 300 frames
+    if (cnt == 300) {
+        int vp = s_vp_calls.load(std::memory_order_relaxed);
+        ul_log::Write("Viewport: %d bind_viewports calls after %llu presents (buckets=%d)",
+                      vp, cnt, s_vp_bucket_count);
     }
 
     // Commit the most-used sub-native viewport as the render resolution
@@ -1147,6 +1228,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         __try {
             s_limiter.Init();
 
+            // Hook vkCreateDevice to inject VK_NV_low_latency2 before the game
+            // creates its Vulkan device. Safe to call even if Vulkan isn't loaded.
+            VkReflexHookCreateDevice();
+
             SetSLPresentCb(OnSLPresentCb);
             SetMarkerCb(OnMarkerCb);
             StartWorker();
@@ -1171,6 +1256,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         ul_log::Write("Shutting down");
         SetUnhandledExceptionFilter(s_prev_filter);
         StopWorker();
+        VkReflexUnhookCreateDevice();
         reshade::unregister_overlay("ReLimiter", DrawOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_overlay>(DrawOSD);
         s_limiter.Shutdown();

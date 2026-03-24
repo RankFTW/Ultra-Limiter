@@ -16,6 +16,9 @@
 #include <cstdint>
 #include <windows.h>
 
+// Forward declaration
+class VkReflex;
+
 // ============================================================================
 // Bottleneck identification
 // ============================================================================
@@ -228,6 +231,7 @@ public:
     void Shutdown();
 
     bool ConnectReflex(IUnknown* device);
+    void ConnectVulkanReflex(VkReflex* vk);
     void SetHwnd(HWND hwnd) { hwnd_ = hwnd; }
 
     void OnPresent();
@@ -254,6 +258,7 @@ private:
     IUnknown* dev_ = nullptr;
     HWND hwnd_ = nullptr;
     uint64_t frame_num_ = 0;
+    VkReflex* vk_reflex_ = nullptr;  // non-null when Vulkan backend is active
 
     HANDLE htimer_delay_ = nullptr;
     HANDLE htimer_fallback_ = nullptr;

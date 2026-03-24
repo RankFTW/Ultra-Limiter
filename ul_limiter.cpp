@@ -12,6 +12,7 @@
 #include "ul_limiter.hpp"
 #include "ul_log.hpp"
 #include "ul_timing.hpp"
+#include "ul_vk_reflex.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -419,6 +420,12 @@ void UlLimiter::Init() {
 }
 
 void UlLimiter::Shutdown() {
+    // Vulkan cleanup
+    if (vk_reflex_) {
+        vk_reflex_->Shutdown();
+        vk_reflex_ = nullptr;
+    }
+
     if (dev_ && ReflexActive()) {
         const auto& gs = GetGameState();
         NvSleepParams p = {};
@@ -451,6 +458,12 @@ bool UlLimiter::ConnectReflex(IUnknown* device) {
     }
     ul_log::Write("ConnectReflex: hooks active");
     return true;
+}
+
+void UlLimiter::ConnectVulkanReflex(VkReflex* vk) {
+    vk_reflex_ = vk;
+    ul_log::Write("ConnectVulkanReflex: Vulkan Reflex backend attached (active=%d)",
+                  vk ? vk->IsActive() : 0);
 }
 
 void UlLimiter::ResetAdaptiveState() {
@@ -589,15 +602,27 @@ bool UlLimiter::MaybeUpdateSleepMode(const NvSleepParams& p) {
 // ============================================================================
 
 void UlLimiter::UpdatePipelineStats() {
-    if (!ReflexActive() || !dev_ || !latency_buf_) return;
+    if (!latency_buf_) return;
 
-    memset(latency_buf_, 0, sizeof(*latency_buf_));
-    latency_buf_->version = NV_LATENCY_RESULT_VER;
+    // Vulkan path
+    if (vk_reflex_ && vk_reflex_->IsActive()) {
+        memset(latency_buf_, 0, sizeof(*latency_buf_));
+        latency_buf_->version = NV_LATENCY_RESULT_VER;
+        if (!vk_reflex_->GetLatencyTimings(latency_buf_)) return;
+        // Fall through to shared analysis below
+    }
+    // DX path
+    else {
+        if (!ReflexActive() || !dev_) return;
 
-    NvStatus st;
-    __try { st = InvokeGetLatency(dev_, latency_buf_); }
-    __except(EXCEPTION_EXECUTE_HANDLER) { st = NV_NO_IMPL; }
-    if (st != NV_OK) return;
+        memset(latency_buf_, 0, sizeof(*latency_buf_));
+        latency_buf_->version = NV_LATENCY_RESULT_VER;
+
+        NvStatus st;
+        __try { st = InvokeGetLatency(dev_, latency_buf_); }
+        __except(EXCEPTION_EXECUTE_HANDLER) { st = NV_NO_IMPL; }
+        if (st != NV_OK) return;
+    }
 
     // Scan the most recent valid reports (up to 16)
     float sum_gpu = 0, sum_queue = 0, sum_fg = 0;
@@ -969,6 +994,24 @@ int UlLimiter::ResolveEnforcementSite() const {
 // ============================================================================
 
 void UlLimiter::DoReflexSleep() {
+    // Vulkan path: use VK_NV_low_latency2
+    if (vk_reflex_ && vk_reflex_->IsActive()) {
+        NvSleepParams p = BuildSleepParams();
+        // Always update the driver's low-latency mode / interval / boost hints
+        vk_reflex_->SetSleepMode(
+            p.bLowLatencyMode != 0,
+            p.bLowLatencyBoost != 0,
+            p.minimumIntervalUs);
+        // Only block on the timeline semaphore when the game uses native Reflex
+        // markers. Without markers the driver has no frame timing context, so
+        // vkWaitSemaphores blocks for the wrong duration → low FPS.
+        // In that case we let DoTimingFallback() handle the actual pacing.
+        if (g_game_uses_reflex.load(std::memory_order_relaxed))
+            vk_reflex_->Sleep();
+        return;
+    }
+
+    // DX path: NVAPI
     if (!ReflexActive() || !dev_) return;
     NvSleepParams p = BuildSleepParams();
     MaybeUpdateSleepMode(p);
@@ -1028,7 +1071,8 @@ void UlLimiter::HandleQueuedFrames(uint64_t frame_id, int max_q) {
 // ============================================================================
 
 void UlLimiter::OnMarker(int marker_type, uint64_t frame_id) {
-    if (!ReflexActive() || !dev_) return;
+    bool has_reflex = (ReflexActive() && dev_) || (vk_reflex_ && vk_reflex_->IsActive());
+    if (!has_reflex) return;
     if (!warmup_done_) return;
 
     if (s_smooth_motion.load(std::memory_order_relaxed)) return;
@@ -1205,7 +1249,8 @@ void UlLimiter::OnPresent() {
     }
 
     // Present-to-present feedback loop (1:1 only — not under FG)
-    if (ReflexActive() && dev_ && DetectFGDivisor() == 1) {
+    bool any_reflex = (ReflexActive() && dev_) || (vk_reflex_ && vk_reflex_->IsActive());
+    if (any_reflex && DetectFGDivisor() == 1) {
         float out_fps = g_cfg.fps_limit.load(std::memory_order_relaxed);
         if (out_fps > 0.0f) {
             float target_us = 1'000'000.0f / out_fps;
@@ -1233,8 +1278,17 @@ void UlLimiter::OnPresent() {
         }
     }
 
-    // Reflex path
-    if (ReflexActive() && dev_) {
+    // Reflex path — DX or Vulkan
+    bool vk_active = (vk_reflex_ && vk_reflex_->IsActive());
+    bool vk_native = vk_active && g_game_uses_reflex.load(std::memory_order_relaxed);
+    if (vk_active) {
+        // Only call DoReflexSleep (SetSleepMode + Sleep) when the game uses
+        // native Reflex markers. Without markers, SetSleepMode's halved
+        // minimumIntervalUs causes the driver to throttle at render rate
+        // instead of output rate. Let DoTimingFallback handle pacing instead.
+        if (vk_native)
+            DoReflexSleep();
+    } else if (ReflexActive() && dev_) {
         if (g_game_uses_reflex.load(std::memory_order_relaxed)) {
             NvSleepParams p = BuildSleepParams();
             MaybeUpdateSleepMode(p);
@@ -1244,7 +1298,13 @@ void UlLimiter::OnPresent() {
     }
 
     // Timing fallback as hard backstop
-    DoTimingFallback();
+    // When Vulkan Reflex is active AND the game uses native markers,
+    // vkLatencySleepNV + vkWaitSemaphores already blocks for the full
+    // interval — skip DoTimingFallback to avoid double-sleep.
+    // When VK Reflex is active but the game does NOT use native markers,
+    // Sleep() was skipped above, so we need the timing fallback for pacing.
+    if (!vk_native)
+        DoTimingFallback();
 }
 
 // ============================================================================
