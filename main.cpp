@@ -374,11 +374,8 @@ static void DrawOSD(reshade::api::effect_runtime*) {
             int pct = static_cast<int>(100.0f * rw / static_cast<float>(ow));
             snprintf(buf, sizeof(buf), "Res: %ux%u -> %ux%u (%d%%)", rw, rh, ow, oh, pct);
             add_line(buf, gold);
-        } else if (ow > 0 && oh > 0) {
-            // No upscaling — just show output resolution
-            snprintf(buf, sizeof(buf), "Res: %ux%u", ow, oh);
-            add_line(buf, gold);
         }
+        // No upscaling — hide resolution line
     }
 
     has_graph = g_cfg.show_graph.load(std::memory_order_relaxed) &&
@@ -1195,7 +1192,9 @@ static void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* sc,
                       vp, cnt, s_vp_bucket_count);
     }
 
-    // Commit the most-used sub-native viewport as the render resolution
+    // Commit the most-used sub-native viewport as the render resolution.
+    // When no sub-native viewports were seen this frame, clear the render
+    // resolution so the OSD hides the resolution line for non-upscaled games.
     if (s_vp_bucket_count > 0) {
         int best = 0;
         for (int i = 1; i < s_vp_bucket_count; i++) {
@@ -1205,6 +1204,9 @@ static void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* sc,
         s_rnd_w.store(s_vp_buckets[best].w, std::memory_order_relaxed);
         s_rnd_h.store(s_vp_buckets[best].h, std::memory_order_relaxed);
         s_vp_bucket_count = 0;
+    } else {
+        s_rnd_w.store(0, std::memory_order_relaxed);
+        s_rnd_h.store(0, std::memory_order_relaxed);
     }
 }
 
