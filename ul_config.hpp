@@ -56,6 +56,9 @@ struct UlConfig {
     // 5XXX Exclusive Pacing Optimization (flip metering)
     std::atomic<bool> exclusive_pacing{false};
 
+    // Fake Fullscreen — intercept exclusive fullscreen and convert to borderless window
+    std::atomic<bool> fake_fullscreen{false};
+
     // Keybinds (virtual key codes)
     std::atomic<int> osd_toggle_key{VK_END};  // default: END
 

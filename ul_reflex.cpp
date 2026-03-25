@@ -14,6 +14,7 @@
 
 #include <MinHook.h>
 #include <dxgi.h>
+#include <dxgi1_2.h>
 #include <dxgi1_5.h>
 #include <cstring>
 #include <intrin.h>  // _ReturnAddress for RTSS filter
@@ -699,6 +700,277 @@ void ApplyFrameLatency() {
     }
 }
 
+// ============================================================================
+// Fake Fullscreen — intercept exclusive fullscreen at creation time
+// ============================================================================
+// Strategy: hook CreateSwapChain/CreateSwapChainForHwnd on the DXGI Factory
+// to force Windowed=TRUE at creation time. Also hook SetFullscreenState,
+// GetFullscreenState, and ResizeTarget on the swapchain as a safety net.
+// This prevents the game from ever entering exclusive fullscreen mode.
+// Source: public Microsoft DXGI documentation (IDXGIFactory, IDXGISwapChain).
+
+// --- Factory hooks (persistent, not per-swapchain) ---
+
+// IDXGIFactory vtable: IUnknown[0-2] + IDXGIObject[3-6] + IDXGIFactory[7-10]
+// vtable[10] = CreateSwapChain
+using CreateSwapChainFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
+static CreateSwapChainFn s_orig_create_swapchain = nullptr;
+static void* s_factory_csc_target = nullptr;
+static std::atomic<bool> s_factory_hooked{false};
+
+// IDXGIFactory2 vtable: extends IDXGIFactory1 which extends IDXGIFactory
+// IDXGIFactory1 adds: EnumAdapters1[12], IsCurrent[13]
+// IDXGIFactory2 adds: IsWindowedStereoEnabled[14], CreateSwapChainForHwnd[15]
+using CreateSwapChainForHwndFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, HWND,
+    const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+static CreateSwapChainForHwndFn s_orig_create_swapchain_hwnd = nullptr;
+static void* s_factory_csc_hwnd_target = nullptr;
+
+// --- Swapchain hooks ---
+
+using SetFullscreenStateFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, BOOL, IDXGIOutput*);
+using GetFullscreenStateFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, BOOL*, IDXGIOutput**);
+using ResizeTargetFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, const DXGI_MODE_DESC*);
+
+static SetFullscreenStateFn s_orig_set_fullscreen = nullptr;
+static GetFullscreenStateFn s_orig_get_fullscreen = nullptr;
+static ResizeTargetFn s_orig_resize_target = nullptr;
+static std::atomic<bool> s_fake_fs_hooked{false};
+static void* s_fake_fs_set_target = nullptr;
+static void* s_fake_fs_get_target = nullptr;
+static void* s_fake_fs_rt_target = nullptr;
+static std::atomic<bool> s_fake_fs_active{false};
+static HWND s_fake_fs_hwnd = nullptr;
+
+// --- Factory hook implementations ---
+
+static HRESULT STDMETHODCALLTYPE Hook_CreateSwapChain(
+    IDXGIFactory* factory, IUnknown* pDevice,
+    DXGI_SWAP_CHAIN_DESC* pDesc, IDXGISwapChain** ppSwapChain)
+{
+    if (g_cfg.fake_fullscreen.load(std::memory_order_relaxed) && pDesc && !pDesc->Windowed) {
+        ul_log::Write("FakeFullscreen: CreateSwapChain forced Windowed=TRUE (was %ux%u fullscreen)",
+                      pDesc->BufferDesc.Width, pDesc->BufferDesc.Height);
+        pDesc->Windowed = TRUE;
+        pDesc->Flags &= ~DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+        s_fake_fs_active.store(true, std::memory_order_relaxed);
+        if (pDesc->OutputWindow) s_fake_fs_hwnd = pDesc->OutputWindow;
+    }
+    return s_orig_create_swapchain(factory, pDevice, pDesc, ppSwapChain);
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_CreateSwapChainForHwnd(
+    IDXGIFactory2* factory, IUnknown* pDevice, HWND hWnd,
+    const DXGI_SWAP_CHAIN_DESC1* pDesc,
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
+    IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain)
+{
+    // CreateSwapChainForHwnd: if pFullscreenDesc is non-null and Windowed=FALSE,
+    // force windowed mode by passing NULL for pFullscreenDesc.
+    if (g_cfg.fake_fullscreen.load(std::memory_order_relaxed) &&
+        pFullscreenDesc && !pFullscreenDesc->Windowed) {
+        ul_log::Write("FakeFullscreen: CreateSwapChainForHwnd forced windowed (was fullscreen)");
+        s_fake_fs_active.store(true, std::memory_order_relaxed);
+        if (hWnd) s_fake_fs_hwnd = hWnd;
+        // Strip ALLOW_MODE_SWITCH if present
+        if (pDesc) {
+            DXGI_SWAP_CHAIN_DESC1 mod = *pDesc;
+            mod.Flags &= ~DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+            return s_orig_create_swapchain_hwnd(factory, pDevice, hWnd, &mod,
+                                                 nullptr, pRestrictToOutput, ppSwapChain);
+        }
+        return s_orig_create_swapchain_hwnd(factory, pDevice, hWnd, pDesc,
+                                             nullptr, pRestrictToOutput, ppSwapChain);
+    }
+    return s_orig_create_swapchain_hwnd(factory, pDevice, hWnd, pDesc,
+                                         pFullscreenDesc, pRestrictToOutput, ppSwapChain);
+}
+
+// --- Swapchain hook implementations ---
+
+static HRESULT STDMETHODCALLTYPE Hook_SetFullscreenState(
+    IDXGISwapChain* sc, BOOL fullscreen, IDXGIOutput* pTarget)
+{
+    if (!g_cfg.fake_fullscreen.load(std::memory_order_relaxed))
+        return s_orig_set_fullscreen(sc, fullscreen, pTarget);
+
+    if (fullscreen) {
+        // Apply borderless window style
+        HWND hwnd = s_fake_fs_hwnd;
+        if (!hwnd) {
+            DXGI_SWAP_CHAIN_DESC desc = {};
+            if (SUCCEEDED(sc->GetDesc(&desc))) hwnd = desc.OutputWindow;
+        }
+        if (!hwnd) hwnd = GetForegroundWindow();
+        if (hwnd) {
+            s_fake_fs_hwnd = hwnd;
+            LONG st = GetWindowLongA(hwnd, GWL_STYLE);
+            st &= ~(WS_OVERLAPPEDWINDOW | WS_CAPTION | WS_BORDER | WS_THICKFRAME);
+            st |= WS_POPUP;
+            SetWindowLongA(hwnd, GWL_STYLE, st);
+            LONG ex = GetWindowLongA(hwnd, GWL_EXSTYLE);
+            ex &= ~(WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE);
+            SetWindowLongA(hwnd, GWL_EXSTYLE, ex);
+            HMONITOR hm = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi = {}; mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoA(hm, &mi)) {
+                SetWindowPos(hwnd, HWND_TOP,
+                             mi.rcMonitor.left, mi.rcMonitor.top,
+                             mi.rcMonitor.right - mi.rcMonitor.left,
+                             mi.rcMonitor.bottom - mi.rcMonitor.top,
+                             SWP_FRAMECHANGED | SWP_NOZORDER);
+            }
+            ul_log::Write("FakeFullscreen: blocked SetFullscreenState(TRUE) — borderless applied");
+        }
+        s_fake_fs_active.store(true, std::memory_order_relaxed);
+        return S_OK;
+    } else {
+        s_fake_fs_active.store(false, std::memory_order_relaxed);
+        ul_log::Write("FakeFullscreen: SetFullscreenState(FALSE) — passthrough");
+        return s_orig_set_fullscreen(sc, FALSE, pTarget);
+    }
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_GetFullscreenState(
+    IDXGISwapChain* sc, BOOL* pFullscreen, IDXGIOutput** ppTarget)
+{
+    if (g_cfg.fake_fullscreen.load(std::memory_order_relaxed) &&
+        s_fake_fs_active.load(std::memory_order_relaxed)) {
+        if (pFullscreen) *pFullscreen = TRUE;
+        if (ppTarget) *ppTarget = nullptr;
+        return S_OK;
+    }
+    return s_orig_get_fullscreen(sc, pFullscreen, ppTarget);
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_ResizeTarget(
+    IDXGISwapChain* sc, const DXGI_MODE_DESC* pNewTargetParameters)
+{
+    if (g_cfg.fake_fullscreen.load(std::memory_order_relaxed) &&
+        s_fake_fs_active.load(std::memory_order_relaxed)) {
+        if (pNewTargetParameters)
+            ul_log::Write("FakeFullscreen: blocked ResizeTarget %ux%u",
+                          pNewTargetParameters->Width, pNewTargetParameters->Height);
+        return S_OK;
+    }
+    return s_orig_resize_target(sc, pNewTargetParameters);
+}
+
+// --- Hook installation ---
+
+static void HookFactory(IDXGISwapChain* sc) {
+    if (s_factory_hooked.load(std::memory_order_relaxed)) return;
+
+    // Get the factory from the swapchain
+    IDXGIFactory* factory = nullptr;
+    if (FAILED(sc->GetParent(__uuidof(IDXGIFactory), (void**)&factory)) || !factory) return;
+
+    void** vtable = *reinterpret_cast<void***>(factory);
+    if (!vtable) { factory->Release(); return; }
+
+    // IDXGIFactory::CreateSwapChain = vtable[10]
+    MH_STATUS st = MH_CreateHook(vtable[10], (void*)Hook_CreateSwapChain,
+                                 (void**)&s_orig_create_swapchain);
+    if (st == MH_OK) {
+        if (MH_EnableHook(vtable[10]) == MH_OK) {
+            s_factory_csc_target = vtable[10];
+            ul_log::Write("FakeFullscreen: hooked IDXGIFactory::CreateSwapChain");
+        } else {
+            MH_RemoveHook(vtable[10]);
+        }
+    }
+
+    // Try IDXGIFactory2::CreateSwapChainForHwnd
+    IDXGIFactory2* factory2 = nullptr;
+    if (SUCCEEDED(factory->QueryInterface(__uuidof(IDXGIFactory2), (void**)&factory2)) && factory2) {
+        void** vtable2 = *reinterpret_cast<void***>(factory2);
+        if (vtable2) {
+            // IDXGIFactory2::CreateSwapChainForHwnd = vtable[15]
+            st = MH_CreateHook(vtable2[15], (void*)Hook_CreateSwapChainForHwnd,
+                               (void**)&s_orig_create_swapchain_hwnd);
+            if (st == MH_OK) {
+                if (MH_EnableHook(vtable2[15]) == MH_OK) {
+                    s_factory_csc_hwnd_target = vtable2[15];
+                    ul_log::Write("FakeFullscreen: hooked IDXGIFactory2::CreateSwapChainForHwnd");
+                } else {
+                    MH_RemoveHook(vtable2[15]);
+                }
+            }
+        }
+        factory2->Release();
+    }
+
+    factory->Release();
+    s_factory_hooked.store(true, std::memory_order_relaxed);
+}
+
+bool HookFakeFullscreen(IDXGISwapChain* sc) {
+    if (!sc || s_fake_fs_hooked.load(std::memory_order_acquire)) return false;
+
+    // RE Engine games (DMC5, RE2/3/4/Village/9) are incompatible with fake
+    // fullscreen — the engine's internal fullscreen state machine recreates
+    // the swapchain in an infinite loop regardless of our hooks.
+    {
+        HMODULE exe = GetModuleHandleW(nullptr);
+        if (exe) {
+            wchar_t path[MAX_PATH] = {};
+            GetModuleFileNameW(exe, path, MAX_PATH);
+            wchar_t* slash = wcsrchr(path, L'\\');
+            if (slash) {
+                wcscpy(slash + 1, L"re_chunk_000.pak");
+                if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+                    ul_log::Write("HookFakeFullscreen: RE Engine detected — skipping (incompatible)");
+                    return false;
+                }
+            }
+        }
+    }
+
+    // Hook the factory first (persistent — survives swapchain recreation)
+    HookFactory(sc);
+
+    void** vtable = *reinterpret_cast<void***>(sc);
+    if (!vtable) return false;
+
+    // Swapchain vtable[10] = SetFullscreenState, [11] = GetFullscreenState, [14] = ResizeTarget
+    MH_STATUS st = MH_CreateHook(vtable[10], (void*)Hook_SetFullscreenState,
+                                 (void**)&s_orig_set_fullscreen);
+    if (st != MH_OK) {
+        ul_log::Write("HookFakeFullscreen: MH_CreateHook(Set) failed=%d", st);
+        return false;
+    }
+    if (MH_EnableHook(vtable[10]) != MH_OK) {
+        MH_RemoveHook(vtable[10]);
+        return false;
+    }
+    s_fake_fs_set_target = vtable[10];
+
+    st = MH_CreateHook(vtable[11], (void*)Hook_GetFullscreenState,
+                       (void**)&s_orig_get_fullscreen);
+    if (st != MH_OK) {
+        ul_log::Write("HookFakeFullscreen: MH_CreateHook(Get) failed=%d", st);
+    } else {
+        MH_EnableHook(vtable[11]);
+        s_fake_fs_get_target = vtable[11];
+    }
+
+    st = MH_CreateHook(vtable[14], (void*)Hook_ResizeTarget,
+                       (void**)&s_orig_resize_target);
+    if (st != MH_OK) {
+        ul_log::Write("HookFakeFullscreen: MH_CreateHook(ResizeTarget) failed=%d", st);
+    } else {
+        if (MH_EnableHook(vtable[14]) == MH_OK) {
+            s_fake_fs_rt_target = vtable[14];
+        } else {
+            MH_RemoveHook(vtable[14]);
+        }
+    }
+
+    s_fake_fs_hooked.store(true, std::memory_order_release);
+    ul_log::Write("HookFakeFullscreen: hooked SetFullscreenState/GetFullscreenState/ResizeTarget");
+    return true;
+}
+
 void ReleaseSwapchainHooks() {
     // Disable and remove swapchain vtable hooks before the swapchain is freed.
     // This prevents MH_Uninitialize from touching stale memory during shutdown.
@@ -738,5 +1010,28 @@ void ReleaseSwapchainHooks() {
         s_orig_get_max_latency = nullptr;
         if (s_latency_sc2) { s_latency_sc2->Release(); s_latency_sc2 = nullptr; }
         ul_log::Write("ReleaseSwapchainHooks: frame latency released");
+    }
+
+    if (s_fake_fs_hooked.exchange(false, std::memory_order_acq_rel)) {
+        if (s_fake_fs_set_target) {
+            MH_DisableHook(s_fake_fs_set_target);
+            MH_RemoveHook(s_fake_fs_set_target);
+            s_fake_fs_set_target = nullptr;
+        }
+        if (s_fake_fs_get_target) {
+            MH_DisableHook(s_fake_fs_get_target);
+            MH_RemoveHook(s_fake_fs_get_target);
+            s_fake_fs_get_target = nullptr;
+        }
+        s_orig_set_fullscreen = nullptr;
+        s_orig_get_fullscreen = nullptr;
+        if (s_fake_fs_rt_target) {
+            MH_DisableHook(s_fake_fs_rt_target);
+            MH_RemoveHook(s_fake_fs_rt_target);
+            s_fake_fs_rt_target = nullptr;
+        }
+        s_orig_resize_target = nullptr;
+        s_fake_fs_active.store(false, std::memory_order_relaxed);
+        ul_log::Write("ReleaseSwapchainHooks: fake fullscreen released");
     }
 }

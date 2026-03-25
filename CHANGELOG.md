@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.0.9
+
+- Added Fake Fullscreen option — intercepts exclusive fullscreen and converts to borderless window
+- Hooks DXGI Factory CreateSwapChain/CreateSwapChainForHwnd to force windowed mode at creation time
+- Hooks SetFullscreenState, GetFullscreenState, and ResizeTarget as safety net
+- RE Engine games auto-detected and skipped (incompatible with fake fullscreen)
+- Skipped in Streamline safe mode
+- Added NGX loader DLLs (nvngx.dll, _nvngx.dll) to upscaler detection gate
+- Added upscaler detection diagnostic logging
+- Fixed OSD resolution line flickering in FG games (60-frame decay instead of instant clear)
+- Fixed OSD resolution bouncing between different sub-native viewports (now picks largest instead of most frequent)
+
 ## v2.0.8
 
 - Fixed background FPS limiter not sleeping consistently (grid drift from using wall-clock instead of grid-aligned advancement)

@@ -90,6 +90,7 @@ static void WriteDefaults(const char* path) {
         "window_mode=none\n"
         "vsync_override=0\n"
         "exclusive_pacing=false\n"
+        "fake_fullscreen=false\n"
         "osd_toggle_key=35\n"
         "osd_bg_opacity=0\n"
         "osd_drop_shadow=false\n"
@@ -195,6 +196,7 @@ void LoadSettings(HMODULE addon_module) {
     else                                         g_cfg.window_mode.store(WindowMode::NoOverride);
     g_cfg.vsync_override.store(GetPrivateProfileIntA("UltraLimiter", "vsync_override", 0, ini));
     g_cfg.exclusive_pacing.store(ReadBool(ini, "exclusive_pacing", false));
+    g_cfg.fake_fullscreen.store(ReadBool(ini, "fake_fullscreen", false));
     g_cfg.osd_toggle_key.store(GetPrivateProfileIntA("UltraLimiter", "osd_toggle_key", VK_END, ini));
     g_cfg.osd_bg_opacity.store(GetPrivateProfileIntA("UltraLimiter", "osd_bg_opacity", 0, ini));
     g_cfg.osd_drop_shadow.store(ReadBool(ini, "osd_drop_shadow", false));
@@ -235,4 +237,5 @@ void SaveSettings() {
     WInt("osd_text_brightness", g_cfg.osd_text_brightness.load());
     WInt("vsync_override", g_cfg.vsync_override.load());
     WBool("exclusive_pacing", g_cfg.exclusive_pacing.load());
+    WBool("fake_fullscreen", g_cfg.fake_fullscreen.load());
 }

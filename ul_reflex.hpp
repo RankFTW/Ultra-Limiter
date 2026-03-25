@@ -165,7 +165,11 @@ bool HookFrameLatency(IDXGISwapChain* sc);
 // Re-apply the frame latency override (call after config changes at runtime).
 void ApplyFrameLatency();
 
-// Release swapchain vtable hooks (SL proxy, VSync, frame latency).
+// --- Fake Fullscreen (intercept exclusive fullscreen → borderless window) ---
+
+bool HookFakeFullscreen(IDXGISwapChain* sc);
+
+// Release swapchain vtable hooks (SL proxy, VSync, frame latency, fake fullscreen).
 // Must be called from OnDestroySwapchain before the swapchain is freed.
 void ReleaseSwapchainHooks();
 

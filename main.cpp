@@ -884,6 +884,17 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
             g_cfg.window_mode.store(static_cast<WindowMode>(wm)); changed = true;
             RequestWindowMode(static_cast<WindowMode>(wm));
         }
+
+        ImGui::Spacing();
+        bool ffs = g_cfg.fake_fullscreen.load(std::memory_order_relaxed);
+        if (ImGui::Checkbox("Fake Fullscreen", &ffs)) {
+            g_cfg.fake_fullscreen.store(ffs); changed = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Intercept exclusive fullscreen and convert to borderless window.\n"
+            "The game thinks it's in fullscreen but runs in a borderless window.\n"
+            "Requires game restart to take effect.");
+
         ImGui::Unindent(8);
     }
 
@@ -1065,6 +1076,17 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
             ul_log::Write("OnInitSwapchain: skipping FrameLatency hook (Streamline safe mode)");
         }
 
+        // Hook SetFullscreenState for fake fullscreen (borderless window override)
+        if (!IsStreamlineSafeMode()) {
+            auto nsc = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
+            if (nsc) {
+                ul_log::Write("OnInitSwapchain: HookFakeFullscreen...");
+                HookFakeFullscreen(nsc);
+            }
+        } else {
+            ul_log::Write("OnInitSwapchain: skipping FakeFullscreen hook (Streamline safe mode)");
+        }
+
         ul_log::Write("OnInitSwapchain: done");
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         ul_log::Write("OnInitSwapchain: exception 0x%08X", GetExceptionCode());
@@ -1130,7 +1152,13 @@ static void OnBindViewports(reshade::api::command_list*,
             GetModuleHandleW(L"ffx_opticalflow.dll") != nullptr ||
             GetModuleHandleW(L"amd_fidelityfx_framegeneration.dll") != nullptr ||
             GetModuleHandleW(L"ffx_fsr3upscaler.dll") != nullptr ||
-            GetModuleHandleW(L"ffx_fsr2.dll") != nullptr;
+            GetModuleHandleW(L"ffx_fsr2.dll") != nullptr ||
+            GetModuleHandleW(L"nvngx.dll") != nullptr ||
+            GetModuleHandleW(L"_nvngx.dll") != nullptr;
+        if (!s_upscaler_checked && s_upscaler_present)
+            ul_log::Write("Viewport: upscaler DLL detected — viewport tracking active");
+        if (!s_upscaler_checked && !s_upscaler_present)
+            ul_log::Write("Viewport: no upscaler DLL detected — viewport tracking disabled");
         s_upscaler_checked = true;
     }
     if (!s_upscaler_present) return;
@@ -1218,20 +1246,27 @@ static void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* sc,
     }
 
     // Commit the most-used sub-native viewport as the render resolution.
-    // When no sub-native viewports were seen this frame, clear the render
-    // resolution so the OSD hides the resolution line for non-upscaled games.
+    // When no sub-native viewports are seen for several consecutive frames,
+    // clear the render resolution. This avoids flickering in FG games where
+    // generated frames may not trigger the viewport callback.
+    static int s_no_vp_frames = 0;
     if (s_vp_bucket_count > 0) {
         int best = 0;
         for (int i = 1; i < s_vp_bucket_count; i++) {
-            if (s_vp_buckets[i].count > s_vp_buckets[best].count)
+            uint32_t area_i = s_vp_buckets[i].w * s_vp_buckets[i].h;
+            uint32_t area_b = s_vp_buckets[best].w * s_vp_buckets[best].h;
+            if (area_i > area_b)
                 best = i;
         }
         s_rnd_w.store(s_vp_buckets[best].w, std::memory_order_relaxed);
         s_rnd_h.store(s_vp_buckets[best].h, std::memory_order_relaxed);
         s_vp_bucket_count = 0;
+        s_no_vp_frames = 0;
     } else {
-        s_rnd_w.store(0, std::memory_order_relaxed);
-        s_rnd_h.store(0, std::memory_order_relaxed);
+        if (++s_no_vp_frames > 60) {
+            s_rnd_w.store(0, std::memory_order_relaxed);
+            s_rnd_h.store(0, std::memory_order_relaxed);
+        }
     }
 }
 
