@@ -1110,6 +1110,31 @@ static void OnBindViewports(reshade::api::command_list*,
 
     s_vp_calls.fetch_add(1, std::memory_order_relaxed);
 
+    // Only track sub-native viewports when an upscaler DLL is loaded.
+    // Without this gate, shadow maps / reflections / post-process passes
+    // produce false positives in non-upscaled games.
+    static bool s_upscaler_checked = false;
+    static bool s_upscaler_present = false;
+    if (!s_upscaler_checked || (s_vp_calls.load(std::memory_order_relaxed) % 300 == 0)) {
+        s_upscaler_present =
+            GetModuleHandleW(L"nvngx_dlss.dll") != nullptr ||
+            GetModuleHandleW(L"_nvngx_dlss.dll") != nullptr ||
+            GetModuleHandleW(L"nvngx_dlssd.dll") != nullptr ||
+            GetModuleHandleW(L"nvngx_dlssg.dll") != nullptr ||
+            GetModuleHandleW(L"_nvngx_dlssg.dll") != nullptr ||
+            GetModuleHandleW(L"sl.dlss.dll") != nullptr ||
+            GetModuleHandleW(L"sl.dlss_g.dll") != nullptr ||
+            GetModuleHandleW(L"dlss-g.dll") != nullptr ||
+            GetModuleHandleW(L"libxess.dll") != nullptr ||
+            GetModuleHandleW(L"amd_fidelityfx_opticalflow.dll") != nullptr ||
+            GetModuleHandleW(L"ffx_opticalflow.dll") != nullptr ||
+            GetModuleHandleW(L"amd_fidelityfx_framegeneration.dll") != nullptr ||
+            GetModuleHandleW(L"ffx_fsr3upscaler.dll") != nullptr ||
+            GetModuleHandleW(L"ffx_fsr2.dll") != nullptr;
+        s_upscaler_checked = true;
+    }
+    if (!s_upscaler_present) return;
+
     uint32_t ow = s_out_w.load(std::memory_order_relaxed);
     uint32_t oh = s_out_h.load(std::memory_order_relaxed);
     if (!ow || !oh) return;

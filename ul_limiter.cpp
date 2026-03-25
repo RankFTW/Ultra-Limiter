@@ -1192,7 +1192,7 @@ void UlLimiter::OnPresent() {
                 grid_interval_ns_ = bg_ns;
                 if (grid_next_ns_ > now_ns)
                     ul_timing::SleepUntilNs(grid_next_ns_, htimer_fallback_);
-                grid_next_ns_ = now_ns + bg_ns;
+                grid_next_ns_ += bg_ns;
             }
             return;
         }

@@ -1,8 +1,13 @@
 # Changelog
 
-## v2.0.7
+## v2.0.8
 
-- OSD resolution line now hidden when no upscaling is detected
+- Fixed background FPS limiter not sleeping consistently (grid drift from using wall-clock instead of grid-aligned advancement)
+- Fixed OSD resolution line showing in non-upscaled games (viewport tracking now gated behind upscaler DLL detection)
+- Added DLSS Ray Reconstruction (nvngx_dlssd.dll) to upscaler detection
+- Added DLSS FG and Streamline DLSS DLLs to upscaler detection gate (fixes resolution not showing in games like Crimson Desert)
+
+## v2.0.7
 - Fixed stale render resolution persisting on OSD in non-upscaled games
 
 ## v2.0.6
