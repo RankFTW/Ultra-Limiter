@@ -1298,14 +1298,12 @@ void UlLimiter::OnPresent() {
         }
     }
 
-    // Timing fallback as hard backstop.
-    // Always run for Vulkan (native or not) — native Reflex games handle
-    // their own sleep but we still provide a timing backstop if the user
-    // sets an FPS limit. For non-native VK, this is the primary pacer.
-    // Skip only for DX Reflex without native markers (DoReflexSleep already
-    // called InvokeSleep which blocks).
-    if (vk_active || !(ReflexActive() && dev_) || g_game_uses_reflex.load(std::memory_order_relaxed))
-        DoTimingFallback();
+    // Timing fallback — always runs as a hard backstop.
+    // For Vulkan (native or not) this is the primary/backstop pacer.
+    // For DX non-Reflex games this is the only pacer.
+    // For DX Reflex games, InvokeSleep already blocked above, but
+    // DoTimingFallback gracefully no-ops when the frame is already late.
+    DoTimingFallback();
 }
 
 // ============================================================================

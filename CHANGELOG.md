@@ -1,13 +1,8 @@
 # Changelog
 
-## v2.0.5
+## v2.0.6
 
-- Native Reflex detection via vkGetDeviceProcAddr hook (intercepts game's vkSetLatencySleepModeNV calls)
-- Deferred SetSleepMode — no longer called eagerly during swapchain attach, avoids conflicts with native Reflex games
-- Native Reflex VK games: ReLimiter is hands-off (no SetSleepMode/Sleep calls), timing fallback as backstop only
-- Non-native Reflex VK games: driver low-latency hints + QPC timing fallback (no semaphore wait)
-- Added GPU render time, render latency, and present latency OSD metrics for Vulkan games
-- Fixed Vulkan OSD render latency showing inflated values due to stale cross-frame timestamps
+- Fixed FPS limiter not working in non-Reflex DX and Vulkan games (timing fallback was incorrectly skipped)
 
 ## v2.0.3
 
