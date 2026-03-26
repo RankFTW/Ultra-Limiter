@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <windows.h>
 
 // Forward declaration
@@ -144,32 +145,81 @@ struct CadenceTracker {
     float stddev_us = 0.0f;
     float mean_delta_us = 0.0f;
 
-    float best_interval_us = 0.0f;
-    float best_variance_us2 = 1e12f;
-    int stable_streak = 0;
-    int jitter_streak = 0;
-
-    static constexpr float kLowVarianceRatio = 0.03f;
-    static constexpr float kHighVarianceRatio = 0.08f;
-    static constexpr int kStableThreshold = 15;
-    static constexpr int kJitterThreshold = 5;
-
     void Feed(uint64_t present_end_time);
     void ComputeStats();
+    float ComputeCV() const;
     void Reset();
 };
 
 // ============================================================================
-// FGPacingContext — unified signal inputs for FG interval adjustment
+// QPCCadenceMonitor — local QPC present-to-present variance (QPC Brake signal)
 // ============================================================================
 
-struct FGPacingContext {
-    float gpu_headroom = 0.0f;
-    bool queue_stressed = false;
-    float fg_overhead_us = 0.0f;
-    float cadence_stddev_us = 0.0f;
-    float output_interval_us = 0.0f;
-    bool is_mfg = false;
+struct QPCCadenceMonitor {
+    static constexpr int kWindowSize = 16;
+    int64_t last_qpc = 0;
+    float deltas_us[kWindowSize] = {};
+    int head = 0;
+    int count = 0;
+
+    void Feed(int64_t now_qpc);
+    float ComputeCV() const;
+    void Reset();
+};
+
+// ============================================================================
+// ConsistencyBuffer — two-mode state machine for adaptive consistency buffer
+// ============================================================================
+
+struct ConsistencyBuffer {
+    enum class Mode : uint8_t { Tighten, Stabilize };
+
+    Mode mode = Mode::Stabilize;
+    int32_t buffer_us = 0;
+    int consecutive_stable_ticks = 0;
+
+    struct TuningParams {
+        int32_t initial_buffer_us;
+        int32_t max_buffer_us;
+        int32_t stabilize_step_us;
+        int32_t tighten_step_us;
+        float stability_threshold_cv;
+        float instability_threshold_cv;
+        int stable_ticks_to_tighten;
+        float qpc_brake_threshold_cv;
+    };
+
+    static constexpr TuningParams kTier1x1   = {4,  20, 2, 1, 0.03f, 0.08f, 15, 0.12f};
+    static constexpr TuningParams kTier2xFG  = {12, 50, 4, 2, 0.03f, 0.08f, 12, 0.10f};
+    static constexpr TuningParams kTier3xMFG = {20, 80, 6, 3, 0.04f, 0.10f, 10, 0.10f};
+
+    TuningParams active_params = kTier1x1;
+
+    void Tick(float cadence_cv, float qpc_cv, float vrr_proximity);
+    void SelectTier(int fg_divisor);
+    void Reset(int fg_divisor);
+};
+
+// ============================================================================
+// CSVLogger — diagnostic CSV writer for consistency buffer state
+// ============================================================================
+
+struct CSVLogger {
+    FILE* file = nullptr;
+    bool enabled = false;
+    bool header_written = false;
+
+    void Open(HMODULE addon_module);
+    void WriteRow(int64_t timestamp_qpc,
+                  ConsistencyBuffer::Mode mode,
+                  int32_t buffer_us,
+                  float cadence_cv,
+                  float qpc_cv,
+                  float gpu_load_ratio,
+                  int fg_tier,
+                  float vrr_proximity,
+                  NvU32 final_interval_us);
+    void Close();
 };
 
 struct PipelinePredictor {
@@ -188,13 +238,9 @@ struct PipelinePredictor {
     static constexpr float kMaxMargin = 2000.0f;
 
     CadenceTracker cadence;
-    int32_t fg_cadence_adjust_us = 0;
-    int32_t fg_unified_adjust_us = 0;
 
     void UpdatePrediction(bool fg_active);
     void RecordMiss(bool missed);
-    void UpdateCadenceResponse(bool fg_active, int fg_divisor, float target_interval_us);
-    void ComputeFGAdjustment(const FGPacingContext& ctx);
     void Reset();
 };
 
@@ -229,7 +275,7 @@ struct BoostController {
 
 class UlLimiter {
 public:
-    void Init();
+    void Init(HMODULE addon_module = nullptr);
     void Shutdown();
 
     bool ConnectReflex(IUnknown* device);
@@ -288,6 +334,15 @@ private:
     BoostController boost_ctrl_;
     NvLatencyResult* latency_buf_ = nullptr;
     uint64_t last_pred_frame_id_ = 0;
+
+    // Adaptive consistency buffer components
+    QPCCadenceMonitor qpc_monitor_;
+    ConsistencyBuffer consistency_buf_;
+    bool gpu_load_gate_open_ = false;
+    int last_fg_tier_ = 0;
+    int pending_fg_tier_ = 0;
+    int fg_tier_confirm_ticks_ = 0;
+    CSVLogger csv_logger_;
 
     int64_t warmup_start_qpc_ = 0;
     bool warmup_done_ = false;

@@ -1341,6 +1341,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
         __try {
             LoadSettings(hModule);
+            SaveSettings();   // flush defaults so new keys appear in the INI
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             ul_log::Write("FATAL: LoadSettings exception 0x%08X", GetExceptionCode());
             reshade::unregister_addon(hModule);
@@ -1356,7 +1357,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         }
 
         __try {
-            s_limiter.Init();
+            s_limiter.Init(hModule);
 
             // Hook vkCreateDevice to inject VK_NV_low_latency2 before the game
             // creates its Vulkan device. Safe to call even if Vulkan isn't loaded.

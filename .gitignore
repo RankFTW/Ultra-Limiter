@@ -1,3 +1,7 @@
 /build
 /build32
 /external
+/.kiro
+/tests
+*.obj
+*.exe

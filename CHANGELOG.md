@@ -1,5 +1,22 @@
 # Changelog
 
+## v2.1.0
+
+Adaptive consistency buffer — replaces the old cadence response system with a two-mode state machine.
+
+- New ConsistencyBuffer state machine (STABILIZE / TIGHTEN) replaces FGPacingContext, UpdateCadenceResponse, and ComputeFGAdjustment
+- Continuous coefficient of variation (CV) signal replaces binary smooth/jittery streak classification
+- Three tuning tiers: 1:1 (4–20 µs), 2x FG (12–50 µs), 3x+ MFG (20–80 µs) with tier-appropriate step sizes and thresholds
+- QPCCadenceMonitor provides secondary CV signal as early-warning brake — forces immediate STABILIZE before primary cadence signal confirms instability
+- GPU load gate (50% threshold) freezes all adaptive logic during menus and loading screens, resumes without reset
+- VRR proximity scaling halves TIGHTEN step when near VRR ceiling (>90% proximity)
+- Consistency buffer applied on both FG and 1:1 paths (1:1 previously had no cadence-driven buffer)
+- FG multiplier detection from cadence ratio — correctly identifies 2x/3x/4x DLSS FG instead of hardcoding 2x
+- Hysteresis on FG tier demotion (30-tick confirmation) prevents false downgrades from transient load spikes
+- Diagnostic CSV logging (`csv_consistency_log` INI option) writes per-tick state machine data to `relimiter_consistency.csv`
+- New config fields auto-written to INI on first load
+- Removed: FGPacingContext, UpdateCadenceResponse, ComputeFGAdjustment, CadenceTracker streak counters and variance ratio constants
+
 ## v2.0.10
 
 - Added 32-bit build (relimiter.addon32) for 32-bit DX games — timing fallback, OSD, VSync, frame latency, fake fullscreen (no Reflex/Vulkan on 32-bit)

@@ -70,6 +70,9 @@ struct UlConfig {
 
     // OSD text brightness (0–100, default 100 = full white)
     std::atomic<int> osd_text_brightness{100};
+
+    // Diagnostic CSV logging for adaptive consistency buffer
+    std::atomic<bool> csv_consistency_log{false};
 };
 
 extern UlConfig g_cfg;

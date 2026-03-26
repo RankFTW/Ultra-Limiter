@@ -105,42 +105,7 @@ void PipelinePredictor::Reset() {
     gpu.Reset(); sim.Reset(); fg.Reset();
     predicted_total_us = 0.0f; active = false;
     safety_margin_us = 500.0f; frames_since_miss = 0; miss_count = 0;
-    cadence.Reset(); fg_cadence_adjust_us = 0; fg_unified_adjust_us = 0;
-}
-
-// ============================================================================
-// Unified FG adjustment
-// ============================================================================
-
-void PipelinePredictor::ComputeFGAdjustment(const FGPacingContext& ctx) {
-    int32_t base = static_cast<int32_t>(std::round(ctx.fg_overhead_us));
-    base = std::clamp(base, 4, 60);
-
-    float low_thresh = ctx.output_interval_us * CadenceTracker::kLowVarianceRatio;
-    float high_thresh = ctx.output_interval_us * CadenceTracker::kHighVarianceRatio;
-
-    bool is_smooth = (ctx.cadence_stddev_us < low_thresh) && (cadence.count >= 8);
-    bool is_jittery = (ctx.cadence_stddev_us > high_thresh) && (cadence.count >= 8);
-    bool has_data = (cadence.count >= 8);
-
-    int32_t delta = fg_cadence_adjust_us;
-
-    if (has_data) {
-        if (is_jittery && ctx.queue_stressed) {
-            delta = std::min(delta + 3, static_cast<int32_t>(15));
-        } else if (is_jittery) {
-            delta = std::min(delta, static_cast<int32_t>(12));
-        } else if (is_smooth && ctx.gpu_headroom > 0.30f && !ctx.queue_stressed) {
-            if (!ctx.is_mfg)
-                delta = std::max(delta - 1, static_cast<int32_t>(-4));
-        } else if (is_smooth && ctx.gpu_headroom <= 0.30f) {
-            if (delta < 0) delta = 0;
-        }
-        if (ctx.queue_stressed && delta < 0)
-            delta = 0;
-    }
-
-    fg_unified_adjust_us = base + delta;
+    cadence.Reset();
 }
 
 // ============================================================================
@@ -178,65 +143,188 @@ void CadenceTracker::ComputeStats() {
 void CadenceTracker::Reset() {
     head = 0; count = 0; last_present_time = 0; last_fed_frame_id = 0;
     variance_us2 = 0; stddev_us = 0; mean_delta_us = 0;
-    best_interval_us = 0; best_variance_us2 = 1e12f;
-    stable_streak = 0; jitter_streak = 0;
+}
+
+float CadenceTracker::ComputeCV() const {
+    return (count >= 4 && mean_delta_us > 0.0f) ? stddev_us / mean_delta_us : 0.0f;
 }
 
 // ============================================================================
-// PipelinePredictor — FG/MFG cadence response
+// QPCCadenceMonitor — local QPC present-to-present variance (QPC Brake signal)
 // ============================================================================
 
-void PipelinePredictor::UpdateCadenceResponse(bool fg_active, int fg_divisor,
-                                               float target_interval_us) {
-    if (!fg_active || target_interval_us <= 0.0f) {
-        fg_cadence_adjust_us = 0;
+void QPCCadenceMonitor::Feed(int64_t now_qpc) {
+    if (last_qpc != 0 && now_qpc > last_qpc) {
+        int64_t delta = now_qpc - last_qpc;
+        float delta_us = static_cast<float>(
+            static_cast<double>(delta) * 1000000.0 / static_cast<double>(ul_timing::g_qpc_freq));
+        deltas_us[head] = delta_us;
+        head = (head + 1) % kWindowSize;
+        if (count < kWindowSize) count++;
+    }
+    last_qpc = now_qpc;
+}
+
+float QPCCadenceMonitor::ComputeCV() const {
+    if (count < 4) return 0.0f;
+    float sum = 0.0f;
+    for (int i = 0; i < count; i++)
+        sum += deltas_us[(head - count + i + kWindowSize) % kWindowSize];
+    float mean = sum / static_cast<float>(count);
+    if (mean == 0.0f) return 0.0f;
+    float var_sum = 0.0f;
+    for (int i = 0; i < count; i++) {
+        float d = deltas_us[(head - count + i + kWindowSize) % kWindowSize] - mean;
+        var_sum += d * d;
+    }
+    float stddev = std::sqrt(var_sum / static_cast<float>(count));
+    return stddev / mean;
+}
+
+void QPCCadenceMonitor::Reset() {
+    last_qpc = 0;
+    head = 0;
+    count = 0;
+    std::memset(deltas_us, 0, sizeof(deltas_us));
+}
+
+// ============================================================================
+// ConsistencyBuffer — two-mode state machine for adaptive consistency buffer
+// ============================================================================
+
+void ConsistencyBuffer::SelectTier(int fg_divisor) {
+    if (fg_divisor >= 3)
+        active_params = kTier3xMFG;
+    else if (fg_divisor == 2)
+        active_params = kTier2xFG;
+    else
+        active_params = kTier1x1;
+}
+
+void ConsistencyBuffer::Reset(int fg_divisor) {
+    SelectTier(fg_divisor);
+    mode = Mode::Stabilize;
+    buffer_us = active_params.initial_buffer_us;
+    consecutive_stable_ticks = 0;
+}
+
+void ConsistencyBuffer::Tick(float cadence_cv, float qpc_cv, float vrr_proximity) {
+    // QPC brake: immediate STABILIZE on QPC variance spike
+    if (qpc_cv > active_params.qpc_brake_threshold_cv) {
+        mode = Mode::Stabilize;
+        consecutive_stable_ticks = 0;
+    }
+
+    if (mode == Mode::Stabilize) {
+        if (cadence_cv > active_params.instability_threshold_cv) {
+            // Unstable: increase buffer
+            buffer_us += active_params.stabilize_step_us;
+            consecutive_stable_ticks = 0;
+        } else if (cadence_cv < active_params.stability_threshold_cv) {
+            // Stable tick
+            consecutive_stable_ticks++;
+            if (consecutive_stable_ticks >= active_params.stable_ticks_to_tighten) {
+                mode = Mode::Tighten;
+                consecutive_stable_ticks = 0;
+            }
+        } else {
+            // In between thresholds: reset stable counter but don't increase buffer
+            consecutive_stable_ticks = 0;
+        }
+    } else {
+        // TIGHTEN mode
+        if (cadence_cv > active_params.instability_threshold_cv) {
+            // Instability detected: transition to STABILIZE
+            mode = Mode::Stabilize;
+            consecutive_stable_ticks = 0;
+        } else {
+            // Stable: decrease buffer with VRR proximity scaling
+            int32_t effective_step = active_params.tighten_step_us;
+            if (vrr_proximity > 0.90f) {
+                effective_step = effective_step / 2;  // halve near VRR ceiling
+            }
+            buffer_us -= effective_step;
+        }
+    }
+
+    // Final clamp
+    if (buffer_us < 0) buffer_us = 0;
+    if (buffer_us > active_params.max_buffer_us) buffer_us = active_params.max_buffer_us;
+}
+
+// ============================================================================
+// CSVLogger — diagnostic CSV writer for consistency buffer state
+// ============================================================================
+
+void CSVLogger::Open(HMODULE addon_module) {
+    if (!addon_module) {
+        ul_log::Write("CSVLogger: null module handle, disabling");
+        enabled = false;
         return;
     }
 
-    auto& ct = cadence;
-    ct.ComputeStats();
-    if (ct.count < 8) { fg_cadence_adjust_us = 0; return; }
-
-    int effective_divisor = fg_divisor;
-    if (ct.mean_delta_us > 0.0f && target_interval_us > 0.0f) {
-        float ratio = target_interval_us / ct.mean_delta_us;
-        if (ratio > 3.5f)      effective_divisor = 4;
-        else if (ratio > 2.5f) effective_divisor = 3;
-        else if (ratio > 1.3f) effective_divisor = 2;
+    wchar_t wpath[MAX_PATH] = {};
+    if (!GetModuleFileNameW(addon_module, wpath, MAX_PATH)) {
+        ul_log::Write("CSVLogger: GetModuleFileNameW failed (err=%lu), disabling",
+                      GetLastError());
+        enabled = false;
+        return;
     }
 
-    float output_interval_us = target_interval_us / static_cast<float>(effective_divisor);
-    float low_thresh = output_interval_us * CadenceTracker::kLowVarianceRatio;
-    float high_thresh = output_interval_us * CadenceTracker::kHighVarianceRatio;
+    // Strip filename, append csv name
+    wchar_t* slash = wcsrchr(wpath, L'\\');
+    if (slash)
+        wcscpy(slash + 1, L"relimiter_consistency.csv");
+    else
+        wcscpy(wpath, L"relimiter_consistency.csv");
 
-    bool is_smooth = (ct.stddev_us < low_thresh);
-    bool is_jittery = (ct.stddev_us > high_thresh);
-
-    if (is_smooth) { ct.stable_streak++; ct.jitter_streak = 0; }
-    else if (is_jittery) { ct.jitter_streak++; ct.stable_streak = 0; }
-    else {
-        if (ct.stable_streak > 0) ct.stable_streak--;
-        if (ct.jitter_streak > 0) ct.jitter_streak--;
+    file = _wfopen(wpath, L"w");
+    if (!file) {
+        ul_log::Write("CSVLogger: failed to open CSV file (err=%lu), disabling",
+                      GetLastError());
+        enabled = false;
+        return;
     }
 
-    if (ct.variance_us2 < ct.best_variance_us2) {
-        ct.best_variance_us2 = ct.variance_us2;
-        ct.best_interval_us = ct.mean_delta_us;
-    }
+    // Write header row
+    fprintf(file, "timestamp,mode,buffer_us,cadence_cv,qpc_cv,gpu_load,fg_tier,vrr_proximity,interval_us\n");
+    fflush(file);
+    header_written = true;
+    enabled = true;
+}
 
-    bool is_mfg = (effective_divisor >= 3);
+void CSVLogger::WriteRow(int64_t timestamp_qpc,
+                         ConsistencyBuffer::Mode mode,
+                         int32_t buffer_us,
+                         float cadence_cv,
+                         float qpc_cv,
+                         float gpu_load_ratio,
+                         int fg_tier,
+                         float vrr_proximity,
+                         NvU32 final_interval_us) {
+    if (!enabled || !file) return;
 
-    if (is_mfg) {
-        if (ct.jitter_streak >= CadenceTracker::kJitterThreshold)
-            fg_cadence_adjust_us = std::min(fg_cadence_adjust_us + 2, static_cast<int32_t>(12));
-        else if (ct.stable_streak >= CadenceTracker::kStableThreshold * 2)
-            fg_cadence_adjust_us = std::max(fg_cadence_adjust_us - 1, static_cast<int32_t>(0));
-    } else {
-        if (ct.jitter_streak >= CadenceTracker::kJitterThreshold)
-            fg_cadence_adjust_us = std::min(fg_cadence_adjust_us + 2, static_cast<int32_t>(10));
-        else if (ct.stable_streak >= CadenceTracker::kStableThreshold)
-            fg_cadence_adjust_us = std::max(fg_cadence_adjust_us - 1, static_cast<int32_t>(-4));
+    const char* mode_str = (mode == ConsistencyBuffer::Mode::Tighten) ? "TIGHTEN" : "STABILIZE";
+    fprintf(file, "%lld,%s,%d,%.6f,%.6f,%.4f,%d,%.4f,%u\n",
+            static_cast<long long>(timestamp_qpc),
+            mode_str,
+            buffer_us,
+            cadence_cv,
+            qpc_cv,
+            gpu_load_ratio,
+            fg_tier,
+            vrr_proximity,
+            final_interval_us);
+    fflush(file);
+}
+
+void CSVLogger::Close() {
+    if (file) {
+        fclose(file);
+        file = nullptr;
     }
+    enabled = false;
+    header_written = false;
 }
 
 // ============================================================================
@@ -355,6 +443,18 @@ static NvU32 ComputeVrrFloorIntervalUs(HWND hwnd) {
 }
 
 // ============================================================================
+// VRR proximity — how close the target interval is to the VRR ceiling
+// ============================================================================
+
+static float ComputeVrrProximity(HWND hwnd, NvU32 target_interval_us) {
+    NvU32 vrr_floor = ComputeVrrFloorIntervalUs(hwnd);
+    if (vrr_floor == 0 || target_interval_us == 0)
+        return 0.0f;
+    float proximity = static_cast<float>(vrr_floor) / static_cast<float>(target_interval_us);
+    return std::clamp(proximity, 0.0f, 1.0f);
+}
+
+// ============================================================================
 // FG pacing offset (static fallback)
 // ============================================================================
 
@@ -419,12 +519,18 @@ float UlLimiter::ComputeRenderFps() const {
 // Lifecycle
 // ============================================================================
 
-void UlLimiter::Init() {
+void UlLimiter::Init(HMODULE addon_module) {
     if (!latency_buf_)
         latency_buf_ = new (std::nothrow) NvLatencyResult{};
+
+    if (g_cfg.csv_consistency_log.load()) {
+        csv_logger_.Open(addon_module);
+    }
 }
 
 void UlLimiter::Shutdown() {
+    csv_logger_.Close();
+
     // Vulkan cleanup
 #ifdef _WIN64
     if (vk_reflex_) {
@@ -479,6 +585,12 @@ void UlLimiter::ResetAdaptiveState() {
     pipeline_predictor_.Reset();
     pipeline_stats_ = PipelineStats{};
     boost_ctrl_.Reset();
+    qpc_monitor_.Reset();
+    consistency_buf_.Reset(DetectFGDivisor());
+    gpu_load_gate_open_ = false;
+    last_fg_tier_ = 0;
+    pending_fg_tier_ = 0;
+    fg_tier_confirm_ticks_ = 0;
     ptp_error_accum_us_ = 0.0f;
     ptp_correction_us_ = 0;
     ptp_sample_count_ = 0;
@@ -500,12 +612,12 @@ void UlLimiter::ResetAdaptiveState() {
 }
 
 // ============================================================================
-// Interval adjustment — VRR floor, FG offset, driver shave
+// Interval adjustment — VRR floor, consistency buffer, FG offset, driver shave
 // ============================================================================
 
 static NvU32 AdjustIntervalUs(NvU32 raw, int fg_divisor, HWND hwnd,
                               const PipelineStats& ps, int32_t ptp_correction_us,
-                              int32_t fg_unified_adjust_us) {
+                              int32_t consistency_buffer_us) {
     if (raw == 0) return 0;
 
     NvU32 vrr_floor = ComputeVrrFloorIntervalUs(hwnd);
@@ -513,10 +625,10 @@ static NvU32 AdjustIntervalUs(NvU32 raw, int fg_divisor, HWND hwnd,
         raw = vrr_floor;
 
     if (fg_divisor > 1) {
-        // FG path: single unified adjustment
-        int32_t fg_adj = fg_unified_adjust_us;
-        if (fg_adj == 0)
-            fg_adj = static_cast<int32_t>(kFGPacingOffsetUs);
+        // FG path: consistency buffer + FG overhead offset
+        int32_t fg_adj = consistency_buffer_us;
+        if (ps.adaptive_fg_offset_us > 0)
+            fg_adj += ps.adaptive_fg_offset_us;
 
         if (fg_adj > 0) {
             raw += static_cast<NvU32>(fg_adj);
@@ -534,6 +646,11 @@ static NvU32 AdjustIntervalUs(NvU32 raw, int fg_divisor, HWND hwnd,
         }
         if (ptp_correction_us != 0) {
             int32_t adjusted = static_cast<int32_t>(raw) + ptp_correction_us;
+            if (adjusted > 50) raw = static_cast<NvU32>(adjusted);
+        }
+        // Consistency buffer: independent additive term
+        if (consistency_buffer_us != 0) {
+            int32_t adjusted = static_cast<int32_t>(raw) + consistency_buffer_us;
             if (adjusted > 50) raw = static_cast<NvU32>(adjusted);
         }
     }
@@ -588,7 +705,7 @@ NvSleepParams UlLimiter::BuildSleepParams() const {
 
     p.minimumIntervalUs = AdjustIntervalUs(raw_interval, DetectFGDivisor(), hwnd_,
                                             pipeline_stats_, ptp_correction_us_,
-                                            pipeline_predictor_.fg_unified_adjust_us);
+                                            consistency_buf_.buffer_us);
     return p;
 }
 
@@ -890,31 +1007,114 @@ void UlLimiter::UpdatePipelineStats() {
                 pred.cadence.last_fed_frame_id = csamples[n_cs - 1].id;
         }
 
-        pred.UpdateCadenceResponse(fg_active, fg_active ? DetectFGDivisor() : 1,
-                                   target_interval_us);
+        // Cadence response and unified FG adjustment removed — replaced by ConsistencyBuffer
+        // ComputeStats so CV is fresh for the consistency buffer tick
+        pred.cadence.ComputeStats();
+    }
 
-        // Unified FG adjustment
-        if (fg_active && target_interval_us > 0.0f) {
-            int effective_divisor = 1;
-            if (pred.cadence.mean_delta_us > 0.0f) {
-                float ratio = target_interval_us / pred.cadence.mean_delta_us;
-                if (ratio > 3.5f)      effective_divisor = 4;
-                else if (ratio > 2.5f) effective_divisor = 3;
-                else if (ratio > 1.3f) effective_divisor = 2;
-            } else {
-                effective_divisor = DetectFGDivisor();
+    // --- GPU Load Gate ---
+    // When GPU load is below 50%, freeze all downstream adaptive logic
+    // (ConsistencyBuffer tick, BoostController evaluate, DynamicPacing vote accumulation).
+    {
+        bool gate_open = (ps.gpu_load_ratio >= 0.50f);
+        gpu_load_gate_open_ = gate_open;
+
+        if (!gate_open) {
+            // Freeze: skip ConsistencyBuffer tick, BoostController evaluate, DynamicPacing vote
+            return;
+        }
+
+        // --- FG tier change detection ---
+        // DetectFGDivisor() only tells us FG is active (returns 2) or not (1).
+        // Refine the actual multiplier from cadence data when available.
+        // Promotions are instant; demotions require sustained confirmation
+        // to avoid false downgrades from transient load spikes.
+        int fg_tier = DetectFGDivisor();
+        if (fg_tier > 1 && pipeline_predictor_.cadence.count >= 8
+            && pipeline_predictor_.cadence.mean_delta_us > 0.0f) {
+            float target_fps = g_cfg.fps_limit.load(std::memory_order_relaxed);
+            if (target_fps > 0.0f) {
+                float target_interval_us = 1'000'000.0f / target_fps;
+                float ratio = target_interval_us / pipeline_predictor_.cadence.mean_delta_us;
+                int cadence_tier = 2;
+                if (ratio > 3.5f)      cadence_tier = 4;
+                else if (ratio > 2.5f) cadence_tier = 3;
+
+                if (cadence_tier > last_fg_tier_ || last_fg_tier_ <= 1) {
+                    // Promotion: accept immediately
+                    fg_tier = cadence_tier;
+                    pending_fg_tier_ = 0;
+                    fg_tier_confirm_ticks_ = 0;
+                } else if (cadence_tier < last_fg_tier_) {
+                    // Demotion: require 30 consecutive ticks at lower tier
+                    if (cadence_tier == pending_fg_tier_) {
+                        fg_tier_confirm_ticks_++;
+                        if (fg_tier_confirm_ticks_ >= 30) {
+                            fg_tier = cadence_tier;
+                            pending_fg_tier_ = 0;
+                            fg_tier_confirm_ticks_ = 0;
+                        } else {
+                            fg_tier = last_fg_tier_;  // hold current tier
+                        }
+                    } else {
+                        pending_fg_tier_ = cadence_tier;
+                        fg_tier_confirm_ticks_ = 1;
+                        fg_tier = last_fg_tier_;  // hold current tier
+                    }
+                } else {
+                    // Same tier: reset demotion counter
+                    fg_tier = last_fg_tier_;
+                    pending_fg_tier_ = 0;
+                    fg_tier_confirm_ticks_ = 0;
+                }
             }
+        }
+        if (fg_tier != last_fg_tier_) {
+            consistency_buf_.SelectTier(fg_tier);
+            consistency_buf_.Reset(fg_tier);
+            last_fg_tier_ = fg_tier;
+        }
 
-            FGPacingContext fctx;
-            fctx.gpu_headroom = 1.0f - ps.gpu_load_ratio;
-            fctx.queue_stressed = ps.queue_pressure;
-            fctx.fg_overhead_us = ps.avg_fg_overhead_us;
-            fctx.cadence_stddev_us = pred.cadence.stddev_us;
-            fctx.output_interval_us = target_interval_us / static_cast<float>(effective_divisor);
-            fctx.is_mfg = (effective_divisor >= 3);
-            pred.ComputeFGAdjustment(fctx);
-        } else {
-            pred.fg_unified_adjust_us = 0;
+        // --- VRR proximity ---
+        NvU32 target_iv_us = 0;
+        {
+            float rfps = ComputeRenderFps();
+            if (rfps > 0.0f)
+                target_iv_us = static_cast<NvU32>(std::round(1'000'000.0 / static_cast<double>(rfps)));
+        }
+        float vrr_proximity = ComputeVrrProximity(hwnd_, target_iv_us);
+
+        // --- Cadence CV with 8-sample minimum gate ---
+        float cadence_cv = (pipeline_predictor_.cadence.count >= 8)
+            ? pipeline_predictor_.cadence.ComputeCV() : 0.0f;
+
+        // --- QPC CV ---
+        float qpc_cv = qpc_monitor_.ComputeCV();
+
+        // --- Tick consistency buffer state machine ---
+        consistency_buf_.Tick(cadence_cv, qpc_cv, vrr_proximity);
+
+        // --- CSV logging (gate open only) ---
+        if (g_cfg.csv_consistency_log.load(std::memory_order_relaxed) && csv_logger_.enabled) {
+            NvU32 final_interval_us = 0;
+            {
+                float rfps = ComputeRenderFps();
+                if (rfps > 0.0f) {
+                    NvU32 raw = static_cast<NvU32>(std::round(1'000'000.0 / static_cast<double>(rfps)));
+                    final_interval_us = AdjustIntervalUs(raw, fg_tier, hwnd_,
+                                                          ps, ptp_correction_us_,
+                                                          consistency_buf_.buffer_us);
+                }
+            }
+            csv_logger_.WriteRow(ul_timing::NowQpc(),
+                                 consistency_buf_.mode,
+                                 consistency_buf_.buffer_us,
+                                 cadence_cv,
+                                 qpc_cv,
+                                 ps.gpu_load_ratio,
+                                 fg_tier,
+                                 vrr_proximity,
+                                 final_interval_us);
         }
     }
 
@@ -1210,6 +1410,9 @@ void UlLimiter::OnPresent() {
             return;
         }
     }
+
+    // Feed QPC timestamp to local brake signal monitor
+    qpc_monitor_.Feed(now_qpc);
 
     // --- Settings change detection → global reset ---
     {
