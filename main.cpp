@@ -1341,7 +1341,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
         __try {
             LoadSettings(hModule);
-            SaveSettings();   // flush defaults so new keys appear in the INI
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             ul_log::Write("FATAL: LoadSettings exception 0x%08X", GetExceptionCode());
             reshade::unregister_addon(hModule);

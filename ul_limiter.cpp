@@ -1013,17 +1013,11 @@ void UlLimiter::UpdatePipelineStats() {
     }
 
     // --- GPU Load Gate ---
-    // When GPU load is below 50%, freeze all downstream adaptive logic
-    // (ConsistencyBuffer tick, BoostController evaluate, DynamicPacing vote accumulation).
-    {
-        bool gate_open = (ps.gpu_load_ratio >= 0.50f);
-        gpu_load_gate_open_ = gate_open;
+    // When GPU load is below 50%, freeze ConsistencyBuffer tick only.
+    // DynamicPacing and BoostController continue running as before.
+    gpu_load_gate_open_ = (ps.gpu_load_ratio >= 0.50f);
 
-        if (!gate_open) {
-            // Freeze: skip ConsistencyBuffer tick, BoostController evaluate, DynamicPacing vote
-            return;
-        }
-
+    if (gpu_load_gate_open_) {
         // --- FG tier change detection ---
         // DetectFGDivisor() only tells us FG is active (returns 2) or not (1).
         // Refine the actual multiplier from cadence data when available.
@@ -1371,6 +1365,7 @@ void UlLimiter::OnPresent() {
             return;
         warmup_done_ = true;
         ul_log::Write("OnPresent: warmup done, limiting active (frame %llu)", frame_num_);
+        SaveSettings();  // flush defaults so new keys appear in the INI (deferred from init)
     }
 
     // --- Background limiter ---
