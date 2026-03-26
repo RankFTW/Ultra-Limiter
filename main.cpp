@@ -307,10 +307,12 @@ static void DrawOSD(reshade::api::effect_runtime*) {
     // and s_native_fps (from SIM_START) is the higher output rate. Swap for display.
     // If the game doesn't use Reflex markers, s_native_fps will be 0 — fall back to
     // s_fps so the OSD never shows 0.
+    // Since we pace real frames at half rate for SM, double s_fps to show the actual
+    // output FPS (real + interpolated).
     bool sm = GetModuleHandleW(L"NvPresent64.dll") != nullptr;
     bool has_nat = s_has_native.load(std::memory_order_relaxed) && s_native_fps > 0.0f;
-    float disp_fps = (sm && has_nat) ? s_native_fps : s_fps;
-    float disp_native_fps = (sm && has_nat) ? s_fps : s_native_fps;
+    float disp_fps = sm ? s_fps * 2.0f : s_fps;
+    float disp_native_fps = (sm && has_nat) ? s_fps : ((has_nat) ? s_native_fps : 0.0f);
     float disp_native_ft = (sm && has_nat) ? s_ft_ms : s_native_ft_ms;
 
     // --- Measure pass: compute text lines and track max width ---
@@ -1100,13 +1102,13 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
         }
 
         // Hook SetFullscreenState for fake fullscreen (borderless window override)
-        if (!IsStreamlineSafeMode()) {
+        if (!IsStreamlineSafeMode() && g_cfg.fake_fullscreen.load(std::memory_order_relaxed)) {
             auto nsc = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
             if (nsc) {
                 ul_log::Write("OnInitSwapchain: HookFakeFullscreen...");
                 HookFakeFullscreen(nsc);
             }
-        } else {
+        } else if (IsStreamlineSafeMode()) {
             ul_log::Write("OnInitSwapchain: skipping FakeFullscreen hook (Streamline safe mode)");
         }
 
@@ -1304,9 +1306,12 @@ static void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* sc,
 static LPTOP_LEVEL_EXCEPTION_FILTER s_prev_filter = nullptr;
 
 static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
-    if (ep && ep->ExceptionRecord)
-        ul_log::Write("CRASH: code=0x%08X addr=%p",
-                      ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+    if (ep && ep->ExceptionRecord) {
+        DWORD code = ep->ExceptionRecord->ExceptionCode;
+        // Skip STATUS_BREAKPOINT — commonly fired by anti-tamper (Denuvo) and not a real crash
+        if (code != 0x80000003)
+            ul_log::Write("CRASH: code=0x%08X addr=%p", code, ep->ExceptionRecord->ExceptionAddress);
+    }
     return s_prev_filter ? s_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
 }
 

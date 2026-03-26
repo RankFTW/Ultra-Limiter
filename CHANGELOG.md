@@ -17,6 +17,10 @@ Adaptive consistency buffer — replaces the old cadence response system with a 
 - New config fields auto-written to INI on first load
 - Fixed GPU load gate early return skipping DynamicPacing and BoostController (caused crash in Smooth Motion games)
 - Fixed SaveSettings during DLL_PROCESS_ATTACH causing loader lock issues — deferred to first OnPresent after warmup
+- Fixed fake fullscreen hooks installing unconditionally even when disabled, triggering anti-tamper crashes in some games
+- Fixed Smooth Motion FPS cap — real frames now paced at half rate so total output matches the configured limit
+- Fixed OSD showing half the actual FPS in Smooth Motion games
+- Filtered STATUS_BREAKPOINT from crash log (anti-tamper noise, not a real crash)
 - Removed: FGPacingContext, UpdateCadenceResponse, ComputeFGAdjustment, CadenceTracker streak counters and variance ratio constants
 
 ## v2.0.10

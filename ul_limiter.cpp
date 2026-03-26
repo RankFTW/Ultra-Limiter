@@ -1323,6 +1323,11 @@ void UlLimiter::DoTimingFallback() {
     }
     if (target <= 0.0f) return;
 
+    // Smooth Motion doubles output at the driver level — pace real frames
+    // at half the target so total output (real + interpolated) hits the cap.
+    if (s_smooth_motion.load(std::memory_order_relaxed))
+        target *= 0.5f;
+
     int64_t frame_ns = static_cast<int64_t>(1e9 / static_cast<double>(target));
     int64_t now = ul_timing::NowNs();
 
@@ -1365,7 +1370,13 @@ void UlLimiter::OnPresent() {
             return;
         warmup_done_ = true;
         ul_log::Write("OnPresent: warmup done, limiting active (frame %llu)", frame_num_);
-        SaveSettings();  // flush defaults so new keys appear in the INI (deferred from init)
+
+        // Flush defaults so new config keys appear in the INI (one-shot, deferred from init)
+        static bool s_settings_flushed = false;
+        if (!s_settings_flushed) {
+            SaveSettings();
+            s_settings_flushed = true;
+        }
     }
 
     // --- Background limiter ---
