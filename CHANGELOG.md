@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.1.1
+
+NVIDIA DMFG (Dynamic Multi-Frame Generation) compatibility — RTX 50 series 3x–6x driver-side frame generation.
+
+- Fixed frame latency override starving DMFG pipeline — game-requested queue depth (≥4) is now passed through instead of being forced to 1
+- Fixed flip metering (SetFlipConfig) being blocked in DMFG sessions — allowed through when game latency ≥ 4
+- Fixed DetectFGDivisor() hardcoding return 2 for all FG — latency hint from game's requested MaxFrameLatency now takes priority via max(latency_hint, cadence_tier), preventing cadence-seeded tier 2 from overriding a known DMFG 4x+ session
+- Fixed DetectFGDivisor() failing to detect driver-side DMFG (no user-space FG DLL) — latency hint check moved before DLL check
+- Added cadence tier thresholds for 5x (>4.5f) and 6x (>5.5f) multipliers
+- Added kTier4xPlusMFG tuning tier for ConsistencyBuffer (30–120 µs range, step 8/4, CV thresholds 0.05/0.12)
+- Added OSD 5x and 6x display branches in UpdateFGString
+- Added GetGameRequestedLatency() export for cross-module DMFG detection
+- All DMFG changes gated behind latency ≥ 4 detection — existing 1x/2x paths untouched
+
 ## v2.1.0
 
 Adaptive consistency buffer — replaces the old cadence response system with a two-mode state machine.

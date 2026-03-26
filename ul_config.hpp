@@ -34,6 +34,7 @@ struct UlConfig {
     std::atomic<float> osd_x{10.0f};
     std::atomic<float> osd_y{10.0f};
     std::atomic<bool> show_fps{true};
+    std::atomic<bool> show_1pct_low{true};
     std::atomic<bool> show_frametime{true};
     std::atomic<bool> show_native_fps{true};
     std::atomic<bool> show_graph{true};

@@ -165,6 +165,10 @@ bool HookFrameLatency(IDXGISwapChain* sc);
 // Re-apply the frame latency override (call after config changes at runtime).
 void ApplyFrameLatency();
 
+// Returns the game's last requested MaximumFrameLatency value (0 if never set).
+// Used by DetectFGDivisor as a DMFG hint before cadence data is available.
+UINT GetGameRequestedLatency();
+
 // --- Fake Fullscreen (intercept exclusive fullscreen → borderless window) ---
 
 bool HookFakeFullscreen(IDXGISwapChain* sc);

@@ -92,6 +92,23 @@ static std::atomic<bool> s_latency_hooked{false};
 static std::atomic<UINT> s_game_latency{0};
 static IDXGISwapChain2* s_latency_sc2 = nullptr;
 static void* s_latency_set_target = nullptr;  // vtable[31] address
+
+// Returns true when driver-side DMFG is likely active:
+// game requests deep queue (≥4) AND no user-space FG DLL is loaded.
+// Standard DLSS FG / FSR FG games may also request ≥4 queue depth,
+// but they have an FG DLL — in that case exclusive pacing should still apply.
+static bool IsDmfgSession() {
+    UINT lat = s_game_latency.load(std::memory_order_relaxed);
+    if (lat < 4) return false;
+    // If any FG DLL is loaded, this is standard DLL-based FG, not driver-side DMFG
+    if (GetModuleHandleW(L"nvngx_dlssg.dll"))  return false;
+    if (GetModuleHandleW(L"_nvngx_dlssg.dll")) return false;
+    if (GetModuleHandleW(L"sl.dlss_g.dll"))    return false;
+    if (GetModuleHandleW(L"dlss-g.dll"))       return false;
+    if (GetModuleHandleW(L"amd_fidelityfx_framegeneration.dll")) return false;
+    if (GetModuleHandleW(L"ffx_framegeneration.dll"))            return false;
+    return true;
+}
 static void* s_latency_get_target = nullptr;  // vtable[32] address
 
 // ============================================================================
@@ -118,6 +135,18 @@ static void* __cdecl Hook_QueryInterface(NvU32 id) {
     if (id == kSetFlipConfigId) {
         // Allow through if Smooth Motion is active — it needs flip metering
         if (GetModuleHandleW(L"NvPresent64.dll") != nullptr) {
+            return s_orig_qi ? s_orig_qi(id) : nullptr;
+        }
+        // Allow through for DMFG (3x+) — higher multipliers need flip metering
+        // for driver-side presentation coordination. Detect via game's requested
+        // frame latency: standard 2x FG requests 2-3, DMFG 3x+ requests ≥4.
+        if (IsDmfgSession()) {
+            static bool s_dmfg_logged = false;
+            if (!s_dmfg_logged) {
+                ul_log::Write("Hook_QueryInterface: allowing SetFlipConfig for DMFG (game latency=%u)",
+                              s_game_latency.load(std::memory_order_relaxed));
+                s_dmfg_logged = true;
+            }
             return s_orig_qi ? s_orig_qi(id) : nullptr;
         }
         static bool s_logged = false;
@@ -580,12 +609,20 @@ static HRESULT STDMETHODCALLTYPE Hook_SetMaxFrameLatency(IDXGISwapChain* sc, UIN
 
     // Determine the desired override value.
     // Priority: exclusive_pacing (force 1) > max_queued_frames from preset > passthrough.
+    // Exception: DMFG (game requests ≥4) needs a deep queue — pass through the game's
+    // value to avoid starving the multi-frame generation pipeline.
     UINT target = MaxLatency;
     const char* reason = nullptr;
 
     if (g_cfg.exclusive_pacing.load(std::memory_order_relaxed)) {
-        target = 1;
-        reason = "exclusive_pacing";
+        if (IsDmfgSession()) {
+            // Driver-side DMFG — pass through the game's requested depth.
+            // Forcing 1 would starve the 3x-6x generation pipeline.
+            reason = nullptr;  // no override
+        } else {
+            target = 1;
+            reason = "exclusive_pacing";
+        }
     }
     // else: passthrough — use whatever the game requested
 
@@ -675,8 +712,14 @@ bool HookFrameLatency(IDXGISwapChain* sc) {
     // would overwrite s_game_latency with our override value).
     if (s_orig_set_max_latency) {
         if (g_cfg.exclusive_pacing.load(std::memory_order_relaxed)) {
-            s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(sc2), 1);
-            ul_log::Write("HookFrameLatency: applied initial override to 1 (exclusive pacing)");
+            if (IsDmfgSession()) {
+                // Driver-side DMFG — don't override, the game needs a deep queue
+                UINT game_val = s_game_latency.load(std::memory_order_relaxed);
+                ul_log::Write("HookFrameLatency: DMFG detected (game latency=%u), skipping override", game_val);
+            } else {
+                s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(sc2), 1);
+                ul_log::Write("HookFrameLatency: applied initial override to 1 (exclusive pacing)");
+            }
         }
     }
 
@@ -691,14 +734,25 @@ void ApplyFrameLatency() {
     // Call the trampoline directly — going through the vtable would hit our
     // hook and corrupt s_game_latency with the override value.
     if (g_cfg.exclusive_pacing.load(std::memory_order_relaxed)) {
-        s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(s_latency_sc2), 1);
-        ul_log::Write("ApplyFrameLatency: set to 1 (exclusive pacing ON)");
+        if (IsDmfgSession()) {
+            // Driver-side DMFG — pass through the game's requested depth
+            UINT game_val = s_game_latency.load(std::memory_order_relaxed);
+            s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(s_latency_sc2), game_val);
+            ul_log::Write("ApplyFrameLatency: DMFG passthrough to %u (game requested)", game_val);
+        } else {
+            s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(s_latency_sc2), 1);
+            ul_log::Write("ApplyFrameLatency: set to 1 (exclusive pacing ON)");
+        }
     } else {
         UINT restore = s_game_latency.load(std::memory_order_relaxed);
         if (restore == 0) restore = 3;  // sensible default if game never called it
         s_orig_set_max_latency(reinterpret_cast<IDXGISwapChain*>(s_latency_sc2), restore);
         ul_log::Write("ApplyFrameLatency: restored to %u (game default)", restore);
     }
+}
+
+UINT GetGameRequestedLatency() {
+    return s_game_latency.load(std::memory_order_relaxed);
 }
 
 // ============================================================================

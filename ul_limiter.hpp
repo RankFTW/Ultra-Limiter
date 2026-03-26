@@ -189,9 +189,10 @@ struct ConsistencyBuffer {
         float qpc_brake_threshold_cv;
     };
 
-    static constexpr TuningParams kTier1x1   = {4,  20, 2, 1, 0.03f, 0.08f, 15, 0.12f};
-    static constexpr TuningParams kTier2xFG  = {12, 50, 4, 2, 0.03f, 0.08f, 12, 0.10f};
-    static constexpr TuningParams kTier3xMFG = {20, 80, 6, 3, 0.04f, 0.10f, 10, 0.10f};
+    static constexpr TuningParams kTier1x1      = {4,  20, 2, 1, 0.03f, 0.08f, 15, 0.12f};
+    static constexpr TuningParams kTier2xFG     = {12, 50, 4, 2, 0.03f, 0.08f, 12, 0.10f};
+    static constexpr TuningParams kTier3xMFG    = {20, 80, 6, 3, 0.04f, 0.10f, 10, 0.10f};
+    static constexpr TuningParams kTier4xPlusMFG = {30, 120, 8, 4, 0.05f, 0.12f, 8, 0.10f};
 
     TuningParams active_params = kTier1x1;
 

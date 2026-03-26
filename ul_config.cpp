@@ -78,6 +78,7 @@ static void WriteDefaults(const char* path) {
         "osd_x=10.0\n"
         "osd_y=10.0\n"
         "show_fps=true\n"
+        "show_1pct_low=true\n"
         "show_frametime=true\n"
         "show_native_fps=true\n"
         "show_graph=true\n"
@@ -176,6 +177,7 @@ void LoadSettings(HMODULE addon_module) {
     g_cfg.osd_x.store(ReadFloat(ini, "osd_x", 10.0f));
     g_cfg.osd_y.store(ReadFloat(ini, "osd_y", 10.0f));
     g_cfg.show_fps.store(ReadBool(ini, "show_fps", true));
+    g_cfg.show_1pct_low.store(ReadBool(ini, "show_1pct_low", true));
     g_cfg.show_frametime.store(ReadBool(ini, "show_frametime", true));
     g_cfg.show_native_fps.store(ReadBool(ini, "show_native_fps", true));
     g_cfg.show_graph.store(ReadBool(ini, "show_graph", true));
@@ -215,6 +217,7 @@ void SaveSettings() {
     WFloat("osd_x", g_cfg.osd_x.load());
     WFloat("osd_y", g_cfg.osd_y.load());
     WBool("show_fps", g_cfg.show_fps.load());
+    WBool("show_1pct_low", g_cfg.show_1pct_low.load());
     WBool("show_frametime", g_cfg.show_frametime.load());
     WBool("show_native_fps", g_cfg.show_native_fps.load());
     WBool("show_graph", g_cfg.show_graph.load());

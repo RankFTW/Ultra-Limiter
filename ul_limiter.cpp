@@ -193,7 +193,9 @@ void QPCCadenceMonitor::Reset() {
 // ============================================================================
 
 void ConsistencyBuffer::SelectTier(int fg_divisor) {
-    if (fg_divisor >= 3)
+    if (fg_divisor >= 4)
+        active_params = kTier4xPlusMFG;
+    else if (fg_divisor >= 3)
         active_params = kTier3xMFG;
     else if (fg_divisor == 2)
         active_params = kTier2xFG;
@@ -465,13 +467,45 @@ static constexpr NvU32 kFGPacingOffsetUs = 24;
 // ============================================================================
 
 int UlLimiter::DetectFGDivisor() const {
-    if (GetModuleHandleW(L"nvngx_dlssg.dll"))  return 2;
-    if (GetModuleHandleW(L"_nvngx_dlssg.dll")) return 2;
-    if (GetModuleHandleW(L"sl.dlss_g.dll"))    return 2;
-    if (GetModuleHandleW(L"dlss-g.dll"))        return 2;
-    if (GetModuleHandleW(L"amd_fidelityfx_framegeneration.dll")) return 2;
-    if (GetModuleHandleW(L"ffx_framegeneration.dll"))            return 2;
-    return 1;
+    bool fg_dll = GetModuleHandleW(L"nvngx_dlssg.dll")
+              || GetModuleHandleW(L"_nvngx_dlssg.dll")
+              || GetModuleHandleW(L"sl.dlss_g.dll")
+              || GetModuleHandleW(L"dlss-g.dll");
+    bool fsr_dll = GetModuleHandleW(L"amd_fidelityfx_framegeneration.dll")
+                || GetModuleHandleW(L"ffx_framegeneration.dll");
+
+    // DMFG hint from game's requested frame latency.
+    // ONLY used when no user-space FG DLL is present — this is the signal
+    // for driver-side DMFG (RTX 50 series) which has no DLL.
+    // When an FG DLL IS loaded, the game may still request high queue depths
+    // (e.g. Crimson Desert requests 4 with standard 2x DLSS FG), so the
+    // latency hint would misclassify 2x as 3x. Trust cadence detection instead.
+    UINT game_lat = GetGameRequestedLatency();
+    int lat_hint = 1;
+    if (!fg_dll && !fsr_dll) {
+        // No FG DLL — driver-side DMFG or no FG at all.
+        // Generated frames are injected by the driver below the swapchain,
+        // so OnPresent only fires for real frames and we can't observe the
+        // actual multiplier directly.
+        // Empirically, the game's MaxFrameLatency value matches the DMFG
+        // multiplier shown in the NVIDIA overlay (e.g. game_lat=6 → 6x FG).
+        // Use it directly as the tier.
+        if (game_lat >= 3) {
+            lat_hint = static_cast<int>(game_lat);
+            if (lat_hint > 6) lat_hint = 6;
+        }
+    }
+
+    // If cadence data has refined the tier, use the higher of cadence vs latency hint.
+    // This prevents cadence from downgrading a known DMFG session to 2x.
+    if (last_fg_tier_ > 1) return (lat_hint > last_fg_tier_) ? lat_hint : last_fg_tier_;
+
+    // Use latency hint if available (driver-side DMFG only, no DLL)
+    if (lat_hint > 1) return lat_hint;
+
+    if (!fg_dll && !fsr_dll) return 1;
+
+    return 2;  // standard 2x FG (DLSS FG or FSR FG)
 }
 
 // Compute the Reflex cap from the monitor refresh rate.
@@ -1019,20 +1053,44 @@ void UlLimiter::UpdatePipelineStats() {
 
     if (gpu_load_gate_open_) {
         // --- FG tier change detection ---
-        // DetectFGDivisor() only tells us FG is active (returns 2) or not (1).
+        // DetectFGDivisor() returns the latency-hint-aware base tier.
         // Refine the actual multiplier from cadence data when available.
         // Promotions are instant; demotions require sustained confirmation
         // to avoid false downgrades from transient load spikes.
+        //
+        // DMFG floor: when the game's requested latency implies a high tier
+        // (e.g. latency=6 → tier 4), cadence-based demotion must never go
+        // below that floor. Without this, the feedback loop (wrong tier →
+        // wrong sleep interval → cadence reads ~2x → confirms demotion to 2)
+        // defeats the latency hint entirely.
         int fg_tier = DetectFGDivisor();
+        int dmfg_floor = fg_tier;  // latency-hint tier before cadence refinement
         if (fg_tier > 1 && pipeline_predictor_.cadence.count >= 8
             && pipeline_predictor_.cadence.mean_delta_us > 0.0f) {
             float target_fps = g_cfg.fps_limit.load(std::memory_order_relaxed);
+            float ratio = 0.0f;
             if (target_fps > 0.0f) {
-                float target_interval_us = 1'000'000.0f / target_fps;
-                float ratio = target_interval_us / pipeline_predictor_.cadence.mean_delta_us;
+                // Capped: cadence mean_delta is the render frame interval (from
+                // GetLatency, which only reports real frames). The FG multiplier
+                // is render_interval / output_interval.
+                float output_interval_us = 1'000'000.0f / target_fps;
+                ratio = pipeline_predictor_.cadence.mean_delta_us / output_interval_us;
+            }
+            // For DMFG (no DLL), DetectFGDivisor() already returns the correct
+            // tier from the latency hint. No cadence refinement needed — the
+            // driver controls frame injection below the swapchain level so we
+            // can't observe the actual multiplier from either cadence or QPC.
+            if (ratio > 1.3f) {
                 int cadence_tier = 2;
-                if (ratio > 3.5f)      cadence_tier = 4;
+                if (ratio > 5.5f)      cadence_tier = 6;
+                else if (ratio > 4.5f) cadence_tier = 5;
+                else if (ratio > 3.5f) cadence_tier = 4;
                 else if (ratio > 2.5f) cadence_tier = 3;
+
+                // Cadence can never demote below the DMFG latency hint floor.
+                // The sleep interval is computed from fg_tier, so cadence measured
+                // under the wrong tier is not a valid demotion signal.
+                if (cadence_tier < dmfg_floor) cadence_tier = dmfg_floor;
 
                 if (cadence_tier > last_fg_tier_ || last_fg_tier_ <= 1) {
                     // Promotion: accept immediately
@@ -1064,8 +1122,16 @@ void UlLimiter::UpdatePipelineStats() {
             }
         }
         if (fg_tier != last_fg_tier_) {
+            // Only reset the consistency buffer when the tuning params actually
+            // change. DMFG can oscillate between 4x/5x/6x frequently — all use
+            // kTier4xPlusMFG, so resetting on every shift would cause repeated
+            // buffer spikes for no benefit.
+            ConsistencyBuffer::TuningParams prev_params = consistency_buf_.active_params;
             consistency_buf_.SelectTier(fg_tier);
-            consistency_buf_.Reset(fg_tier);
+            if (consistency_buf_.active_params.initial_buffer_us != prev_params.initial_buffer_us
+                || consistency_buf_.active_params.max_buffer_us != prev_params.max_buffer_us) {
+                consistency_buf_.Reset(fg_tier);
+            }
             last_fg_tier_ = fg_tier;
         }
 

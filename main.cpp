@@ -66,11 +66,19 @@ static IUnknown* s_reflex_dev = nullptr;
 // Resolution
 static std::atomic<uint32_t> s_out_w{0}, s_out_h{0};
 static std::atomic<uint32_t> s_rnd_w{0}, s_rnd_h{0};
+static std::atomic<bool> s_dlaa_detected{false};
 
 // FG mode string
 static char s_fg_str[32] = "None";
 static int64_t s_fg_check_qpc = 0;
 static bool s_fg_logged = false;
+
+// 1% low FPS — computed from the worst 1% of frame times in a rolling window
+static constexpr int kLowPctWindow = 300;  // ~5 seconds at 60 fps, ~2.5s at 120
+static float s_low_pct_hist[kLowPctWindow] = {};
+static int s_low_pct_head = 0;
+static int s_low_pct_count = 0;
+static float s_1pct_low_fps = 0.0f;
 
 // ============================================================================
 // FG detection
@@ -94,7 +102,9 @@ static void UpdateFGString() {
     bool from_fps = false;
     if (s_has_native.load(std::memory_order_relaxed) && s_native_fps > 1.0f && s_fps > 1.0f) {
         float r = s_fps / s_native_fps;
-        if (r > 3.5f)      { mult = " 4x"; from_fps = true; }
+        if (r > 5.5f)      { mult = " 6x"; from_fps = true; }
+        else if (r > 4.5f) { mult = " 5x"; from_fps = true; }
+        else if (r > 3.5f) { mult = " 4x"; from_fps = true; }
         else if (r > 2.5f) { mult = " 3x"; from_fps = true; }
         else if (r > 1.3f) { mult = " 2x"; from_fps = true; }
     }
@@ -258,6 +268,32 @@ static void UpdateStats() {
         for (int i = 0; i < n; i++) sum += s_ft_hist[(s_ft_idx - 1 - i + kHistLen) % kHistLen];
         s_ft_ms = sum / static_cast<float>(n);
         s_fps = (s_ft_ms > 0.0f) ? 1000.0f / s_ft_ms : 0.0f;
+
+        // Feed 1% low rolling window
+        s_low_pct_hist[s_low_pct_head] = dt;
+        s_low_pct_head = (s_low_pct_head + 1) % kLowPctWindow;
+        if (s_low_pct_count < kLowPctWindow) s_low_pct_count++;
+
+        // Compute 1% low: 99th percentile frame time converted to FPS.
+        // Sort frame times ascending, pick the value at the 99th percentile
+        // position (i.e. 99% of frames are faster than this).
+        // This matches FrameView / CapFrameX / industry-standard methodology.
+        if (s_low_pct_count >= 30) {  // need at least 30 samples
+            float tmp[kLowPctWindow];
+            for (int i = 0; i < s_low_pct_count; i++) tmp[i] = s_low_pct_hist[i];
+            // Simple insertion sort — window is small (≤300)
+            for (int i = 1; i < s_low_pct_count; i++) {
+                float key = tmp[i];
+                int j = i - 1;
+                while (j >= 0 && tmp[j] > key) { tmp[j + 1] = tmp[j]; j--; }
+                tmp[j + 1] = key;
+            }
+            // 99th percentile index (0-based): floor(count * 0.99)
+            int p99_idx = static_cast<int>(s_low_pct_count * 0.99f);
+            if (p99_idx >= s_low_pct_count) p99_idx = s_low_pct_count - 1;
+            float p99_ft = tmp[p99_idx];
+            s_1pct_low_fps = (p99_ft > 0.0f) ? 1000.0f / p99_ft : 0.0f;
+        }
     }
     s_last_qpc = now;
 }
@@ -336,6 +372,11 @@ static void DrawOSD(reshade::api::effect_runtime*) {
         snprintf(buf, sizeof(buf), "FPS: %.1f", disp_fps);
         add_line(buf, white);
     }
+    if (g_cfg.show_1pct_low.load(std::memory_order_relaxed) && s_low_pct_count >= 30) {
+        float disp_1pct = sm ? s_1pct_low_fps * 2.0f : s_1pct_low_fps;
+        snprintf(buf, sizeof(buf), "1%% Low: %.1f", disp_1pct);
+        add_line(buf, white);
+    }
     if (g_cfg.show_native_fps.load(std::memory_order_relaxed) && s_has_native.load(std::memory_order_relaxed)) {
         snprintf(buf, sizeof(buf), "Native: %.1f FPS (%.2f ms)", disp_native_fps, disp_native_ft);
         add_line(buf, white);
@@ -373,12 +414,16 @@ static void DrawOSD(reshade::api::effect_runtime*) {
         uint32_t ow = s_out_w.load(), oh = s_out_h.load();
         uint32_t rw = s_rnd_w.load(), rh = s_rnd_h.load();
         if (rw > 0 && rh > 0 && ow > 0 && rw < ow) {
-            // Upscaling detected — show render → output
+            // Upscaling detected — show render -> output
             int pct = static_cast<int>(100.0f * rw / static_cast<float>(ow));
             snprintf(buf, sizeof(buf), "Res: %ux%u -> %ux%u (%d%%)", rw, rh, ow, oh, pct);
             add_line(buf, gold);
+        } else if (s_dlaa_detected.load(std::memory_order_relaxed) && ow > 0 && oh > 0) {
+            // DLAA/native — rendering at full resolution with AA
+            snprintf(buf, sizeof(buf), "Res: DLAA %ux%u", ow, oh);
+            add_line(buf, gold);
         }
-        // No upscaling — hide resolution line
+        // No upscaling and no DLAA — hide resolution line
     }
 
     has_graph = g_cfg.show_graph.load(std::memory_order_relaxed) &&
@@ -820,6 +865,7 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
                 if (tip && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
             };
             toggle("FPS", g_cfg.show_fps, "Total output frame rate (including generated frames).");
+            toggle("1% Low FPS", g_cfg.show_1pct_low, "Worst 1% frame rate over a rolling window.");
             toggle("Frametime", g_cfg.show_frametime, "Time per frame in milliseconds.");
             toggle("Native FPS", g_cfg.show_native_fps, "Real render rate excluding generated frames.");
             toggle("Frametime Graph", g_cfg.show_graph, "Rolling frametime history graph.");
@@ -1287,14 +1333,34 @@ static void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* sc,
             if (area_i > area_b)
                 best = i;
         }
-        s_rnd_w.store(s_vp_buckets[best].w, std::memory_order_relaxed);
-        s_rnd_h.store(s_vp_buckets[best].h, std::memory_order_relaxed);
+        // When the only sub-native viewport is exactly half the output (within
+        // 2%), it's almost certainly a half-res post-process pass (bloom, DOF,
+        // motion vectors) rather than the actual render resolution. This happens
+        // with DLAA or native rendering where the upscaler DLL is loaded but
+        // the game renders at full resolution. Suppress in this case.
+        uint32_t bw = s_vp_buckets[best].w, bh = s_vp_buckets[best].h;
+        uint32_t ow2 = s_out_w.load(std::memory_order_relaxed);
+        uint32_t oh2 = s_out_h.load(std::memory_order_relaxed);
+        bool is_half = ow2 > 0 && oh2 > 0
+                    && (bw > ow2 * 48 / 100 && bw < ow2 * 52 / 100)
+                    && (bh > oh2 * 48 / 100 && bh < oh2 * 52 / 100);
+        if (is_half && s_vp_bucket_count == 1) {
+            // Only one sub-native size and it's half-res — likely DLAA/native
+            s_rnd_w.store(0, std::memory_order_relaxed);
+            s_rnd_h.store(0, std::memory_order_relaxed);
+            s_dlaa_detected.store(true, std::memory_order_relaxed);
+        } else {
+            s_rnd_w.store(bw, std::memory_order_relaxed);
+            s_rnd_h.store(bh, std::memory_order_relaxed);
+            s_dlaa_detected.store(false, std::memory_order_relaxed);
+        }
         s_vp_bucket_count = 0;
         s_no_vp_frames = 0;
     } else {
         if (++s_no_vp_frames > 60) {
             s_rnd_w.store(0, std::memory_order_relaxed);
             s_rnd_h.store(0, std::memory_order_relaxed);
+            s_dlaa_detected.store(false, std::memory_order_relaxed);
         }
     }
 }
