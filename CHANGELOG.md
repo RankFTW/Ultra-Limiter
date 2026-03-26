@@ -1,49 +1,56 @@
 # Changelog
 
-## v2.1.1
+## v2.1.2
 
-NVIDIA DMFG (Dynamic Multi-Frame Generation) compatibility — RTX 50 series 3x–6x driver-side frame generation.
+NVIDIA DMFG (Dynamic Multi-Frame Generation) compatibility, FG tier detection improvements, and OSD additions.
 
-- Fixed frame latency override starving DMFG pipeline — game-requested queue depth (≥4) is now passed through instead of being forced to 1
-- Fixed flip metering (SetFlipConfig) being blocked in DMFG sessions — allowed through when game latency ≥ 4
-- Fixed DetectFGDivisor() hardcoding return 2 for all FG — latency hint from game's requested MaxFrameLatency now takes priority via max(latency_hint, cadence_tier), preventing cadence-seeded tier 2 from overriding a known DMFG 4x+ session
-- Fixed DetectFGDivisor() failing to detect driver-side DMFG (no user-space FG DLL) — latency hint check moved before DLL check
-- Added cadence tier thresholds for 5x (>4.5f) and 6x (>5.5f) multipliers
-- Added kTier4xPlusMFG tuning tier for ConsistencyBuffer (30–120 µs range, step 8/4, CV thresholds 0.05/0.12)
-- Added OSD 5x and 6x display branches in UpdateFGString
+- DMFG support (RTX 50 series, driver-side 3x-6x frame generation with no user-space FG DLL):
+  - Frame latency override passes through game-requested queue depth instead of forcing 1
+  - Flip metering (SetFlipConfig) allowed through for DMFG sessions
+  - FG tier derived directly from game's MaxFrameLatency value (e.g. game_lat=6 -> tier 6)
+  - All DMFG detection gated behind absence of FG DLLs -- standard DLL-based FG unaffected
+  - Added IsDmfgSession() helper for consistent no-DLL + high-latency detection across hooks
+- FG tier detection fixes:
 - Added GetGameRequestedLatency() export for cross-module DMFG detection
-- All DMFG changes gated behind latency ≥ 4 detection — existing 1x/2x paths untouched
+- Fixed OSD resolution showing incorrect 50% upscale when using DLAA -- half-res post-process viewports now detected and suppressed; OSD shows "DLAA" with native resolution instead- correctly detects 2x/3x/4x for DLL-based FG with a FPS cap
+  - Fixed cadence-based tier demotion feedback loop -- demotion clamped to DMFG latency hint floor
+  - Consistency buffer no longer resets when tier changes between same tuning params (e.g. 4x/5x/6x all use kTier4xPlusMFG)
+- Added cadence tier thresholds for 5x (>4.5f) and 6x (>5.5f) multipliers
+- Added kTier4xPlusMFG tuning tier for ConsistencyBuffer (30-120 us range, step 8/4, CV thresholds 0.05/0.12)
+- Added OSD 5x and 6x display branches in UpdateFGString
+- Added 1% low FPS to OSD -- 99th percentile frame time over a 300-frame rolling window, matching FrameView/CapFrameX methodology
+- Added GetGameRequestedLatency() export for cross-module DMFG detection
 
 ## v2.1.0
 
-Adaptive consistency buffer — replaces the old cadence response system with a two-mode state machine.
+Adaptive consistency buffer -- replaces the old cadence response system with a two-mode state machine.
 
 - New ConsistencyBuffer state machine (STABILIZE / TIGHTEN) replaces FGPacingContext, UpdateCadenceResponse, and ComputeFGAdjustment
 - Continuous coefficient of variation (CV) signal replaces binary smooth/jittery streak classification
-- Three tuning tiers: 1:1 (4–20 µs), 2x FG (12–50 µs), 3x+ MFG (20–80 µs) with tier-appropriate step sizes and thresholds
-- QPCCadenceMonitor provides secondary CV signal as early-warning brake — forces immediate STABILIZE before primary cadence signal confirms instability
+- Three tuning tiers: 1:1 (4-20 us), 2x FG (12-50 us), 3x+ MFG (20-80 us) with tier-appropriate step sizes and thresholds
+- QPCCadenceMonitor provides secondary CV signal as early-warning brake -- forces immediate STABILIZE before primary cadence signal confirms instability
 - GPU load gate (50% threshold) freezes ConsistencyBuffer tick during menus and loading screens, resumes without reset
 - VRR proximity scaling halves TIGHTEN step when near VRR ceiling (>90% proximity)
 - Consistency buffer applied on both FG and 1:1 paths (1:1 previously had no cadence-driven buffer)
-- FG multiplier detection from cadence ratio — correctly identifies 2x/3x/4x DLSS FG instead of hardcoding 2x
+- FG multiplier detection from cadence ratio -- correctly identifies 2x/3x/4x DLSS FG instead of hardcoding 2x
 - Hysteresis on FG tier demotion (30-tick confirmation) prevents false downgrades from transient load spikes
 - Diagnostic CSV logging (`csv_consistency_log` INI option) writes per-tick state machine data to `relimiter_consistency.csv`
 - New config fields auto-written to INI on first load
 - Fixed GPU load gate early return skipping DynamicPacing and BoostController (caused crash in Smooth Motion games)
-- Fixed SaveSettings during DLL_PROCESS_ATTACH causing loader lock issues — deferred to first OnPresent after warmup
+- Fixed SaveSettings during DLL_PROCESS_ATTACH causing loader lock issues -- deferred to first OnPresent after warmup
 - Fixed fake fullscreen hooks installing unconditionally even when disabled, triggering anti-tamper crashes in some games
-- Fixed Smooth Motion FPS cap — real frames now paced at half rate so total output matches the configured limit
+- Fixed Smooth Motion FPS cap -- real frames now paced at half rate so total output matches the configured limit
 - Fixed OSD showing half the actual FPS in Smooth Motion games
 - Filtered STATUS_BREAKPOINT from crash log (anti-tamper noise, not a real crash)
 - Removed: FGPacingContext, UpdateCadenceResponse, ComputeFGAdjustment, CadenceTracker streak counters and variance ratio constants
 
 ## v2.0.10
 
-- Added 32-bit build (relimiter.addon32) for 32-bit DX games — timing fallback, OSD, VSync, frame latency, fake fullscreen (no Reflex/Vulkan on 32-bit)
-- Added DX9 Fake Fullscreen support — hooks IDirect3DDevice9::Reset to force windowed mode
+- Added 32-bit build (relimiter.addon32) for 32-bit DX games -- timing fallback, OSD, VSync, frame latency, fake fullscreen (no Reflex/Vulkan on 32-bit)
+- Added DX9 Fake Fullscreen support -- hooks IDirect3DDevice9::Reset to force windowed mode
 
 ## v2.0.9
-- Added Fake Fullscreen option — intercepts exclusive fullscreen and converts to borderless window
+- Added Fake Fullscreen option -- intercepts exclusive fullscreen and converts to borderless window
 - Hooks DXGI Factory CreateSwapChain/CreateSwapChainForHwnd to force windowed mode at creation time
 - Hooks SetFullscreenState, GetFullscreenState, and ResizeTarget as safety net
 - RE Engine games auto-detected and skipped (incompatible with fake fullscreen)
@@ -66,7 +73,7 @@ Adaptive consistency buffer — replaces the old cadence response system with a 
 ## v2.0.6
 
 - Native Reflex detection via vkGetDeviceProcAddr hook (intercepts game's vkSetLatencySleepModeNV calls)
-- Deferred SetSleepMode — no longer called eagerly during swapchain attach, avoids conflicts with native Reflex games
+- Deferred SetSleepMode -- no longer called eagerly during swapchain attach, avoids conflicts with native Reflex games
 - Native Reflex VK games: ReLimiter is hands-off (no SetSleepMode/Sleep calls), timing fallback as backstop only
 - Non-native Reflex VK games: driver low-latency hints + QPC timing fallback (no semaphore wait)
 - Added GPU render time, render latency, and present latency OSD metrics for Vulkan games
@@ -85,7 +92,7 @@ Adaptive consistency buffer — replaces the old cadence response system with a 
 ## v2.0.3
 
 - Added OSD drop shadow option for improved text readability
-- Added OSD text brightness slider (0–100%)
+- Added OSD text brightness slider (0-100%)
 
 ## v2.0.2
 
@@ -102,7 +109,7 @@ Fully dynamic pacing engine rewrite.
 
 - Replaced manual presets, boost override, and FG multiplier with fully automatic adaptive systems
 - Pipeline-aware predictive sleep with per-stage StagePredictor instances (GPU, sim, FG)
-- Dynamic queue depth (1–3) via voting-window system with supermajority thresholds
+- Dynamic queue depth (1-3) via voting-window system with supermajority thresholds
 - Dynamic Boost controller based on GPU idle gaps, utilization, and thermal detection
 - Bottleneck detection across 5 pipeline stages (40% threshold)
 - Unified FG adjustment combining measured overhead + cadence + headroom + queue stress
