@@ -168,6 +168,7 @@ void ApplyFrameLatency();
 // --- Fake Fullscreen (intercept exclusive fullscreen → borderless window) ---
 
 bool HookFakeFullscreen(IDXGISwapChain* sc);
+bool HookFakeFullscreenD3D9(void* d3d9_device);
 
 // Release swapchain vtable hooks (SL proxy, VSync, frame latency, fake fullscreen).
 // Must be called from OnDestroySwapchain before the swapchain is freed.

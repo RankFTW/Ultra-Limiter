@@ -6,6 +6,8 @@
 //     vkSetLatencyMarkerNV function signatures and struct layouts
 // No code from any other project.
 
+#ifdef _WIN64  // Vulkan Reflex is 64-bit only
+
 #include "ul_reflex.hpp"  // NvSleepParams, NvLatencyResult, LatencyMarker, etc.
 #include <atomic>
 #include <cstdint>
@@ -237,3 +239,5 @@ void VkReflexUnhookCreateDevice();
 // Returns true if the extension was successfully injected into the last
 // vkCreateDevice call (i.e., the device should support low_latency2).
 bool VkReflexExtensionInjected();
+
+#endif // _WIN64

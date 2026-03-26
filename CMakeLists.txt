@@ -29,10 +29,14 @@ add_library(ultra_limiter SHARED
     ul_limiter.cpp
     ul_log.cpp
     ul_reflex.cpp
-    ul_vk_reflex.cpp
     ul_timing.cpp
     version.rc
 )
+
+# Vulkan Reflex backend — 64-bit only (requires vulkan-1.dll / VK_NV_low_latency2)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    target_sources(ultra_limiter PRIVATE ul_vk_reflex.cpp)
+endif()
 
 # Include directories
 target_include_directories(ultra_limiter PRIVATE
@@ -80,9 +84,13 @@ if(MSVC)
     target_link_options(ultra_limiter PRIVATE $<$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>:/DEBUG>)
 endif()
 
-# Output as .addon64
+# Output name and suffix based on architecture
 set_target_properties(ultra_limiter PROPERTIES
     OUTPUT_NAME "relimiter"
-    SUFFIX ".addon64"
     PREFIX ""
 )
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set_target_properties(ultra_limiter PROPERTIES SUFFIX ".addon64")
+else()
+    set_target_properties(ultra_limiter PROPERTIES SUFFIX ".addon32")
+endif()

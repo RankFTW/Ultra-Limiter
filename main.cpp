@@ -13,7 +13,9 @@
 #include "ul_limiter.hpp"
 #include "ul_log.hpp"
 #include "ul_timing.hpp"
+#ifdef _WIN64
 #include "ul_vk_reflex.hpp"
+#endif
 
 #include <reshade.hpp>
 
@@ -200,6 +202,7 @@ static void PollGpuLatency() {
 }
 
 // Vulkan equivalent — uses VkReflex::GetLatencyTimings instead of NVAPI
+#ifdef _WIN64
 static void PollVkGpuLatency() {
     if (!g_vk_reflex.IsActive()) return;
 
@@ -217,12 +220,9 @@ static void PollVkGpuLatency() {
             gpu += static_cast<float>(f.gpuActiveRenderTimeUs) / 1000.0f;
             n_gpu++;
         }
-        // Render latency: sim start → gpu render end.
-        // On Vulkan the driver may report stale/cross-frame timestamps when
-        // the game doesn't set its own markers. Clamp to 100ms to reject junk.
         if (f.simStartTime > 0 && f.gpuRenderEndTime > f.simStartTime) {
             uint64_t delta = f.gpuRenderEndTime - f.simStartTime;
-            if (delta < 100'000) {  // < 100ms — plausible
+            if (delta < 100'000) {
                 rlat += static_cast<float>(delta) / 1000.0f;
                 n_rlat++;
             }
@@ -240,6 +240,7 @@ static void PollVkGpuLatency() {
     if (n_plat > 0) s_present_lat_ms = plat / n_plat;
     if (n_gpu > 0) s_has_gpu.store(true, std::memory_order_relaxed);
 }
+#endif
 
 // ============================================================================
 // Frametime stats
@@ -926,12 +927,19 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
     // --- Status ---
     ImGui::Spacing();
     ImGui::TextDisabled("Status");
-    ImGui::Text("Reflex: %s", g_vk_reflex.IsActive() ? "Vulkan (VK_NV_low_latency2)" :
-                              ReflexActive() ? "Hooked" : "Not hooked");
+    ImGui::Text("Reflex: %s",
+#ifdef _WIN64
+                g_vk_reflex.IsActive() ? "Vulkan (VK_NV_low_latency2)" :
+#endif
+                ReflexActive() ? "Hooked" : "Not hooked");
     ImGui::Text("Native Reflex: %s", g_game_uses_reflex.load() ? "Detected" : "No");
 
     bool native = g_game_uses_reflex.load();
+#ifdef _WIN64
     bool vk_active = g_vk_reflex.IsActive();
+#else
+    bool vk_active = false;
+#endif
     const char* mode = "Timing";
     if (vk_active) {
         if (native) {
@@ -1007,13 +1015,13 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
         ul_log::Write("OnInitSwapchain: FG=%s", s_fg_str);
 
         // --- Vulkan path ---
+#ifdef _WIN64
         if (api == reshade::api::device_api::vulkan) {
             VkDevice vk_dev = reinterpret_cast<VkDevice>(static_cast<uintptr_t>(dev->get_native()));
             if (vk_dev) {
                 ul_log::Write("OnInitSwapchain: Vulkan device detected (ext injected=%d)",
                               VkReflexExtensionInjected() ? 1 : 0);
                 if (g_vk_reflex.Init(vk_dev)) {
-                    // ReShade exposes VkSwapchainKHR as the native swapchain handle
                     VkSwapchainKHR vk_sc = sc->get_native();
                     if (vk_sc && g_vk_reflex.AttachSwapchain(vk_sc)) {
                         s_limiter.ConnectVulkanReflex(&g_vk_reflex);
@@ -1026,6 +1034,21 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
                 }
             }
             ul_log::Write("OnInitSwapchain: done (Vulkan)");
+            return;
+        }
+#endif
+
+        // --- DX9 path ---
+        if (api == reshade::api::device_api::d3d9) {
+            // DX9 fake fullscreen — hook Reset to force windowed mode
+            if (g_cfg.fake_fullscreen.load(std::memory_order_relaxed)) {
+                void* native_dev = reinterpret_cast<void*>(dev->get_native());
+                if (native_dev) {
+                    ul_log::Write("OnInitSwapchain: HookFakeFullscreenD3D9...");
+                    HookFakeFullscreenD3D9(native_dev);
+                }
+            }
+            ul_log::Write("OnInitSwapchain: done (DX9)");
             return;
         }
 
@@ -1096,10 +1119,12 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
 static void OnDestroySwapchain(reshade::api::swapchain* sc, bool) {
     ul_log::Write("OnDestroySwapchain");
     // Detach Vulkan Reflex if active
+#ifdef _WIN64
     if (g_vk_reflex.IsActive()) {
         g_vk_reflex.DetachSwapchain();
         ul_log::Write("OnDestroySwapchain: Vulkan Reflex detached");
     }
+#endif
     // Release swapchain vtable hooks (SL proxy, VSync, frame latency) before
     // the swapchain is freed. This prevents use-after-free when MinHook tries
     // to restore the original function prologues during MH_Uninitialize.
@@ -1233,7 +1258,9 @@ static void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* sc,
         s_limiter.OnPresent();
         UpdateStats();
         if (cnt > 300 && cnt % 30 == 0) PollGpuLatency();
+#ifdef _WIN64
         if (cnt > 300 && cnt % 30 == 0) PollVkGpuLatency();
+#endif
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         ul_log::Write("OnPresent: exception 0x%08X", GetExceptionCode());
     }
@@ -1333,7 +1360,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
             // Hook vkCreateDevice to inject VK_NV_low_latency2 before the game
             // creates its Vulkan device. Safe to call even if Vulkan isn't loaded.
+#ifdef _WIN64
             VkReflexHookCreateDevice();
+#endif
 
             SetSLPresentCb(OnSLPresentCb);
             SetMarkerCb(OnMarkerCb);
@@ -1359,7 +1388,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         ul_log::Write("Shutting down");
         SetUnhandledExceptionFilter(s_prev_filter);
         StopWorker();
+#ifdef _WIN64
         VkReflexUnhookCreateDevice();
+#endif
         reshade::unregister_overlay("ReLimiter", DrawOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_overlay>(DrawOSD);
         s_limiter.Shutdown();

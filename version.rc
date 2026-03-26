@@ -19,7 +19,11 @@ BEGIN
             VALUE "FileVersion",      UL_VERSION_STRING
             VALUE "InternalName",     "relimiter"
             VALUE "LegalCopyright",   "MIT License"
+#ifdef _WIN64
             VALUE "OriginalFilename", "relimiter.addon64"
+#else
+            VALUE "OriginalFilename", "relimiter.addon32"
+#endif
             VALUE "ProductName",      "ReLimiter"
             VALUE "ProductVersion",   UL_VERSION_STRING
         END

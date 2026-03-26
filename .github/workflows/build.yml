@@ -67,11 +67,17 @@ jobs:
           git clone --depth 1 https://github.com/NVIDIA/nvapi external/nvapi
           git clone --depth 1 --branch v1.92.5-docking https://github.com/ocornut/imgui external/imgui
 
-      - name: Configure
+      - name: Configure x64
         run: cmake -B build -G "Visual Studio 17 2022" -A x64
 
-      - name: Build
+      - name: Build x64
         run: cmake --build build --config Release
+
+      - name: Configure x86
+        run: cmake -B build32 -G "Visual Studio 17 2022" -A Win32
+
+      - name: Build x86
+        run: cmake --build build32 --config Release
 
       - name: Extract changelog for release
         id: changelog
@@ -89,7 +95,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: relimiter
-          path: build/Release/relimiter.addon64
+          path: |
+            build/Release/relimiter.addon64
+            build32/Release/relimiter.addon32
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -99,6 +107,7 @@ jobs:
           body_path: release_notes.txt
           files: |
             build/Release/relimiter.addon64
+            build32/Release/relimiter.addon32
             CHANGELOG.md
           make_latest: true
           prerelease: false

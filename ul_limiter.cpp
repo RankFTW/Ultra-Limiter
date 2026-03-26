@@ -12,7 +12,12 @@
 #include "ul_limiter.hpp"
 #include "ul_log.hpp"
 #include "ul_timing.hpp"
+#ifdef _WIN64
 #include "ul_vk_reflex.hpp"
+#define VK_REFLEX_ACTIVE() (vk_reflex_ && vk_reflex_->IsActive())
+#else
+#define VK_REFLEX_ACTIVE() (false)
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -421,10 +426,12 @@ void UlLimiter::Init() {
 
 void UlLimiter::Shutdown() {
     // Vulkan cleanup
+#ifdef _WIN64
     if (vk_reflex_) {
         vk_reflex_->Shutdown();
         vk_reflex_ = nullptr;
     }
+#endif
 
     if (dev_ && ReflexActive()) {
         const auto& gs = GetGameState();
@@ -460,11 +467,13 @@ bool UlLimiter::ConnectReflex(IUnknown* device) {
     return true;
 }
 
+#ifdef _WIN64
 void UlLimiter::ConnectVulkanReflex(VkReflex* vk) {
     vk_reflex_ = vk;
     ul_log::Write("ConnectVulkanReflex: Vulkan Reflex backend attached (active=%d)",
                   vk ? vk->IsActive() : 0);
 }
+#endif
 
 void UlLimiter::ResetAdaptiveState() {
     pipeline_predictor_.Reset();
@@ -605,14 +614,16 @@ void UlLimiter::UpdatePipelineStats() {
     if (!latency_buf_) return;
 
     // Vulkan path
-    if (vk_reflex_ && vk_reflex_->IsActive()) {
+#ifdef _WIN64
+    if (VK_REFLEX_ACTIVE()) {
         memset(latency_buf_, 0, sizeof(*latency_buf_));
         latency_buf_->version = NV_LATENCY_RESULT_VER;
         if (!vk_reflex_->GetLatencyTimings(latency_buf_)) return;
-        // Fall through to shared analysis below
     }
     // DX path
-    else {
+    else
+#endif
+    {
         if (!ReflexActive() || !dev_) return;
 
         memset(latency_buf_, 0, sizeof(*latency_buf_));
@@ -995,7 +1006,8 @@ int UlLimiter::ResolveEnforcementSite() const {
 
 void UlLimiter::DoReflexSleep() {
     // Vulkan path: use VK_NV_low_latency2
-    if (vk_reflex_ && vk_reflex_->IsActive()) {
+#ifdef _WIN64
+    if (VK_REFLEX_ACTIVE()) {
         // When the game uses native Reflex (calls vkSetLatencySleepModeNV /
         // vkLatencySleepNV itself), do NOT call SetSleepMode or Sleep — our
         // calls would conflict with the game's own sleep cycle and crash.
@@ -1012,6 +1024,7 @@ void UlLimiter::DoReflexSleep() {
             p.minimumIntervalUs);
         return;
     }
+#endif
 
     // DX path: NVAPI
     if (!ReflexActive() || !dev_) return;
@@ -1073,7 +1086,7 @@ void UlLimiter::HandleQueuedFrames(uint64_t frame_id, int max_q) {
 // ============================================================================
 
 void UlLimiter::OnMarker(int marker_type, uint64_t frame_id) {
-    bool has_reflex = (ReflexActive() && dev_) || (vk_reflex_ && vk_reflex_->IsActive());
+    bool has_reflex = (ReflexActive() && dev_) || VK_REFLEX_ACTIVE();
     if (!has_reflex) return;
     if (!warmup_done_) return;
 
@@ -1251,7 +1264,7 @@ void UlLimiter::OnPresent() {
     }
 
     // Present-to-present feedback loop (1:1 only — not under FG)
-    bool any_reflex = (ReflexActive() && dev_) || (vk_reflex_ && vk_reflex_->IsActive());
+    bool any_reflex = (ReflexActive() && dev_) || VK_REFLEX_ACTIVE();
     if (any_reflex && DetectFGDivisor() == 1) {
         float out_fps = g_cfg.fps_limit.load(std::memory_order_relaxed);
         if (out_fps > 0.0f) {
@@ -1281,7 +1294,7 @@ void UlLimiter::OnPresent() {
     }
 
     // Reflex path — DX or Vulkan
-    bool vk_active = (vk_reflex_ && vk_reflex_->IsActive());
+    bool vk_active = VK_REFLEX_ACTIVE();
     bool vk_native = vk_active && g_game_uses_reflex.load(std::memory_order_relaxed);
     if (vk_active) {
         // When the game uses native Reflex, it handles its own sleep cycle.

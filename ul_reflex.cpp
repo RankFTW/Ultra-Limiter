@@ -16,6 +16,7 @@
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <dxgi1_5.h>
+#include <d3d9.h>
 #include <cstring>
 #include <intrin.h>  // _ReturnAddress for RTSS filter
 
@@ -971,6 +972,79 @@ bool HookFakeFullscreen(IDXGISwapChain* sc) {
     return true;
 }
 
+// ============================================================================
+// DX9 Fake Fullscreen — hook IDirect3DDevice9::Reset to force windowed mode
+// ============================================================================
+// IDirect3DDevice9 vtable[16] = Reset
+// Source: public Microsoft Direct3D 9 documentation.
+
+using D3D9ResetFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
+static D3D9ResetFn s_orig_d3d9_reset = nullptr;
+static std::atomic<bool> s_d3d9_fs_hooked{false};
+static void* s_d3d9_reset_target = nullptr;
+static HWND s_d3d9_fs_hwnd = nullptr;
+
+static HRESULT STDMETHODCALLTYPE Hook_D3D9Reset(
+    IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pParams)
+{
+    if (g_cfg.fake_fullscreen.load(std::memory_order_relaxed) &&
+        pParams && !pParams->Windowed) {
+        ul_log::Write("FakeFullscreen DX9: Reset forced Windowed=TRUE (was %ux%u fullscreen)",
+                      pParams->BackBufferWidth, pParams->BackBufferHeight);
+        pParams->Windowed = TRUE;
+        pParams->FullScreen_RefreshRateInHz = 0;  // must be 0 in windowed mode
+
+        // Apply borderless window style
+        HWND hwnd = pParams->hDeviceWindow;
+        if (!hwnd) hwnd = s_d3d9_fs_hwnd;
+        if (!hwnd) hwnd = GetForegroundWindow();
+        if (hwnd) {
+            s_d3d9_fs_hwnd = hwnd;
+            LONG st = GetWindowLongA(hwnd, GWL_STYLE);
+            st &= ~(WS_OVERLAPPEDWINDOW | WS_CAPTION | WS_BORDER | WS_THICKFRAME);
+            st |= WS_POPUP;
+            SetWindowLongA(hwnd, GWL_STYLE, st);
+            LONG ex = GetWindowLongA(hwnd, GWL_EXSTYLE);
+            ex &= ~(WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE);
+            SetWindowLongA(hwnd, GWL_EXSTYLE, ex);
+            HMONITOR hm = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi = {}; mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoA(hm, &mi)) {
+                SetWindowPos(hwnd, HWND_TOP,
+                             mi.rcMonitor.left, mi.rcMonitor.top,
+                             mi.rcMonitor.right - mi.rcMonitor.left,
+                             mi.rcMonitor.bottom - mi.rcMonitor.top,
+                             SWP_FRAMECHANGED | SWP_NOZORDER);
+            }
+        }
+        s_fake_fs_active.store(true, std::memory_order_relaxed);
+    }
+    return s_orig_d3d9_reset(dev, pParams);
+}
+
+bool HookFakeFullscreenD3D9(void* d3d9_device) {
+    if (!d3d9_device || s_d3d9_fs_hooked.load(std::memory_order_acquire)) return false;
+
+    void** vtable = *reinterpret_cast<void***>(d3d9_device);
+    if (!vtable) return false;
+
+    // IDirect3DDevice9::Reset = vtable[16]
+    MH_STATUS st = MH_CreateHook(vtable[16], (void*)Hook_D3D9Reset,
+                                 (void**)&s_orig_d3d9_reset);
+    if (st != MH_OK) {
+        ul_log::Write("HookFakeFullscreenD3D9: MH_CreateHook(Reset) failed=%d", st);
+        return false;
+    }
+    if (MH_EnableHook(vtable[16]) != MH_OK) {
+        MH_RemoveHook(vtable[16]);
+        return false;
+    }
+    s_d3d9_reset_target = vtable[16];
+    s_d3d9_fs_hooked.store(true, std::memory_order_release);
+    ul_log::Write("HookFakeFullscreenD3D9: hooked IDirect3DDevice9::Reset");
+    return true;
+}
+
 void ReleaseSwapchainHooks() {
     // Disable and remove swapchain vtable hooks before the swapchain is freed.
     // This prevents MH_Uninitialize from touching stale memory during shutdown.
@@ -1033,5 +1107,15 @@ void ReleaseSwapchainHooks() {
         s_orig_resize_target = nullptr;
         s_fake_fs_active.store(false, std::memory_order_relaxed);
         ul_log::Write("ReleaseSwapchainHooks: fake fullscreen released");
+    }
+
+    if (s_d3d9_fs_hooked.exchange(false, std::memory_order_acq_rel)) {
+        if (s_d3d9_reset_target) {
+            MH_DisableHook(s_d3d9_reset_target);
+            MH_RemoveHook(s_d3d9_reset_target);
+            s_d3d9_reset_target = nullptr;
+        }
+        s_orig_d3d9_reset = nullptr;
+        ul_log::Write("ReleaseSwapchainHooks: DX9 fake fullscreen released");
     }
 }

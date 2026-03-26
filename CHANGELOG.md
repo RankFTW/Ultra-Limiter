@@ -1,7 +1,11 @@
 # Changelog
 
-## v2.0.9
+## v2.0.10
 
+- Added 32-bit build (relimiter.addon32) for 32-bit DX games — timing fallback, OSD, VSync, frame latency, fake fullscreen (no Reflex/Vulkan on 32-bit)
+- Added DX9 Fake Fullscreen support — hooks IDirect3DDevice9::Reset to force windowed mode
+
+## v2.0.9
 - Added Fake Fullscreen option — intercepts exclusive fullscreen and converts to borderless window
 - Hooks DXGI Factory CreateSwapChain/CreateSwapChainForHwnd to force windowed mode at creation time
 - Hooks SetFullscreenState, GetFullscreenState, and ResizeTarget as safety net
