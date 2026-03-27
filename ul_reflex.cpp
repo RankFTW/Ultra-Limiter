@@ -115,13 +115,17 @@ static void* s_latency_get_target = nullptr;  // vtable[32] address
 // Interface table lookup
 // ============================================================================
 
-static NvU32 FindFuncId(const char* name) {
+static NvU32 FindFuncIdInternal(const char* name) {
     for (int i = 0; nvapi_interface_table[i].func != nullptr; i++) {
         if (strcmp(nvapi_interface_table[i].func, name) == 0)
             return nvapi_interface_table[i].id;
     }
     return 0;
 }
+
+NvU32 FindFuncId(const char* name) { return FindFuncIdInternal(name); }
+
+NvQueryInterface_fn GetNvapiQi() { return s_qi; }
 
 // ============================================================================
 // QueryInterface detour — block flip metering pacer

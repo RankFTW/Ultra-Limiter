@@ -210,19 +210,22 @@ void ConsistencyBuffer::Reset(int fg_divisor) {
     consecutive_stable_ticks = 0;
 }
 
-void ConsistencyBuffer::Tick(float cadence_cv, float qpc_cv, float vrr_proximity) {
-    // QPC brake: immediate STABILIZE on QPC variance spike
-    if (qpc_cv > active_params.qpc_brake_threshold_cv) {
+void ConsistencyBuffer::Tick(float cadence_stddev_us, float qpc_cv, float vrr_proximity, bool dmfg) {
+    // QPC brake: immediate STABILIZE on QPC variance spike.
+    // Disabled for DMFG — driver-injected frames cause inherently high QPC
+    // variance from the app's perspective; cadence stddev is the only
+    // reliable stability signal.
+    if (!dmfg && qpc_cv > active_params.qpc_brake_threshold_cv) {
         mode = Mode::Stabilize;
         consecutive_stable_ticks = 0;
     }
 
     if (mode == Mode::Stabilize) {
-        if (cadence_cv > active_params.instability_threshold_cv) {
+        if (cadence_stddev_us > active_params.instability_threshold_us) {
             // Unstable: increase buffer
             buffer_us += active_params.stabilize_step_us;
             consecutive_stable_ticks = 0;
-        } else if (cadence_cv < active_params.stability_threshold_cv) {
+        } else if (cadence_stddev_us < active_params.stability_threshold_us) {
             // Stable tick
             consecutive_stable_ticks++;
             if (consecutive_stable_ticks >= active_params.stable_ticks_to_tighten) {
@@ -235,7 +238,7 @@ void ConsistencyBuffer::Tick(float cadence_cv, float qpc_cv, float vrr_proximity
         }
     } else {
         // TIGHTEN mode
-        if (cadence_cv > active_params.instability_threshold_cv) {
+        if (cadence_stddev_us > active_params.instability_threshold_us) {
             // Instability detected: transition to STABILIZE
             mode = Mode::Stabilize;
             consecutive_stable_ticks = 0;
@@ -255,72 +258,104 @@ void ConsistencyBuffer::Tick(float cadence_cv, float qpc_cv, float vrr_proximity
 }
 
 // ============================================================================
-// CSVLogger — diagnostic CSV writer for consistency buffer state
+// DiagCSVLogger — expanded per-frame diagnostic CSV (18 columns)
 // ============================================================================
 
-void CSVLogger::Open(HMODULE addon_module) {
+void DiagCSVLogger::Open(HMODULE addon_module) {
     if (!addon_module) {
-        ul_log::Write("CSVLogger: null module handle, disabling");
+        ul_log::Write("DiagCSVLogger: null module handle, disabling");
         enabled = false;
         return;
     }
 
+    // Try game exe directory first (same as INI path), fall back to addon DLL directory
     wchar_t wpath[MAX_PATH] = {};
-    if (!GetModuleFileNameW(addon_module, wpath, MAX_PATH)) {
-        ul_log::Write("CSVLogger: GetModuleFileNameW failed (err=%lu), disabling",
-                      GetLastError());
-        enabled = false;
-        return;
+    bool found = false;
+
+    // Attempt 1: next to game exe
+    if (GetModuleFileNameW(nullptr, wpath, MAX_PATH)) {
+        wchar_t* slash = wcsrchr(wpath, L'\\');
+        if (slash) {
+            wcscpy(slash + 1, L"relimiter_diagnostics.csv");
+            file = _wfopen(wpath, L"w");
+            if (file) found = true;
+        }
     }
 
-    // Strip filename, append csv name
-    wchar_t* slash = wcsrchr(wpath, L'\\');
-    if (slash)
-        wcscpy(slash + 1, L"relimiter_consistency.csv");
-    else
-        wcscpy(wpath, L"relimiter_consistency.csv");
+    // Attempt 2: next to addon DLL
+    if (!found) {
+        wpath[0] = L'\0';
+        if (GetModuleFileNameW(addon_module, wpath, MAX_PATH)) {
+            wchar_t* slash = wcsrchr(wpath, L'\\');
+            if (slash)
+                wcscpy(slash + 1, L"relimiter_diagnostics.csv");
+            else
+                wcscpy(wpath, L"relimiter_diagnostics.csv");
+            file = _wfopen(wpath, L"w");
+            if (file) found = true;
+        }
+    }
 
-    file = _wfopen(wpath, L"w");
     if (!file) {
-        ul_log::Write("CSVLogger: failed to open CSV file (err=%lu), disabling",
+        ul_log::Write("DiagCSVLogger: failed to open CSV file (err=%lu), disabling",
                       GetLastError());
         enabled = false;
         return;
     }
 
-    // Write header row
-    fprintf(file, "timestamp,mode,buffer_us,cadence_cv,qpc_cv,gpu_load,fg_tier,vrr_proximity,interval_us\n");
+    fprintf(file, "timestamp,smoothness,cadence_stddev_us,cadence_mean_delta_us,"
+                  "cadence_cv,qpc_cv,gsync_active,cb_mode,cb_buffer_us,"
+                  "pred_gpu_us,pred_sim_us,pred_fg_us,enforcement_site,"
+                  "queue_depth,fg_tier,vrr_proximity,gpu_load_ratio,final_interval_us\n");
     fflush(file);
     header_written = true;
     enabled = true;
 }
 
-void CSVLogger::WriteRow(int64_t timestamp_qpc,
-                         ConsistencyBuffer::Mode mode,
-                         int32_t buffer_us,
-                         float cadence_cv,
-                         float qpc_cv,
-                         float gpu_load_ratio,
-                         int fg_tier,
-                         float vrr_proximity,
-                         NvU32 final_interval_us) {
+void DiagCSVLogger::WriteRow(int64_t timestamp_qpc,
+                             float smoothness,
+                             float cadence_stddev_us,
+                             float cadence_mean_delta_us,
+                             float cadence_cv,
+                             float qpc_cv,
+                             bool gsync_active,
+                             ConsistencyBuffer::Mode cb_mode,
+                             int32_t cb_buffer_us,
+                             float pred_gpu_us,
+                             float pred_sim_us,
+                             float pred_fg_us,
+                             int enforcement_site,
+                             int queue_depth,
+                             int fg_tier,
+                             float vrr_proximity,
+                             float gpu_load_ratio,
+                             NvU32 final_interval_us) {
     if (!enabled || !file) return;
 
-    const char* mode_str = (mode == ConsistencyBuffer::Mode::Tighten) ? "TIGHTEN" : "STABILIZE";
-    fprintf(file, "%lld,%s,%d,%.6f,%.6f,%.4f,%d,%.4f,%u\n",
+    const char* mode_str = (cb_mode == ConsistencyBuffer::Mode::Tighten) ? "TIGHTEN" : "STABILIZE";
+    fprintf(file, "%lld,%.2f,%.2f,%.2f,%.6f,%.6f,%d,%s,%d,%.2f,%.2f,%.2f,%d,%d,%d,%.4f,%.4f,%u\n",
             static_cast<long long>(timestamp_qpc),
-            mode_str,
-            buffer_us,
+            smoothness,
+            cadence_stddev_us,
+            cadence_mean_delta_us,
             cadence_cv,
             qpc_cv,
-            gpu_load_ratio,
+            gsync_active ? 1 : 0,
+            mode_str,
+            cb_buffer_us,
+            pred_gpu_us,
+            pred_sim_us,
+            pred_fg_us,
+            enforcement_site,
+            queue_depth,
             fg_tier,
             vrr_proximity,
+            gpu_load_ratio,
             final_interval_us);
     fflush(file);
 }
 
-void CSVLogger::Close() {
+void DiagCSVLogger::Close() {
     if (file) {
         fclose(file);
         file = nullptr;
@@ -389,6 +424,247 @@ void BoostController::Reset() {
     idle_frame_count = 0; steady_frame_count = 0; feed_count = 0;
     thermal_suspect = false; thermal_suspect_start_qpc = 0;
 }
+
+// ============================================================================
+// GSyncDetector — runtime GSync/VRR active detection (64-bit only)
+// ============================================================================
+
+#ifdef _WIN64
+bool GSyncDetector::Init() {
+    NvQueryInterface_fn qi = GetNvapiQi();
+    if (!qi) {
+        ul_log::Write("GSyncDetector::Init: NVAPI QI not available");
+        return false;
+    }
+
+    NvU32 goh_id = FindFuncId("NvAPI_D3D_GetObjectHandleForResource");
+    NvU32 gsa_id = FindFuncId("NvAPI_D3D_IsGSyncActive");
+
+    if (!goh_id || !gsa_id) {
+        ul_log::Write("GSyncDetector::Init: function IDs not found in table");
+        return false;
+    }
+
+    get_object_handle = reinterpret_cast<GetObjectHandle_fn>(qi(goh_id));
+    is_gsync_active   = reinterpret_cast<IsGSyncActive_fn>(qi(gsa_id));
+
+    resolved = (get_object_handle != nullptr && is_gsync_active != nullptr);
+    if (!resolved) {
+        ul_log::Write("GSyncDetector::Init: failed to resolve function pointers "
+                      "(GetObjectHandle=%p, IsGSyncActive=%p)",
+                      reinterpret_cast<void*>(get_object_handle),
+                      reinterpret_cast<void*>(is_gsync_active));
+    } else {
+        ul_log::Write("GSyncDetector::Init: resolved OK");
+    }
+    return resolved;
+}
+
+bool GSyncDetector::AcquireSurfaceHandle(IUnknown* device, IUnknown* back_buffer) {
+    if (!resolved || !get_object_handle || !device || !back_buffer) return false;
+
+    // Reset error flag on each attempt (swapchain re-init should retry cleanly)
+    error_logged = false;
+
+    NvU32 handle = 0;
+    NvStatus st = get_object_handle(device, back_buffer, &handle);
+    if (st != NV_OK) {
+        if (!error_logged) {
+            ul_log::Write("GSyncDetector::AcquireSurfaceHandle: failed (status=%d)", st);
+            error_logged = true;
+        }
+        surface_handle = 0;
+        return false;
+    }
+    surface_handle = handle;
+    ul_log::Write("GSyncDetector::AcquireSurfaceHandle: handle=0x%08X", handle);
+    return true;
+}
+
+bool GSyncDetector::Poll(IUnknown* device, int64_t now_qpc) {
+    if (!resolved || !is_gsync_active || surface_handle == 0) {
+        gsync_active = false;
+        return false;
+    }
+
+    // Only poll every 2 seconds
+    if (last_poll_qpc != 0 &&
+        (now_qpc - last_poll_qpc) < ul_timing::g_qpc_freq * 2) {
+        return gsync_active;
+    }
+
+    last_poll_qpc = now_qpc;
+
+    NvU32 active = 0;
+    NvStatus st = is_gsync_active(device, surface_handle, &active);
+    if (st != NV_OK) {
+        if (!error_logged) {
+            ul_log::Write("GSyncDetector::Poll: IsGSyncActive failed (status=%d)", st);
+            error_logged = true;
+        }
+        gsync_active = false;
+        return false;
+    }
+
+    gsync_active = (active != 0);
+    return gsync_active;
+}
+#endif
+
+// ============================================================================
+// FrameSplitController — disable/restore NVIDIA driver frame splitting
+// ============================================================================
+
+#ifdef _WIN64
+bool FrameSplitController::Init() {
+    NvQueryInterface_fn qi = GetNvapiQi();
+    if (!qi) {
+        ul_log::Write("FrameSplitController::Init: NVAPI QI not available");
+        return false;
+    }
+
+    NvU32 get_id = FindFuncId("NvAPI_DISP_GetAdaptiveSyncData");
+    NvU32 set_id = FindFuncId("NvAPI_DISP_SetAdaptiveSyncData");
+    NvU32 enum_id = FindFuncId("NvAPI_EnumNvidiaDisplayHandle");
+
+    if (!get_id || !set_id || !enum_id) {
+        ul_log::Write("FrameSplitController::Init: function IDs not found in table");
+        return false;
+    }
+
+    get_adaptive_sync = reinterpret_cast<GetAdaptiveSyncData_fn>(qi(get_id));
+    set_adaptive_sync = reinterpret_cast<SetAdaptiveSyncData_fn>(qi(set_id));
+    enum_display      = reinterpret_cast<EnumDisplayHandle_fn>(qi(enum_id));
+
+    resolved = (get_adaptive_sync != nullptr && set_adaptive_sync != nullptr
+                && enum_display != nullptr);
+    if (!resolved) {
+        ul_log::Write("FrameSplitController::Init: failed to resolve function pointers");
+    } else {
+        ul_log::Write("FrameSplitController::Init: resolved OK");
+    }
+    return resolved;
+}
+
+bool FrameSplitController::ResolveDisplayId(HWND hwnd) {
+    if (!resolved || !enum_display) return false;
+    if (!hwnd) return false;
+
+    HMONITOR hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!hmon) {
+        if (!error_logged) {
+            ul_log::Write("FrameSplitController::ResolveDisplayId: MonitorFromWindow failed");
+            error_logged = true;
+        }
+        return false;
+    }
+
+    MONITORINFOEXW mi = {};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(hmon, &mi)) {
+        if (!error_logged) {
+            ul_log::Write("FrameSplitController::ResolveDisplayId: GetMonitorInfoW failed");
+            error_logged = true;
+        }
+        return false;
+    }
+
+    // Enumerate NVAPI displays and match by device name
+    for (NvU32 i = 0; i < 32; i++) {
+        NvU32 handle = 0;
+        NvStatus st = enum_display(i, &handle);
+        if (st != NV_OK) break;  // no more displays
+
+        display_id = handle;
+        ul_log::Write("FrameSplitController::ResolveDisplayId: using display handle 0x%08X", handle);
+        return true;
+    }
+
+    if (!error_logged) {
+        ul_log::Write("FrameSplitController::ResolveDisplayId: no NVAPI display found");
+        error_logged = true;
+    }
+    return false;
+}
+
+bool FrameSplitController::Disable() {
+    if (!resolved || !get_adaptive_sync || !set_adaptive_sync) return false;
+    if (display_id == 0) return false;
+    if (disabled) return true;  // already disabled
+
+    // Save original state
+    memset(saved_data, 0, sizeof(saved_data));
+    // NV_GET_ADAPTIVE_SYNC_DATA structure: version at offset 0 (NvU32)
+    // Version = sizeof(struct) | (1 << 16)
+    // Struct size is typically 12 bytes: version(4) + maxFrameInterval(4) + flags(4)
+    NvU32 version = 12 | (1 << 16);
+    memcpy(saved_data, &version, sizeof(version));
+
+    NvStatus st = get_adaptive_sync(display_id, saved_data);
+    if (st != NV_OK) {
+        if (!error_logged) {
+            ul_log::Write("FrameSplitController::Disable: GetAdaptiveSyncData failed (status=%d)", st);
+            error_logged = true;
+        }
+        saved_valid = false;
+        return false;
+    }
+    saved_valid = true;
+
+    // Set frame splitting disabled: copy saved data, set bDisableFrameSplitting flag
+    uint8_t set_data[64] = {};
+    memcpy(set_data, saved_data, sizeof(saved_data));
+
+    // The flags field is at offset 8 (after version + maxFrameInterval)
+    // Bit 0 of flags = bDisableFrameSplitting
+    NvU32 flags = 0;
+    memcpy(&flags, &set_data[8], sizeof(flags));
+    flags |= 1;  // set bDisableFrameSplitting = 1
+    memcpy(&set_data[8], &flags, sizeof(flags));
+
+    st = set_adaptive_sync(display_id, set_data);
+    if (st != NV_OK) {
+        if (!error_logged) {
+            ul_log::Write("FrameSplitController::Disable: SetAdaptiveSyncData failed (status=%d)", st);
+            error_logged = true;
+        }
+        return false;
+    }
+
+    disabled = true;
+    ul_log::Write("FrameSplitController::Disable: frame splitting disabled");
+    return true;
+}
+
+bool FrameSplitController::Restore() {
+    if (!resolved || !set_adaptive_sync) return false;
+    if (!disabled) return true;  // nothing to restore
+    if (!saved_valid) return false;
+
+    // Restore original state: clear bDisableFrameSplitting flag
+    uint8_t restore_data[64] = {};
+    memcpy(restore_data, saved_data, sizeof(saved_data));
+
+    NvU32 flags = 0;
+    memcpy(&flags, &restore_data[8], sizeof(flags));
+    flags &= ~1u;  // clear bDisableFrameSplitting
+    memcpy(&restore_data[8], &flags, sizeof(flags));
+
+    NvStatus st = set_adaptive_sync(display_id, restore_data);
+    if (st != NV_OK) {
+        if (!error_logged) {
+            ul_log::Write("FrameSplitController::Restore: SetAdaptiveSyncData failed (status=%d)", st);
+            error_logged = true;
+        }
+        disabled = false;  // best-effort: mark as not disabled
+        return false;
+    }
+
+    disabled = false;
+    ul_log::Write("FrameSplitController::Restore: frame splitting restored");
+    return true;
+}
+#endif
 
 // ============================================================================
 // Smooth Motion detection
@@ -557,13 +833,18 @@ void UlLimiter::Init(HMODULE addon_module) {
     if (!latency_buf_)
         latency_buf_ = new (std::nothrow) NvLatencyResult{};
 
-    if (g_cfg.csv_consistency_log.load()) {
-        csv_logger_.Open(addon_module);
+    if (g_cfg.csv_diagnostics.load()) {
+        diag_csv_logger_.Open(addon_module);
     }
 }
 
 void UlLimiter::Shutdown() {
-    csv_logger_.Close();
+    diag_csv_logger_.Close();
+
+    // Restore frame splitting state before shutdown
+#ifdef _WIN64
+    frame_split_ctrl_.Restore();
+#endif
 
     // Vulkan cleanup
 #ifdef _WIN64
@@ -604,6 +885,15 @@ bool UlLimiter::ConnectReflex(IUnknown* device) {
         return false;
     }
     ul_log::Write("ConnectReflex: hooks active");
+
+#ifdef _WIN64
+    // Init GSync detection and frame splitting control now that NVAPI is loaded
+    if (!gsync_detector_.resolved)
+        gsync_detector_.Init();
+    if (!frame_split_ctrl_.resolved)
+        frame_split_ctrl_.Init();
+#endif
+
     return true;
 }
 
@@ -612,6 +902,10 @@ void UlLimiter::ConnectVulkanReflex(VkReflex* vk) {
     vk_reflex_ = vk;
     ul_log::Write("ConnectVulkanReflex: Vulkan Reflex backend attached (active=%d)",
                   vk ? vk->IsActive() : 0);
+}
+
+void UlLimiter::AcquireGSyncSurface(IUnknown* device, IUnknown* back_buffer) {
+    gsync_detector_.AcquireSurfaceHandle(device, back_buffer);
 }
 #endif
 
@@ -651,12 +945,16 @@ void UlLimiter::ResetAdaptiveState() {
 
 static NvU32 AdjustIntervalUs(NvU32 raw, int fg_divisor, HWND hwnd,
                               const PipelineStats& ps, int32_t ptp_correction_us,
-                              int32_t consistency_buffer_us) {
+                              int32_t consistency_buffer_us,
+                              bool gsync_active) {
     if (raw == 0) return 0;
 
-    NvU32 vrr_floor = ComputeVrrFloorIntervalUs(hwnd);
-    if (vrr_floor > 0 && raw < vrr_floor)
-        raw = vrr_floor;
+    // Only apply VRR floor when GSync is active
+    if (gsync_active) {
+        NvU32 vrr_floor = ComputeVrrFloorIntervalUs(hwnd);
+        if (vrr_floor > 0 && raw < vrr_floor)
+            raw = vrr_floor;
+    }
 
     if (fg_divisor > 1) {
         // FG path: consistency buffer + FG overhead offset
@@ -739,7 +1037,13 @@ NvSleepParams UlLimiter::BuildSleepParams() const {
 
     p.minimumIntervalUs = AdjustIntervalUs(raw_interval, DetectFGDivisor(), hwnd_,
                                             pipeline_stats_, ptp_correction_us_,
-                                            consistency_buf_.buffer_us);
+                                            consistency_buf_.buffer_us,
+#ifdef _WIN64
+                                            gsync_detector_.gsync_active
+#else
+                                            false
+#endif
+                                            );
     return p;
 }
 
@@ -1065,6 +1369,7 @@ void UlLimiter::UpdatePipelineStats() {
         // defeats the latency hint entirely.
         int fg_tier = DetectFGDivisor();
         int dmfg_floor = fg_tier;  // latency-hint tier before cadence refinement
+        is_dmfg_ = (dmfg_floor >= 3);  // tier from latency hint = driver-side DMFG
         if (fg_tier > 1 && pipeline_predictor_.cadence.count >= 8
             && pipeline_predictor_.cadence.mean_delta_us > 0.0f) {
             float target_fps = g_cfg.fps_limit.load(std::memory_order_relaxed);
@@ -1135,6 +1440,20 @@ void UlLimiter::UpdatePipelineStats() {
             last_fg_tier_ = fg_tier;
         }
 
+        // --- GSync active detection ---
+#ifdef _WIN64
+        gsync_detector_.Poll(dev_, ul_timing::NowQpc());
+
+        // --- Frame splitting control ---
+        if (gsync_detector_.gsync_active && fg_tier > 1) {
+            if (frame_split_ctrl_.display_id == 0 && hwnd_)
+                frame_split_ctrl_.ResolveDisplayId(hwnd_);
+            frame_split_ctrl_.Disable();
+        } else {
+            frame_split_ctrl_.Restore();
+        }
+#endif
+
         // --- VRR proximity ---
         NvU32 target_iv_us = 0;
         {
@@ -1144,37 +1463,70 @@ void UlLimiter::UpdatePipelineStats() {
         }
         float vrr_proximity = ComputeVrrProximity(hwnd_, target_iv_us);
 
-        // --- Cadence CV with 8-sample minimum gate ---
-        float cadence_cv = (pipeline_predictor_.cadence.count >= 8)
-            ? pipeline_predictor_.cadence.ComputeCV() : 0.0f;
+        // Gate VRR proximity: when GSync is not active, disable VRR-specific behavior
+#ifdef _WIN64
+        if (!gsync_detector_.gsync_active)
+            vrr_proximity = 0.0f;
+#endif
+
+        // --- Cadence stddev_us with 8-sample minimum gate ---
+        float cadence_stddev_us = (pipeline_predictor_.cadence.count >= 8)
+            ? pipeline_predictor_.cadence.stddev_us : 0.0f;
 
         // --- QPC CV ---
         float qpc_cv = qpc_monitor_.ComputeCV();
 
         // --- Tick consistency buffer state machine ---
-        consistency_buf_.Tick(cadence_cv, qpc_cv, vrr_proximity);
+        consistency_buf_.Tick(cadence_stddev_us, qpc_cv, vrr_proximity, is_dmfg_);
 
-        // --- CSV logging (gate open only) ---
-        if (g_cfg.csv_consistency_log.load(std::memory_order_relaxed) && csv_logger_.enabled) {
-            NvU32 final_interval_us = 0;
+        // --- Expanded diagnostic CSV logging ---
+        if (g_cfg.csv_diagnostics.load(std::memory_order_relaxed) && diag_csv_logger_.enabled) {
+            NvU32 diag_final_interval_us = 0;
             {
                 float rfps = ComputeRenderFps();
                 if (rfps > 0.0f) {
                     NvU32 raw = static_cast<NvU32>(std::round(1'000'000.0 / static_cast<double>(rfps)));
-                    final_interval_us = AdjustIntervalUs(raw, fg_tier, hwnd_,
-                                                          ps, ptp_correction_us_,
-                                                          consistency_buf_.buffer_us);
+                    diag_final_interval_us = AdjustIntervalUs(raw, fg_tier, hwnd_,
+                                                              ps, ptp_correction_us_,
+                                                              consistency_buf_.buffer_us,
+#ifdef _WIN64
+                                                              gsync_detector_.gsync_active
+#else
+                                                              false
+#endif
+                                                              );
                 }
             }
-            csv_logger_.WriteRow(ul_timing::NowQpc(),
-                                 consistency_buf_.mode,
-                                 consistency_buf_.buffer_us,
-                                 cadence_cv,
-                                 qpc_cv,
-                                 ps.gpu_load_ratio,
-                                 fg_tier,
-                                 vrr_proximity,
-                                 final_interval_us);
+            float diag_cv = (pipeline_predictor_.cadence.count >= 8)
+                ? pipeline_predictor_.cadence.ComputeCV() : 0.0f;
+            float smoothness = 100.0f - (diag_cv * 1000.0f);
+            if (smoothness < 0.0f) smoothness = 0.0f;
+            if (smoothness > 100.0f) smoothness = 100.0f;
+
+            diag_csv_logger_.WriteRow(
+                ul_timing::NowQpc(),
+                smoothness,
+                cadence_stddev_us,
+                (pipeline_predictor_.cadence.count >= 8)
+                    ? pipeline_predictor_.cadence.mean_delta_us : 0.0f,
+                diag_cv,
+                qpc_cv,
+#ifdef _WIN64
+                gsync_detector_.gsync_active,
+#else
+                false,
+#endif
+                consistency_buf_.mode,
+                consistency_buf_.buffer_us,
+                pipeline_predictor_.gpu.predicted_us,
+                pipeline_predictor_.sim.predicted_us,
+                pipeline_predictor_.fg.predicted_us,
+                ResolveEnforcementSite(),
+                ps.pacing.queue_depth,
+                fg_tier,
+                vrr_proximity,
+                ps.gpu_load_ratio,
+                diag_final_interval_us);
         }
     }
 
@@ -1521,8 +1873,8 @@ void UlLimiter::OnPresent() {
         s_sm_check_qpc = now_qpc;
     }
 
-    // Poll GetLatency every 2 frames
-    if (frame_num_ % 2 == 0) {
+    // Poll GetLatency every frame
+    {
         int prev_site = pipeline_stats_.auto_site;
         UpdatePipelineStats();
         if (pipeline_stats_.valid && pipeline_stats_.auto_site != prev_site) {

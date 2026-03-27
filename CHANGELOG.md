@@ -1,5 +1,21 @@
 # Changelog
 
+## v2.2.0
+
+VRR and Frame Generation consistency improvements -- perceptual threshold tuning, GSync detection, frame splitting control, smoothness OSD, diagnostic telemetry, and OSD enhancements.
+
+- Perceptual threshold tuning: ConsistencyBuffer now uses absolute stddev (µs) thresholds instead of CV-based thresholds, derived from the 4ms perceptual floor (Klein et al., 2024). High frame rate sessions no longer penalized with unnecessary buffer when variance is imperceptible. DMFG sessions with high CV but low absolute stddev stay in TIGHTEN instead of being held at max buffer.
+- GSync active detection: polls `NvAPI_D3D_IsGSyncActive` every 2 seconds to verify VRR is actually engaged. All VRR-specific behavior (proximity scaling, floor clamping, frame splitting, consistency buffer VRR tuning) gated on the result. Defaults to inactive if NVAPI unavailable. 64-bit only.
+- Frame splitting disable: calls `NvAPI_DISP_SetAdaptiveSyncData` to disable driver frame splitting when GSync is active and FG is running. Prevents tear-like artifacts from frames split across VRR refresh cycles. Original state restored on shutdown or GSync deactivation. 64-bit only.
+- GetLatency polled every frame instead of every other frame -- cuts detection delay by one frame for pipeline stats and enforcement site changes
+- Smoothness OSD: single percentage score computed from cadence CV (`100 - CV * 1000`, clamped). Color-coded green/yellow/red. Gated on 8-sample minimum. Toggled via `show_smoothness` in settings panel and INI (default true).
+- OSD scale slider: scales the entire OSD from 100% to 300%. Affects all text, graphs, spacing, and line thickness. Configurable via `osd_scale` INI option (default 100).
+- Large frametime graph: new `show_big_graph` toggle adds a 400x120 (scaled) frametime graph with dynamic axis limits, labeled min/mid/max values, background box, and dashed midline. Axis labels auto-size and stay inside the graph area.
+- Expanded CSV diagnostics: new `csv_diagnostics` INI option writes 18-column per-frame telemetry to `relimiter_diagnostics.csv`. Columns include smoothness, cadence stats, GSync state, predictor intervals, enforcement site, queue depth, and final interval. Replaces the old `csv_consistency_log` option.
+- DMFG QPC brake bypass: QPC variance brake disabled for driver-side DMFG sessions. Driver-injected frames cause inherently high QPC variance from the app's perspective; cadence stddev is the sole stability signal. Standard FG and MFG unaffected.
+- Fixed diagnostic CSV not writing in WindowsApps games -- falls back to game exe directory when addon DLL directory is read-only
+- Fixed GSyncDetector and FrameSplitController init running before NVAPI was loaded -- moved init into ConnectReflex after SetupReflexHooks succeeds
+
 ## v2.1.2
 
 NVIDIA DMFG (Dynamic Multi-Frame Generation) compatibility, FG tier detection improvements, and OSD additions.

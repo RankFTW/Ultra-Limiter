@@ -189,3 +189,11 @@ void SetSLPresentCb(SLPresentCb cb);
 // Marker callback — fired when game calls SetLatencyMarker
 using MarkerCb = void(*)(int marker_type, uint64_t frame_id);
 void SetMarkerCb(MarkerCb cb);
+
+// --- NVAPI resolution helpers (for GSyncDetector, FrameSplitController) ---
+
+// Returns the NVAPI QueryInterface function pointer, or nullptr if NVAPI not loaded.
+NvQueryInterface_fn GetNvapiQi();
+
+// Lookup a function ID from the nvapi_interface_table by name. Returns 0 if not found.
+NvU32 FindFuncId(const char* name);

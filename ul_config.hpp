@@ -72,8 +72,17 @@ struct UlConfig {
     // OSD text brightness (0–100, default 100 = full white)
     std::atomic<int> osd_text_brightness{100};
 
-    // Diagnostic CSV logging for adaptive consistency buffer
-    std::atomic<bool> csv_consistency_log{false};
+    // OSD smoothness score display
+    std::atomic<bool> show_smoothness{true};
+
+    // OSD scale (100–300, default 100 = normal size)
+    std::atomic<int> osd_scale{100};
+
+    // Large frametime graph with labeled axis
+    std::atomic<bool> show_big_graph{false};
+
+    // Expanded per-frame diagnostic CSV
+    std::atomic<bool> csv_diagnostics{false};
 };
 
 extern UlConfig g_cfg;

@@ -183,42 +183,51 @@ struct ConsistencyBuffer {
         int32_t max_buffer_us;
         int32_t stabilize_step_us;
         int32_t tighten_step_us;
-        float stability_threshold_cv;
-        float instability_threshold_cv;
+        float stability_threshold_us;
+        float instability_threshold_us;
         int stable_ticks_to_tighten;
         float qpc_brake_threshold_cv;
     };
 
-    static constexpr TuningParams kTier1x1      = {4,  20, 2, 1, 0.03f, 0.08f, 15, 0.12f};
-    static constexpr TuningParams kTier2xFG     = {12, 50, 4, 2, 0.03f, 0.08f, 12, 0.10f};
-    static constexpr TuningParams kTier3xMFG    = {20, 80, 6, 3, 0.04f, 0.10f, 10, 0.10f};
-    static constexpr TuningParams kTier4xPlusMFG = {30, 120, 8, 4, 0.05f, 0.12f, 8, 0.10f};
+    static constexpr TuningParams kTier1x1      = {4,  20, 2, 1, 1000.0f, 3000.0f, 15, 0.12f};
+    static constexpr TuningParams kTier2xFG     = {12, 50, 4, 2, 700.0f, 2000.0f, 12, 0.10f};
+    static constexpr TuningParams kTier3xMFG    = {20, 80, 6, 3, 500.0f, 1500.0f, 10, 0.10f};
+    static constexpr TuningParams kTier4xPlusMFG = {30, 120, 8, 4, 400.0f, 1200.0f, 8, 0.10f};
 
     TuningParams active_params = kTier1x1;
 
-    void Tick(float cadence_cv, float qpc_cv, float vrr_proximity);
+    void Tick(float cadence_stddev_us, float qpc_cv, float vrr_proximity, bool dmfg = false);
     void SelectTier(int fg_divisor);
     void Reset(int fg_divisor);
 };
 
 // ============================================================================
-// CSVLogger — diagnostic CSV writer for consistency buffer state
+// DiagCSVLogger — expanded per-frame diagnostic CSV (18 columns)
 // ============================================================================
 
-struct CSVLogger {
+struct DiagCSVLogger {
     FILE* file = nullptr;
-    bool enabled = false;
-    bool header_written = false;
+    bool  enabled = false;
+    bool  header_written = false;
 
     void Open(HMODULE addon_module);
     void WriteRow(int64_t timestamp_qpc,
-                  ConsistencyBuffer::Mode mode,
-                  int32_t buffer_us,
+                  float smoothness,
+                  float cadence_stddev_us,
+                  float cadence_mean_delta_us,
                   float cadence_cv,
                   float qpc_cv,
-                  float gpu_load_ratio,
+                  bool gsync_active,
+                  ConsistencyBuffer::Mode cb_mode,
+                  int32_t cb_buffer_us,
+                  float pred_gpu_us,
+                  float pred_sim_us,
+                  float pred_fg_us,
+                  int enforcement_site,
+                  int queue_depth,
                   int fg_tier,
                   float vrr_proximity,
+                  float gpu_load_ratio,
                   NvU32 final_interval_us);
     void Close();
 };
@@ -274,6 +283,75 @@ struct BoostController {
     void Reset();
 };
 
+// ============================================================================
+// GSyncDetector — runtime GSync/VRR active detection (64-bit only)
+// ============================================================================
+
+#ifdef _WIN64
+struct GSyncDetector {
+    // NVAPI function pointer typedefs
+    using GetObjectHandle_fn = NvStatus(__cdecl*)(IUnknown*, IUnknown*, NvU32*);
+    using IsGSyncActive_fn   = NvStatus(__cdecl*)(IUnknown*, NvU32, NvU32*);
+
+    GetObjectHandle_fn get_object_handle = nullptr;
+    IsGSyncActive_fn   is_gsync_active   = nullptr;
+
+    NvU32   surface_handle  = 0;       // NVDX_ObjectHandle from back buffer
+    bool    gsync_active    = false;   // last poll result
+    int64_t last_poll_qpc   = 0;       // QPC of last poll
+    bool    resolved        = false;   // true if function pointers resolved OK
+    bool    error_logged    = false;   // one-shot error logging
+
+    // Resolve function pointers via QueryInterface. Returns false if unavailable.
+    bool Init();
+
+    // Acquire surface handle from swapchain back buffer.
+    bool AcquireSurfaceHandle(IUnknown* device, IUnknown* back_buffer);
+
+    // Poll GSync state. Only polls if >= 2 seconds since last poll.
+    // Updates gsync_active. Returns current state.
+    bool Poll(IUnknown* device, int64_t now_qpc);
+};
+#endif
+
+// ============================================================================
+// FrameSplitController — disable/restore NVIDIA driver frame splitting (64-bit only)
+// ============================================================================
+
+#ifdef _WIN64
+struct FrameSplitController {
+    // NVAPI function pointer typedefs
+    using GetAdaptiveSyncData_fn = NvStatus(__cdecl*)(NvU32, void*);
+    using SetAdaptiveSyncData_fn = NvStatus(__cdecl*)(NvU32, void*);
+    using EnumDisplayHandle_fn   = NvStatus(__cdecl*)(NvU32, NvU32*);
+
+    GetAdaptiveSyncData_fn get_adaptive_sync = nullptr;
+    SetAdaptiveSyncData_fn set_adaptive_sync = nullptr;
+    EnumDisplayHandle_fn   enum_display      = nullptr;
+
+    NvU32 display_id   = 0;       // NVAPI display ID for the target monitor
+    bool  resolved     = false;   // function pointers resolved
+    bool  disabled     = false;   // currently disabled by us
+    bool  error_logged = false;   // one-shot error logging
+
+    // Saved original state for restore
+    uint8_t saved_data[64] = {};  // NV_SET_ADAPTIVE_SYNC_DATA is small
+    bool    saved_valid = false;
+
+    // Resolve function pointers via QueryInterface. Returns false if unavailable.
+    bool Init();
+
+    // Resolve display ID from HWND → HMONITOR → NVAPI display enumeration
+    bool ResolveDisplayId(HWND hwnd);
+
+    // Disable frame splitting. Saves original state first.
+    bool Disable();
+
+    // Restore original frame splitting state.
+    bool Restore();
+};
+#endif
+
 class UlLimiter {
 public:
     void Init(HMODULE addon_module = nullptr);
@@ -282,6 +360,7 @@ public:
     bool ConnectReflex(IUnknown* device);
 #ifdef _WIN64
     void ConnectVulkanReflex(VkReflex* vk);
+    void AcquireGSyncSurface(IUnknown* device, IUnknown* back_buffer);
 #endif
     void SetHwnd(HWND hwnd) { hwnd_ = hwnd; }
 
@@ -290,6 +369,13 @@ public:
     void OnMarker(int marker_type, uint64_t frame_id);
 
     const PipelineStats& GetPipelineStats() const { return pipeline_stats_; }
+    float GetCadenceCV() const { return pipeline_predictor_.cadence.ComputeCV(); }
+    int GetCadenceCount() const { return pipeline_predictor_.cadence.count; }
+#ifdef _WIN64
+    bool IsGSyncActive() const { return gsync_detector_.gsync_active; }
+#else
+    bool IsGSyncActive() const { return false; }
+#endif
 
 private:
     float ComputeRenderFps() const;
@@ -311,6 +397,8 @@ private:
     uint64_t frame_num_ = 0;
 #ifdef _WIN64
     VkReflex* vk_reflex_ = nullptr;  // non-null when Vulkan backend is active
+    GSyncDetector gsync_detector_;
+    FrameSplitController frame_split_ctrl_;
 #endif
 
     HANDLE htimer_delay_ = nullptr;
@@ -343,7 +431,8 @@ private:
     int last_fg_tier_ = 0;
     int pending_fg_tier_ = 0;
     int fg_tier_confirm_ticks_ = 0;
-    CSVLogger csv_logger_;
+    bool is_dmfg_ = false;  // true when FG tier comes from driver (no FG DLL)
+    DiagCSVLogger diag_csv_logger_;
 
     int64_t warmup_start_qpc_ = 0;
     bool warmup_done_ = false;

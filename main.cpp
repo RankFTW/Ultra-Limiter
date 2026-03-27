@@ -18,9 +18,12 @@
 #endif
 
 #include <reshade.hpp>
+#include <algorithm>
 
 #include <MinHook.h>
 #include <dxgi.h>
+#include <d3d11.h>
+#include <d3d12.h>
 #include <windows.h>
 #include <cmath>
 #include <new>
@@ -302,6 +305,22 @@ static void UpdateStats() {
 // OSD drawing
 // ============================================================================
 
+// Compute smoothness score from CV: 0% CV = 100 score, 10% CV = 0 score
+static float ComputeSmoothnessScore(float cv) {
+    float score = 100.0f - (cv * 1000.0f);
+    return std::clamp(score, 0.0f, 100.0f);
+}
+
+// Select OSD color for smoothness score: green >90, yellow 70–90, red <70
+static ImU32 SmoothnessColor(float score, float bri) {
+    auto scale = [&](uint8_t c) -> uint8_t { return static_cast<uint8_t>(c * bri); };
+    if (score > 90.0f)
+        return IM_COL32(scale(100), scale(255), scale(100), 255);  // green
+    if (score >= 70.0f)
+        return IM_COL32(scale(255), scale(255), scale(100), 255);  // yellow
+    return IM_COL32(scale(255), scale(100), scale(100), 255);      // red
+}
+
 static void DrawOSD(reshade::api::effect_runtime*) {
     // Poll OSD toggle hotkey
     {
@@ -323,7 +342,14 @@ static void DrawOSD(reshade::api::effect_runtime*) {
     float x = g_cfg.osd_x.load(std::memory_order_relaxed);
     float y_start = g_cfg.osd_y.load(std::memory_order_relaxed) + 8.0f;
     float y = y_start;
-    constexpr float lh = 18.0f, gap = 4.0f, pad = 8.0f;
+
+    // OSD scale factor (100–300%)
+    int scale_pct = g_cfg.osd_scale.load(std::memory_order_relaxed);
+    if (scale_pct < 100) scale_pct = 100;
+    if (scale_pct > 300) scale_pct = 300;
+    float sf = scale_pct / 100.0f;
+
+    float lh = 18.0f * sf, gap = 4.0f * sf, pad = 8.0f * sf;
 
     // Text brightness scaling (0–100 → 0.0–1.0)
     int bri_pct = g_cfg.osd_text_brightness.load(std::memory_order_relaxed);
@@ -338,6 +364,11 @@ static void DrawOSD(reshade::api::effect_runtime*) {
     const ImU32 shadow_col = IM_COL32(0, 0, 0, static_cast<uint8_t>(180 * bri));
     bool drop_shadow = g_cfg.osd_drop_shadow.load(std::memory_order_relaxed);
     char buf[64];
+
+    // Scaled font for OSD text
+    ImFont* font = ImGui::GetFont();
+    float font_size = ImGui::GetFontSize() * sf;
+    float sh_off = 1.5f * sf;  // shadow offset scaled
 
     // When Smooth Motion is active, s_fps (from present) is the native render rate
     // and s_native_fps (from SIM_START) is the higher output rate. Swap for display.
@@ -364,7 +395,8 @@ static void DrawOSD(reshade::api::effect_runtime*) {
         lines[line_count].text[sizeof(lines[0].text) - 1] = '\0';
         lines[line_count].color = col;
         ImVec2 sz = ImGui::CalcTextSize(lines[line_count].text);
-        if (sz.x > max_w) max_w = sz.x;
+        float scaled_w = sz.x * sf;
+        if (scaled_w > max_w) max_w = scaled_w;
         line_count++;
     };
 
@@ -426,17 +458,31 @@ static void DrawOSD(reshade::api::effect_runtime*) {
         // No upscaling and no DLAA — hide resolution line
     }
 
+    // Smoothness score — gated by config and minimum sample count
+    if (g_cfg.show_smoothness.load(std::memory_order_relaxed) &&
+        s_limiter.GetCadenceCount() >= 8) {
+        float cv = s_limiter.GetCadenceCV();
+        float score = ComputeSmoothnessScore(cv);
+        snprintf(buf, sizeof(buf), "Smoothness: %.0f%%", score);
+        add_line(buf, SmoothnessColor(score, bri));
+    }
+
     has_graph = g_cfg.show_graph.load(std::memory_order_relaxed) &&
                 ((s_ft_idx < kHistLen ? s_ft_idx : kHistLen) > 1);
+    bool has_big_graph = g_cfg.show_big_graph.load(std::memory_order_relaxed) &&
+                         ((s_ft_idx < kHistLen ? s_ft_idx : kHistLen) > 1);
 
-    if (line_count == 0 && !has_graph) return;
+    if (line_count == 0 && !has_graph && !has_big_graph) return;
 
     // --- Compute bounding box ---
     float content_h = line_count * (lh + gap);
-    constexpr float graph_w = 160.0f, graph_h = 40.0f;
+    float graph_w = 160.0f * sf, graph_h = 40.0f * sf;
+    float big_graph_w = 400.0f * sf, big_graph_h = 120.0f * sf;
     if (has_graph) content_h += graph_h + gap;
+    if (has_big_graph) content_h += big_graph_h + gap;
     float content_w = max_w + pad * 2;
     if (has_graph && (graph_w + pad * 2) > content_w) content_w = graph_w + pad * 2;
+    if (has_big_graph && (big_graph_w + pad * 2) > content_w) content_w = big_graph_w + pad * 2;
 
     // --- Draw background ---
     int bg_pct = g_cfg.osd_bg_opacity.load(std::memory_order_relaxed);
@@ -452,15 +498,14 @@ static void DrawOSD(reshade::api::effect_runtime*) {
     }
 
     // --- Draw text lines ---
-    constexpr float sh_off = 1.5f;  // shadow offset in pixels
     for (int i = 0; i < line_count; i++) {
         if (drop_shadow)
-            dl->AddText(ImVec2(x + pad + sh_off, y + sh_off), shadow_col, lines[i].text);
-        dl->AddText(ImVec2(x + pad, y), lines[i].color, lines[i].text);
+            dl->AddText(font, font_size, ImVec2(x + pad + sh_off, y + sh_off), shadow_col, lines[i].text);
+        dl->AddText(font, font_size, ImVec2(x + pad, y), lines[i].color, lines[i].text);
         y += lh + gap;
     }
 
-    // --- Frametime graph ---
+    // --- Frametime graph (small) ---
     if (has_graph) {
         int count = (s_ft_idx < kHistLen) ? s_ft_idx : kHistLen;
         float gmax = 33.3f;
@@ -472,8 +517,99 @@ static void DrawOSD(reshade::api::effect_runtime*) {
             float v0 = s_ft_hist[i0] / (gmax * 1.1f); if (v0 > 1) v0 = 1;
             float v1 = s_ft_hist[i1] / (gmax * 1.1f); if (v1 > 1) v1 = 1;
             dl->AddLine(ImVec2(gx + step * i, y + graph_h * (1 - v0)),
-                        ImVec2(gx + step * (i + 1), y + graph_h * (1 - v1)), green, 1.5f);
+                        ImVec2(gx + step * (i + 1), y + graph_h * (1 - v1)), green, 1.5f * sf);
         }
+        y += graph_h + gap;
+    }
+
+    // --- Frametime graph (large, with labeled axis) ---
+    if (has_big_graph) {
+        int count = (s_ft_idx < kHistLen) ? s_ft_idx : kHistLen;
+
+        // Compute dynamic range from data
+        float dmin = 1e9f, dmax = 0.0f;
+        for (int i = 0; i < count; i++) {
+            int idx = (s_ft_idx - count + i + kHistLen) % kHistLen;
+            float v = s_ft_hist[idx];
+            if (v < dmin) dmin = v;
+            if (v > dmax) dmax = v;
+        }
+        // Add 10% padding and round to nice values
+        float range = dmax - dmin;
+        if (range < 1.0f) range = 1.0f;
+        float axis_min = std::floor((dmin - range * 0.1f) * 10.0f) / 10.0f;
+        float axis_max = std::ceil((dmax + range * 0.1f) * 10.0f) / 10.0f;
+        if (axis_min < 0.0f) axis_min = 0.0f;
+        if (axis_max - axis_min < 1.0f) axis_max = axis_min + 1.0f;
+
+        // Measure widest label to size the margin
+        float label_font_size = ImGui::GetFontSize() * sf * 0.75f;
+        char top_lbl[16], bot_lbl[16];
+        snprintf(top_lbl, sizeof(top_lbl), "%.1f", axis_max);
+        snprintf(bot_lbl, sizeof(bot_lbl), "%.1f", axis_min);
+        float top_w = ImGui::CalcTextSize(top_lbl).x * sf * 0.75f;
+        float bot_w = ImGui::CalcTextSize(bot_lbl).x * sf * 0.75f;
+        float label_w = (std::max)(top_w, bot_w) + 8.0f * sf;
+
+        float gx = x + pad + label_w;
+        float gy = y;
+        float gw = big_graph_w - label_w;
+        if (gw < 100.0f * sf) gw = 100.0f * sf;
+        float gh = big_graph_h;
+
+        // Background for graph area
+        dl->AddRectFilled(ImVec2(gx, gy), ImVec2(gx + gw, gy + gh),
+                          IM_COL32(0, 0, 0, 120), 2.0f);
+        dl->AddRect(ImVec2(gx, gy), ImVec2(gx + gw, gy + gh),
+                    IM_COL32(80, 80, 80, 200), 2.0f, 0, 1.0f);
+
+        // Horizontal grid lines: top, middle, bottom
+        // Labels are placed inside the graph area to avoid overlapping text above/below
+        float lbl_h = ImGui::CalcTextSize("0").y * sf * 0.75f;
+        for (int g = 0; g <= 2; g++) {
+            float frac = g / 2.0f;
+            float line_y = gy + gh * frac;
+            float val = axis_max - (axis_max - axis_min) * frac;
+            char lbl[16];
+            snprintf(lbl, sizeof(lbl), "%.1f", val);
+            float lsz_x = ImGui::CalcTextSize(lbl).x * sf * 0.75f;
+            // Clamp label Y: top label below top edge, bottom label above bottom edge
+            float label_y;
+            if (g == 0)
+                label_y = line_y + 2.0f * sf;              // just below top edge
+            else if (g == 2)
+                label_y = line_y - lbl_h - 2.0f * sf;      // just above bottom edge
+            else
+                label_y = line_y - lbl_h * 0.5f;            // centered on middle
+            dl->AddText(font, label_font_size,
+                        ImVec2(gx - lsz_x - 4.0f * sf, label_y),
+                        IM_COL32(180, 180, 180, 200), lbl);
+            if (g > 0 && g < 2) {
+                // Dashed middle line
+                for (float dx = 0; dx < gw; dx += 8.0f * sf) {
+                    float x0 = gx + dx, x1 = gx + dx + 4.0f * sf;
+                    if (x1 > gx + gw) x1 = gx + gw;
+                    dl->AddLine(ImVec2(x0, line_y), ImVec2(x1, line_y),
+                                IM_COL32(60, 60, 60, 150), 1.0f);
+                }
+            }
+        }
+
+        // Plot the frametime line
+        float step = gw / static_cast<float>(count - 1);
+        for (int i = 0; i < count - 1; i++) {
+            int i0 = (s_ft_idx - count + i + kHistLen) % kHistLen;
+            int i1 = (s_ft_idx - count + i + 1 + kHistLen) % kHistLen;
+            float v0 = (s_ft_hist[i0] - axis_min) / (axis_max - axis_min);
+            float v1 = (s_ft_hist[i1] - axis_min) / (axis_max - axis_min);
+            v0 = std::clamp(v0, 0.0f, 1.0f);
+            v1 = std::clamp(v1, 0.0f, 1.0f);
+            dl->AddLine(ImVec2(gx + step * i, gy + gh * (1.0f - v0)),
+                        ImVec2(gx + step * (i + 1), gy + gh * (1.0f - v1)),
+                        green, 2.0f * sf);
+        }
+
+        y += big_graph_h + gap;
     }
 }
 
@@ -869,11 +1005,13 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
             toggle("Frametime", g_cfg.show_frametime, "Time per frame in milliseconds.");
             toggle("Native FPS", g_cfg.show_native_fps, "Real render rate excluding generated frames.");
             toggle("Frametime Graph", g_cfg.show_graph, "Rolling frametime history graph.");
+            toggle("Large Graph", g_cfg.show_big_graph, "Large frametime graph with labeled axis limits.");
             toggle("GPU Render Time", g_cfg.show_gpu_time, "GPU active render time from Reflex.");
             toggle("Render Latency", g_cfg.show_render_lat, "Sim-start to GPU-render-end latency.");
             toggle("Present Latency", g_cfg.show_present_lat, "Present start-to-end latency.");
             toggle("FG Mode", g_cfg.show_fg_mode, "Detected frame generation technology.");
             toggle("Output Resolution", g_cfg.show_resolution, "Render and output resolution with scale %.");
+            toggle("Smoothness", g_cfg.show_smoothness, "Cadence smoothness score (CV-based).");
 
             ImGui::Spacing();
             int bg_op = g_cfg.osd_bg_opacity.load(std::memory_order_relaxed);
@@ -889,6 +1027,11 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
             if (ImGui::SliderInt("Text Brightness", &tbri, 0, 100, "%d%%")) { g_cfg.osd_text_brightness.store(tbri); }
             if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("OSD text brightness. 100 = full, 0 = invisible.");
+
+            int osd_sc = g_cfg.osd_scale.load(std::memory_order_relaxed);
+            if (ImGui::SliderInt("OSD Scale", &osd_sc, 100, 300, "%d%%")) { g_cfg.osd_scale.store(osd_sc); }
+            if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Scale the entire OSD. 100%% = normal, 300%% = triple size.");
         }
         ImGui::Unindent(8);
     }
@@ -1110,6 +1253,40 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
             ul_log::Write("OnInitSwapchain: ConnectReflex...");
             s_limiter.ConnectReflex(native);
             ul_log::Write("OnInitSwapchain: ConnectReflex done");
+
+#ifdef _WIN64
+            // Acquire GSync surface handle from back buffer
+            // NvAPI_D3D_GetObjectHandleForResource needs the real D3D device and resource.
+            // For DX12, we get ID3D12Device from the resource itself to ensure it's the
+            // real device (not a ReShade wrapper).
+            {
+                auto nsc = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
+                if (nsc) {
+                    IUnknown* back_buffer = nullptr;
+                    if (api == reshade::api::device_api::d3d12) {
+                        nsc->GetBuffer(0, __uuidof(ID3D12Resource),
+                                       reinterpret_cast<void**>(&back_buffer));
+                    } else {
+                        nsc->GetBuffer(0, __uuidof(ID3D11Texture2D),
+                                       reinterpret_cast<void**>(&back_buffer));
+                    }
+                    if (back_buffer) {
+                        IUnknown* nvapi_device = native;
+                        ID3D12Device* d3d12_dev = nullptr;
+                        if (api == reshade::api::device_api::d3d12) {
+                            auto res = reinterpret_cast<ID3D12Resource*>(back_buffer);
+                            if (SUCCEEDED(res->GetDevice(__uuidof(ID3D12Device),
+                                                          reinterpret_cast<void**>(&d3d12_dev)))) {
+                                nvapi_device = d3d12_dev;
+                            }
+                        }
+                        s_limiter.AcquireGSyncSurface(nvapi_device, back_buffer);
+                        if (d3d12_dev) d3d12_dev->Release();
+                        back_buffer->Release();
+                    }
+                }
+            }
+#endif
         }
 
         if (g_cfg.use_sl_proxy.load(std::memory_order_relaxed) && !IsStreamlineSafeMode()) {
