@@ -335,6 +335,13 @@ static void Wrapped_vkSetLatencyMarkerNV(
     int mt = static_cast<int>(pLatencyMarkerInfo->marker);
     uint64_t fid = pLatencyMarkerInfo->presentID;
 
+    // One-shot log to confirm markers are flowing
+    static bool s_marker_logged = false;
+    if (!s_marker_logged) {
+        ul_log::Write("VkHook: first marker received (type=%d, presentID=%llu)", mt, fid);
+        s_marker_logged = true;
+    }
+
     // Record in ring buffer (same as DX Hook_SetMarker)
     if (mt >= 0 && mt < kMarkerCount) {
         size_t slot = static_cast<size_t>(fid % kRingSize);

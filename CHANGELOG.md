@@ -2,11 +2,11 @@
 
 ## v2.5.0
 
-Vulkan native Reflex overhaul, FG detection rework, pacing stability fixes, and OSD improvements.
+Vulkan native Reflex overhaul, NGX resolution detection, FG detection rework, and pacing safety improvements.
 
 ### Vulkan Native Reflex — Full Marker-Based Pacing
 - Hooked all three VK_NV_low_latency2 functions via MinHook (vkSetLatencySleepModeNV, vkLatencySleepNV, vkSetLatencyMarkerNV) in addition to the existing vkGetDeviceProcAddr interception. Catches all calls regardless of whether the game uses global or device-level dispatch.
-- Wrapped_vkSetLatencyMarkerNV: intercepts game marker calls, records timestamps in g_ring, performs per-frame dedup, and fires the marker callback — enabling marker-based enforcement pacing on Vulkan identical to the DX path. PRESENT_FINISH markers forwarded to driver before callback; all others after.
+- Wrapped_vkSetLatencyMarkerNV: intercepts game marker calls, records timestamps in g_ring, performs per-frame dedup, and fires the marker callback — enabling marker-based enforcement pacing on Vulkan identical to the DX path.
 - Wrapped_vkLatencySleepNV: forwards game sleep calls to driver to keep the latency measurement pipeline coherent.
 - HookLL2Functions: resolves and hooks real LL2 function addresses via MinHook after vkCreateDevice succeeds, using the original (unhooked) vkGetDeviceProcAddr trampoline.
 - VkReflex::Init now uses the trampoline to resolve real driver functions instead of the hooked dispatch, preventing self-interception.
@@ -14,43 +14,48 @@ Vulkan native Reflex overhaul, FG detection rework, pacing stability fixes, and 
 - Hooked_vkCreateDevice refactored with cleaner extension list building.
 
 ### Vulkan Pacing Fix
-- Fixed FPS cap not working in Vulkan native Reflex games (e.g. RDR2). OnPresent now always calls DoOwnSleep for Vulkan regardless of native/non-native status — grid sleep enforces the FPS cap while SetSleepMode is correctly skipped for native games (their own calls are forwarded by the wrapper).
+- Fixed FPS cap not working in Vulkan native Reflex games (e.g. RDR2). OnPresent now always calls DoOwnSleep for Vulkan regardless of native/non-native status — grid sleep enforces the FPS cap while SetSleepMode is correctly skipped for native games.
 - DoOwnSleep Vulkan path no longer early-returns for native Reflex games. Builds sleep params and runs grid sleep for all Vulkan games; only skips SetSleepMode when the game handles it natively.
+- Fixed Vulkan FG games capped at half refresh rate. Grid interval now divided by FG multiplier so generated frames pass through without being blocked by the render-rate grid.
 
 ### Vulkan OSD
-- Removed render latency and present latency extraction from PollVkGpuLatency — Vulkan timestamps are unreliable when markers are intercepted. Only gpuActiveRenderTimeUs (a delta, not absolute timestamp) is populated.
-- OSD Render Lat and Present Lat lines auto-hide when values are zero (Vulkan path).
-- OSD Smoothness score hidden when 0% (no meaningful data, e.g. Vulkan pacing not settled).
-
-
-### FG Detection Rework (from ReLaz2)
-- DetectFGDivisor reworked: FPS-based ul_fg_monitor::GetTier() is now ground truth for runtime FG state. FG DLLs stay loaded even when the game disables FG (e.g. in menus), so DLL presence alone is no longer trusted. When HasData() reports tier >= 2, use it directly. When HasData() reports tier 0, return 1 (confirmed no FG). DLL presence is fallback only before FPS data is available.
-- ul_fg_monitor::HasData() added — returns true once 30+ updates processed, distinguishing confirmed no FG from not enough data yet.
-
-### Pacing Safety (from ReLaz2)
-- Dedicated background timer handle (htimer_bg_) — separate HANDLE for background sleep, avoiding potential race with htimer_fallback_ used by the main pacing path.
-- Cadence tracker reset on FG tier change — flushes stale cadence data from the previous FG state when last_fg_tier_ changes in UpdatePipelineStats.
-- Predictive sleep gated on marker_pacing (game must use Reflex markers) and eff_queue <= 1 (prevents FPS overshoot when queue depth > 1 redirects enforcement to PRESENT_BEGIN).
-- GPU overload detection uses user's original target interval (accounting for FG divisor) rather than the potentially-adjusted target_interval_us. Overload mode is metrics-only — no pacing effect.
+- Removed render latency and present latency extraction from PollVkGpuLatency — Vulkan timestamps are unreliable when markers are intercepted. Only gpuActiveRenderTimeUs is populated. OSD Render Lat and Present Lat auto-hide when zero.
+- Render pacing graph now works on Vulkan — derives native frame cadence from GetLatencyTimings simStartTime deltas instead of relying on marker callbacks (which Streamline games may bypass).
+- OSD Smoothness score hidden when 0%.
 
 ### NGX Resolution Detection (new module: ul_ngx_res)
-- Hooks NVSDK_NGX_D3D12_CreateFeature and NVSDK_NGX_D3D11_CreateFeature from _nvngx.dll / nvngx.dll via MinHook. Reads DLSS parameters directly from the NVSDK_NGX_Parameter interface at feature creation time — no more guessing render resolution from viewport heuristics.
-- Extracts exact render width/height, output width/height, and DLSS quality mode (Performance/Balanced/Quality/Ultra Performance/Ultra Quality/DLAA) from NGX parameters.
-- DLAA detected both by quality mode == 5 and by render resolution matching output resolution.
-- DLSS Ray Reconstruction detected via feature ID 4 (NVSDK_NGX_Feature_RayReconstruction). OSD shows "RR" suffix when active (e.g. "Res: DLAA+RR 5160x2160" or "Res: 3440x1440 -> 5160x2160 (67%) RR").
+- Hooks NVSDK_NGX CreateFeature and EvaluateFeature from _nvngx.dll, nvngx_dlss.dll, _nvngx_dlss.dll, and nvngx_dlssd.dll for D3D12, D3D11, and Vulkan via MinHook.
+- Reads DLSS parameters directly from the NVSDK_NGX_Parameter interface — exact render width/height, output width/height, and quality mode (Performance/Balanced/Quality/Ultra Performance/Ultra Quality/DLAA).
+- Supports both legacy NGX feature IDs (0 for SR, 4 for RR) and Streamline IDs (11 for SR, 1 for RR, 13 for FG).
+- Reads DLSS.Render.Subrect.Dimensions for Streamline games where standard Width/Height report output resolution.
+- EvaluateFeature hook provides real-time resolution updates when changing DLSS quality mid-game without feature recreation.
+- DLAA detected by quality mode (5) with fallback to render==output comparison.
+- DLSS Ray Reconstruction detected via feature ID 1/4/12 (detection code present, OSD display deferred for refinement).
 - Viewport-based resolution detection retained as fallback for non-DLSS upscalers (FSR, XeSS).
-- Hooks installed at both DLL_PROCESS_ATTACH and OnInitSwapchain (deferred) to handle late NGX DLL loading.
+- Deferred hook installation: retries periodically in OnPresent for lazily-loaded DLSS DLLs (Streamline games).
 
-### OSD Fixes
-- Removed small frametime graph and large frametime graph from OSD. Only the render pacing graph remains.
-- Fixed DLAA detection showing incorrectly when using DLSS Performance at ~50% render scale. Viewport-based DLAA suppression now checks if the largest sub-native viewport is <= 55% of output, catching both half-res and third-res internal passes. Superseded by NGX hook for DLSS games.
-- Added 10-frame hysteresis on viewport-based resolution display transitions (DLAA vs upscaled) to prevent flickering.
-- OSD Render Lat and Present Lat lines auto-hide when values are zero (Vulkan path).
-- OSD Smoothness score hidden when 0%.
-- Renamed "Native Cadence" graph to "Render Pacing" for clarity.
+### FG Detection Rework (from ReLaz2)
+- DetectFGDivisor reworked: FPS-based ul_fg_monitor::GetTier() is now ground truth for runtime FG state. DLL presence is fallback only before FPS data is available.
+- ul_fg_monitor::HasData() added — returns true once 30+ updates processed.
+
+### Pacing Safety (from ReLaz2)
+- Dedicated background timer handle (htimer_bg_) — separate HANDLE for background sleep.
+- Cadence tracker reset on FG tier change.
+- Predictive sleep gated on marker_pacing and eff_queue <= 1.
+- GPU overload detection uses user's original target interval. Overload mode is metrics-only.
+
 ### Enforcement Site Stability
-- Fixed enforcement site flip-flopping every frame under GPU overload. Enforcement site selection and load gate now use the target-based GPU load ratio instead of the cadence-recomputed ratio, which oscillated between the real load (~120%) and the artificially low cadence-based load (~8%) causing rapid SIM_START/PRESENT_FINISH cycling.
-- GPU overload log spam eliminated — load gate no longer falsely closes during overload, preventing repeated overload state flush and re-entry.
+- Fixed enforcement site flip-flopping every frame under GPU overload. Enforcement site selection and load gate now use target-based GPU load ratio instead of cadence-recomputed ratio.
+- GPU overload log spam eliminated — load gate no longer falsely closes during overload.
+
+### OSD Changes
+- Removed small frametime graph and large frametime graph. Only the render pacing graph remains.
+- Renamed "Native Cadence" graph to "Render Pacing".
+- Viewport-based DLAA detection: threshold broadened to <= 55% with 10-frame hysteresis. Superseded by NGX hook for DLSS games.
+
+### REFramework Detection Fix
+- Fixed false positive REFramework detection in games with dinput8.dll + Streamline (e.g. X4 Foundations). Now verifies reframework.dll exports reframework_get_renderer_type before blocking GetLatency. Also checks dinput8.dll path — only triggers for game-directory proxies, not System32.
+
 
 ## v2.2.1
 

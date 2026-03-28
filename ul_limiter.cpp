@@ -1850,18 +1850,25 @@ void UlLimiter::DoOwnSleep() {
                 p.minimumIntervalUs);
         }
 
-        // Grid sleep with our timers
-        int64_t frame_ns = static_cast<int64_t>(p.minimumIntervalUs) * 1000LL;
+        // Grid sleep with our timers.
+        // When FG is active, OnPresent fires for both real and generated frames.
+        // The grid must pace at the OUTPUT rate (e.g. 157 FPS) not the render
+        // rate (e.g. 78.5 FPS for 2x FG), otherwise generated frames get
+        // blocked and total output is capped at the render rate.
+        int fg_div = DetectFGDivisor();
+        int64_t grid_ns = static_cast<int64_t>(p.minimumIntervalUs) * 1000LL;
+        if (fg_div > 1)
+            grid_ns /= fg_div;
         int64_t now = ul_timing::NowNs();
 
         if (grid_epoch_ns_ == 0) {
             grid_epoch_ns_ = now;
-            grid_interval_ns_ = frame_ns;
-            grid_next_ns_ = now + frame_ns;
+            grid_interval_ns_ = grid_ns;
+            grid_next_ns_ = now + grid_ns;
         } else {
             constexpr float kGridAlpha = 0.05f;
             grid_interval_ns_ = static_cast<int64_t>(
-                grid_interval_ns_ * (1.0 - kGridAlpha) + frame_ns * kGridAlpha);
+                grid_interval_ns_ * (1.0 - kGridAlpha) + grid_ns * kGridAlpha);
             if (grid_next_ns_ > now) {
                 ul_timing::SleepUntilNs(grid_next_ns_, htimer_fallback_);
                 grid_next_ns_ += grid_interval_ns_;

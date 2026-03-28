@@ -148,23 +148,54 @@ static bool s_reframework_checked = false;
 static void DetectConflictingFrameworks() {
     if (s_reframework_checked) return;
 
-    bool reframework = GetModuleHandleW(L"reframework.dll") != nullptr
-                    || GetModuleHandleW(L"REFramework.dll") != nullptr;
+    bool reframework = false;
+    HMODULE ref_mod = GetModuleHandleW(L"reframework.dll");
+    if (!ref_mod) ref_mod = GetModuleHandleW(L"REFramework.dll");
+    if (ref_mod) {
+        // Verify it's actually REFramework by checking for a known export.
+        // Some unrelated DLLs may share the name. REFramework exports
+        // "reframework_get_renderer_type" among others.
+        if (GetProcAddress(ref_mod, "reframework_get_renderer_type")) {
+            reframework = true;
+        } else {
+            wchar_t path[MAX_PATH] = {};
+            GetModuleFileNameW(ref_mod, path, MAX_PATH);
+            ul_log::Write("Skipping reframework.dll — not actual REFramework (%ls)", path);
+        }
+    }
 
     // dinput8.dll is REFramework's proxy DLL in RE Engine games.
-    // Only treat as REFramework if Streamline is also present.
+    // The real dinput8.dll lives in System32; REFramework's proxy is in the
+    // game directory. Check the DLL path to avoid false positives on games
+    // that legitimately load dinput8.dll alongside Streamline.
     if (!reframework) {
-        bool dinput8 = GetModuleHandleW(L"dinput8.dll") != nullptr;
-        bool streamline = GetModuleHandleW(L"sl.common.dll") != nullptr
-                       || GetModuleHandleW(L"sl.dlss_g.dll") != nullptr;
-        if (dinput8 && streamline) reframework = true;
+        HMODULE dinput8 = GetModuleHandleW(L"dinput8.dll");
+        if (dinput8) {
+            wchar_t path[MAX_PATH] = {};
+            if (GetModuleFileNameW(dinput8, path, MAX_PATH)) {
+                // System32 dinput8.dll contains "system32" in the path (case-insensitive).
+                // REFramework's proxy is in the game directory (no "system32").
+                bool is_system = false;
+                wchar_t lower[MAX_PATH] = {};
+                for (int i = 0; i < MAX_PATH && path[i]; i++)
+                    lower[i] = (path[i] >= L'A' && path[i] <= L'Z') ? path[i] + 32 : path[i];
+                is_system = wcsstr(lower, L"system32") != nullptr
+                         || wcsstr(lower, L"syswow64") != nullptr;
+                bool streamline = GetModuleHandleW(L"sl.common.dll") != nullptr
+                               || GetModuleHandleW(L"sl.dlss_g.dll") != nullptr;
+                if (!is_system && streamline) {
+                    reframework = true;
+                    ul_log::Write("REFramework proxy dinput8.dll detected at: %ls", path);
+                }
+            }
+        }
     }
 
     if (reframework) {
         BlockGetLatency();
         ul_log::Write("REFramework detected — GetLatency disabled (crash prevention)");
-        s_reframework_checked = true;
     }
+    s_reframework_checked = true;
 }
 
 static NvStatus SafeGetLatency(IUnknown* dev, NvLatencyResult* r) {
@@ -230,10 +261,41 @@ static void PollVkGpuLatency() {
     }
     if (n_gpu > 0) s_gpu_ms = gpu / n_gpu;
     if (n_gpu > 0) s_has_gpu.store(true, std::memory_order_relaxed);
-    // Note: Vulkan latency timestamps (simStartTime, gpuRenderEndTime, etc.)
-    // are unreliable when markers are intercepted. Only gpuActiveRenderTimeUs
-    // (a delta, not absolute timestamp) is trustworthy. Render/Present/PC
-    // latency fields are not populated on Vulkan.
+
+    // Feed native FPS tracker from simStartTime deltas.
+    // On Vulkan, marker callbacks may not flow (Streamline caches function
+    // pointers before our hook installs), so derive render cadence from
+    // GetLatencyTimings frame reports instead.
+    {
+        // Find the two most recent frames with valid simStartTime
+        struct SimFrame { uint64_t id; uint64_t sim_start; };
+        SimFrame recent[2] = {};
+        int n_recent = 0;
+        for (int i = 63; i >= 0 && n_recent < 2; i--) {
+            auto& f = buf->frameReport[i];
+            if (f.frameID && f.simStartTime > 0) {
+                recent[n_recent++] = { f.frameID, f.simStartTime };
+            }
+        }
+        // Sort by frame ID (descending — most recent first)
+        if (n_recent == 2 && recent[0].id < recent[1].id)
+            std::swap(recent[0], recent[1]);
+
+        if (n_recent == 2 && recent[0].sim_start > recent[1].sim_start) {
+            // simStartTime is in microseconds (Vulkan LL2 convention)
+            float dt_ms = static_cast<float>(recent[0].sim_start - recent[1].sim_start) / 1000.0f;
+            if (dt_ms > 0.5f && dt_ms < 200.0f) {
+                s_nat_hist[s_nat_idx % 64] = dt_ms;
+                s_nat_idx++;
+                int n = (s_nat_idx < 64) ? s_nat_idx : 64;
+                float sum = 0.0f;
+                for (int i = 0; i < n; i++) sum += s_nat_hist[(s_nat_idx - 1 - i + 64) % 64];
+                s_native_ft_ms = sum / static_cast<float>(n);
+                s_native_fps = (s_native_ft_ms > 0.0f) ? 1000.0f / s_native_ft_ms : 0.0f;
+                s_has_native.store(true, std::memory_order_relaxed);
+            }
+        }
+    }
 }
 #endif
 
@@ -432,7 +494,7 @@ static void DrawOSD(reshade::api::effect_runtime*) {
 #ifdef _WIN64
         // Prefer NGX-reported resolution (exact DLSS parameters) over viewport heuristics
         if (ul_ngx_res::HasData()) {
-            bool rr = ul_ngx_res::IsRayReconstruction();
+            bool rr = false;  // RR OSD display disabled for now — detection needs refinement
             if (ul_ngx_res::IsDLAA()) {
                 uint32_t ow = ul_ngx_res::GetOutWidth(), oh = ul_ngx_res::GetOutHeight();
                 if (ow > 0 && oh > 0) {
@@ -442,6 +504,7 @@ static void DrawOSD(reshade::api::effect_runtime*) {
             } else {
                 uint32_t rw = ul_ngx_res::GetRenderWidth(), rh = ul_ngx_res::GetRenderHeight();
                 uint32_t ow = ul_ngx_res::GetOutWidth(), oh = ul_ngx_res::GetOutHeight();
+                int qm = ul_ngx_res::GetQualityMode();
                 if (rw > 0 && rh > 0 && ow > 0 && rw < ow) {
                     int pct = static_cast<int>(100.0f * rw / static_cast<float>(ow));
                     if (rr)
@@ -449,6 +512,26 @@ static void DrawOSD(reshade::api::effect_runtime*) {
                     else
                         snprintf(buf, sizeof(buf), "Res: %ux%u -> %ux%u (%d%%)", rw, rh, ow, oh, pct);
                     add_line(buf, gold);
+                } else if (rw == ow && rh == oh && qm >= 0) {
+                    // Streamline: render res == output but quality mode is known.
+                    // Show the quality mode name from the viewport-detected resolution.
+                    uint32_t vw = s_rnd_w.load(), vh = s_rnd_h.load();
+                    if (vw > 0 && vh > 0 && vw < ow) {
+                        int pct = static_cast<int>(100.0f * vw / static_cast<float>(ow));
+                        const char* mode = "";
+                        switch (qm) {
+                            case 0: mode = "Perf"; break;
+                            case 1: mode = "Balanced"; break;
+                            case 2: mode = "Quality"; break;
+                            case 3: mode = "Ultra Perf"; break;
+                            case 4: mode = "Ultra Quality"; break;
+                        }
+                        if (rr)
+                            snprintf(buf, sizeof(buf), "Res: %ux%u -> %ux%u (%d%% %s) RR", vw, vh, ow, oh, pct, mode);
+                        else
+                            snprintf(buf, sizeof(buf), "Res: %ux%u -> %ux%u (%d%% %s)", vw, vh, ow, oh, pct, mode);
+                        add_line(buf, gold);
+                    }
                 }
             }
         } else
@@ -1496,6 +1579,14 @@ static void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* sc,
         ul_log::Write("Viewport: %d bind_viewports calls after %llu presents (buckets=%d)",
                       vp, cnt, s_vp_bucket_count);
     }
+
+#ifdef _WIN64
+    // Deferred NGX hook retry — DLSS DLLs may load lazily (Streamline games).
+    // Try periodically until we get data or give up after 600 frames.
+    if (cnt <= 600 && cnt % 60 == 0 && !ul_ngx_res::HasData()) {
+        ul_ngx_res::InstallHooks();
+    }
+#endif
 
     // Commit the most-used sub-native viewport as the render resolution.
     // When no sub-native viewports are seen for several consecutive frames,
