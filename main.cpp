@@ -16,6 +16,7 @@
 #include "ul_timing.hpp"
 #ifdef _WIN64
 #include "ul_vk_reflex.hpp"
+#include "ul_ngx_res.hpp"
 #endif
 
 #include <reshade.hpp>
@@ -217,8 +218,8 @@ static void PollVkGpuLatency() {
 
     if (!g_vk_reflex.GetLatencyTimings(buf)) return;
 
-    float gpu = 0, rlat = 0, plat = 0;
-    int n_gpu = 0, n_rlat = 0, n_plat = 0;
+    float gpu = 0;
+    int n_gpu = 0;
     for (int i = 63; i >= 0 && n_gpu < 8; i--) {
         auto& f = buf->frameReport[i];
         if (!f.frameID) continue;
@@ -226,25 +227,13 @@ static void PollVkGpuLatency() {
             gpu += static_cast<float>(f.gpuActiveRenderTimeUs) / 1000.0f;
             n_gpu++;
         }
-        if (f.simStartTime > 0 && f.gpuRenderEndTime > f.simStartTime) {
-            uint64_t delta = f.gpuRenderEndTime - f.simStartTime;
-            if (delta < 100'000) {
-                rlat += static_cast<float>(delta) / 1000.0f;
-                n_rlat++;
-            }
-        }
-        if (f.presentStartTime > 0 && f.presentEndTime > f.presentStartTime) {
-            uint64_t delta = f.presentEndTime - f.presentStartTime;
-            if (delta < 100'000) {
-                plat += static_cast<float>(delta) / 1000.0f;
-                n_plat++;
-            }
-        }
     }
     if (n_gpu > 0) s_gpu_ms = gpu / n_gpu;
-    if (n_rlat > 0) s_render_lat_ms = rlat / n_rlat;
-    if (n_plat > 0) s_present_lat_ms = plat / n_plat;
     if (n_gpu > 0) s_has_gpu.store(true, std::memory_order_relaxed);
+    // Note: Vulkan latency timestamps (simStartTime, gpuRenderEndTime, etc.)
+    // are unreliable when markers are intercepted. Only gpuActiveRenderTimeUs
+    // (a delta, not absolute timestamp) is trustworthy. Render/Present/PC
+    // latency fields are not populated on Vulkan.
 }
 #endif
 
@@ -420,11 +409,11 @@ static void DrawOSD(reshade::api::effect_runtime*) {
         snprintf(buf, sizeof(buf), "GPU: %.2f ms", s_gpu_ms);
         add_line(buf, cyan);
     }
-    if (gpu && g_cfg.show_render_lat.load(std::memory_order_relaxed)) {
+    if (gpu && g_cfg.show_render_lat.load(std::memory_order_relaxed) && s_render_lat_ms > 0.0f) {
         snprintf(buf, sizeof(buf), "Render Lat: %.2f ms", s_render_lat_ms);
         add_line(buf, cyan);
     }
-    if (gpu && g_cfg.show_present_lat.load(std::memory_order_relaxed)) {
+    if (gpu && g_cfg.show_present_lat.load(std::memory_order_relaxed) && s_present_lat_ms > 0.0f) {
         snprintf(buf, sizeof(buf), "Present Lat: %.2f ms", s_present_lat_ms);
         add_line(buf, cyan);
     }
@@ -440,49 +429,68 @@ static void DrawOSD(reshade::api::effect_runtime*) {
     }
 
     if (g_cfg.show_resolution.load(std::memory_order_relaxed)) {
-        uint32_t ow = s_out_w.load(), oh = s_out_h.load();
-        uint32_t rw = s_rnd_w.load(), rh = s_rnd_h.load();
-        if (rw > 0 && rh > 0 && ow > 0 && rw < ow) {
-            // Upscaling detected — show render -> output
-            int pct = static_cast<int>(100.0f * rw / static_cast<float>(ow));
-            snprintf(buf, sizeof(buf), "Res: %ux%u -> %ux%u (%d%%)", rw, rh, ow, oh, pct);
-            add_line(buf, gold);
-        } else if (s_dlaa_detected.load(std::memory_order_relaxed) && ow > 0 && oh > 0) {
-            // DLAA/native — rendering at full resolution with AA
-            snprintf(buf, sizeof(buf), "Res: DLAA %ux%u", ow, oh);
-            add_line(buf, gold);
+#ifdef _WIN64
+        // Prefer NGX-reported resolution (exact DLSS parameters) over viewport heuristics
+        if (ul_ngx_res::HasData()) {
+            bool rr = ul_ngx_res::IsRayReconstruction();
+            if (ul_ngx_res::IsDLAA()) {
+                uint32_t ow = ul_ngx_res::GetOutWidth(), oh = ul_ngx_res::GetOutHeight();
+                if (ow > 0 && oh > 0) {
+                    snprintf(buf, sizeof(buf), rr ? "Res: DLAA+RR %ux%u" : "Res: DLAA %ux%u", ow, oh);
+                    add_line(buf, gold);
+                }
+            } else {
+                uint32_t rw = ul_ngx_res::GetRenderWidth(), rh = ul_ngx_res::GetRenderHeight();
+                uint32_t ow = ul_ngx_res::GetOutWidth(), oh = ul_ngx_res::GetOutHeight();
+                if (rw > 0 && rh > 0 && ow > 0 && rw < ow) {
+                    int pct = static_cast<int>(100.0f * rw / static_cast<float>(ow));
+                    if (rr)
+                        snprintf(buf, sizeof(buf), "Res: %ux%u -> %ux%u (%d%%) RR", rw, rh, ow, oh, pct);
+                    else
+                        snprintf(buf, sizeof(buf), "Res: %ux%u -> %ux%u (%d%%)", rw, rh, ow, oh, pct);
+                    add_line(buf, gold);
+                }
+            }
+        } else
+#endif
+        {
+            // Fallback: viewport-based detection (non-DLSS upscalers)
+            uint32_t ow = s_out_w.load(), oh = s_out_h.load();
+            uint32_t rw = s_rnd_w.load(), rh = s_rnd_h.load();
+            if (rw > 0 && rh > 0 && ow > 0 && rw < ow) {
+                int pct = static_cast<int>(100.0f * rw / static_cast<float>(ow));
+                snprintf(buf, sizeof(buf), "Res: %ux%u -> %ux%u (%d%%)", rw, rh, ow, oh, pct);
+                add_line(buf, gold);
+            } else if (s_dlaa_detected.load(std::memory_order_relaxed) && ow > 0 && oh > 0) {
+                snprintf(buf, sizeof(buf), "Res: DLAA %ux%u", ow, oh);
+                add_line(buf, gold);
+            }
         }
-        // No upscaling and no DLAA — hide resolution line
     }
 
     // Smoothness score — gated by config and minimum sample count
+    // Hide when score is 0 (no meaningful data, e.g. Vulkan pacing not settled)
     if (g_cfg.show_smoothness.load(std::memory_order_relaxed) &&
         s_limiter.GetCadenceCount() >= 8) {
         float cv = s_limiter.GetCadenceCV();
         float score = ComputeSmoothnessScore(cv);
-        snprintf(buf, sizeof(buf), "Smoothness: %.0f%%", score);
-        add_line(buf, SmoothnessColor(score, bri));
+        if (score > 0.0f) {
+            snprintf(buf, sizeof(buf), "Smoothness: %.0f%%", score);
+            add_line(buf, SmoothnessColor(score, bri));
+        }
     }
 
-    has_graph = g_cfg.show_graph.load(std::memory_order_relaxed) &&
-                ((s_ft_idx < kHistLen ? s_ft_idx : kHistLen) > 1);
-    bool has_big_graph = g_cfg.show_big_graph.load(std::memory_order_relaxed) &&
-                         ((s_ft_idx < kHistLen ? s_ft_idx : kHistLen) > 1);
+    has_graph = false;  // small/big frametime graphs removed — native cadence graph only
     bool has_native_graph = g_cfg.show_native_graph.load(std::memory_order_relaxed) &&
                             s_has_native.load(std::memory_order_relaxed) && s_nat_idx > 1;
 
-    if (line_count == 0 && !has_graph && !has_big_graph && !has_native_graph) return;
+    if (line_count == 0 && !has_native_graph) return;
 
     // --- Compute bounding box ---
     float content_h = line_count * (lh + gap);
-    float graph_w = 160.0f * sf, graph_h = 40.0f * sf;
     float big_graph_w = 400.0f * sf, big_graph_h = 120.0f * sf;
-    if (has_graph) content_h += graph_h + gap;
-    if (has_big_graph) content_h += big_graph_h + gap;
     if (has_native_graph) content_h += big_graph_h + gap + lh;  // graph + label
     float content_w = max_w + pad * 2;
-    if (has_graph && (graph_w + pad * 2) > content_w) content_w = graph_w + pad * 2;
-    if (has_big_graph && (big_graph_w + pad * 2) > content_w) content_w = big_graph_w + pad * 2;
     if (has_native_graph && (big_graph_w + pad * 2) > content_w) content_w = big_graph_w + pad * 2;
 
     // --- Draw background ---
@@ -506,120 +514,13 @@ static void DrawOSD(reshade::api::effect_runtime*) {
         y += lh + gap;
     }
 
-    // --- Frametime graph (small) ---
-    if (has_graph) {
-        int count = (s_ft_idx < kHistLen) ? s_ft_idx : kHistLen;
-        float gmax = 33.3f;
-        for (int i = 0; i < count; i++) if (s_ft_hist[i] > gmax) gmax = s_ft_hist[i];
-        float gx = x + pad, step = graph_w / static_cast<float>(count - 1);
-        for (int i = 0; i < count - 1; i++) {
-            int i0 = (s_ft_idx - count + i + kHistLen) % kHistLen;
-            int i1 = (s_ft_idx - count + i + 1 + kHistLen) % kHistLen;
-            float v0 = s_ft_hist[i0] / (gmax * 1.1f); if (v0 > 1) v0 = 1;
-            float v1 = s_ft_hist[i1] / (gmax * 1.1f); if (v1 > 1) v1 = 1;
-            dl->AddLine(ImVec2(gx + step * i, y + graph_h * (1 - v0)),
-                        ImVec2(gx + step * (i + 1), y + graph_h * (1 - v1)), green, 1.5f * sf);
-        }
-        y += graph_h + gap;
-    }
-
-    // --- Frametime graph (large, with labeled axis) ---
-    if (has_big_graph) {
-        int count = (s_ft_idx < kHistLen) ? s_ft_idx : kHistLen;
-
-        // Compute dynamic range from data
-        float dmin = 1e9f, dmax = 0.0f;
-        for (int i = 0; i < count; i++) {
-            int idx = (s_ft_idx - count + i + kHistLen) % kHistLen;
-            float v = s_ft_hist[idx];
-            if (v < dmin) dmin = v;
-            if (v > dmax) dmax = v;
-        }
-        // Add 10% padding and round to nice values
-        float range = dmax - dmin;
-        if (range < 1.0f) range = 1.0f;
-        float axis_min = std::floor((dmin - range * 0.1f) * 10.0f) / 10.0f;
-        float axis_max = std::ceil((dmax + range * 0.1f) * 10.0f) / 10.0f;
-        if (axis_min < 0.0f) axis_min = 0.0f;
-        if (axis_max - axis_min < 1.0f) axis_max = axis_min + 1.0f;
-
-        // Measure widest label to size the margin
-        float label_font_size = ImGui::GetFontSize() * sf * 0.75f;
-        char top_lbl[16], bot_lbl[16];
-        snprintf(top_lbl, sizeof(top_lbl), "%.1f", axis_max);
-        snprintf(bot_lbl, sizeof(bot_lbl), "%.1f", axis_min);
-        float top_w = ImGui::CalcTextSize(top_lbl).x * sf * 0.75f;
-        float bot_w = ImGui::CalcTextSize(bot_lbl).x * sf * 0.75f;
-        float label_w = (std::max)(top_w, bot_w) + 8.0f * sf;
-
-        float gx = x + pad + label_w;
-        float gy = y;
-        float gw = big_graph_w - label_w;
-        if (gw < 100.0f * sf) gw = 100.0f * sf;
-        float gh = big_graph_h;
-
-        // Background for graph area
-        dl->AddRectFilled(ImVec2(gx, gy), ImVec2(gx + gw, gy + gh),
-                          IM_COL32(0, 0, 0, 120), 2.0f);
-        dl->AddRect(ImVec2(gx, gy), ImVec2(gx + gw, gy + gh),
-                    IM_COL32(80, 80, 80, 200), 2.0f, 0, 1.0f);
-
-        // Horizontal grid lines: top, middle, bottom
-        // Labels are placed inside the graph area to avoid overlapping text above/below
-        float lbl_h = ImGui::CalcTextSize("0").y * sf * 0.75f;
-        for (int g = 0; g <= 2; g++) {
-            float frac = g / 2.0f;
-            float line_y = gy + gh * frac;
-            float val = axis_max - (axis_max - axis_min) * frac;
-            char lbl[16];
-            snprintf(lbl, sizeof(lbl), "%.1f", val);
-            float lsz_x = ImGui::CalcTextSize(lbl).x * sf * 0.75f;
-            // Clamp label Y: top label below top edge, bottom label above bottom edge
-            float label_y;
-            if (g == 0)
-                label_y = line_y + 2.0f * sf;              // just below top edge
-            else if (g == 2)
-                label_y = line_y - lbl_h - 2.0f * sf;      // just above bottom edge
-            else
-                label_y = line_y - lbl_h * 0.5f;            // centered on middle
-            dl->AddText(font, label_font_size,
-                        ImVec2(gx - lsz_x - 4.0f * sf, label_y),
-                        IM_COL32(180, 180, 180, 200), lbl);
-            if (g > 0 && g < 2) {
-                // Dashed middle line
-                for (float dx = 0; dx < gw; dx += 8.0f * sf) {
-                    float x0 = gx + dx, x1 = gx + dx + 4.0f * sf;
-                    if (x1 > gx + gw) x1 = gx + gw;
-                    dl->AddLine(ImVec2(x0, line_y), ImVec2(x1, line_y),
-                                IM_COL32(60, 60, 60, 150), 1.0f);
-                }
-            }
-        }
-
-        // Plot the frametime line
-        float step = gw / static_cast<float>(count - 1);
-        for (int i = 0; i < count - 1; i++) {
-            int i0 = (s_ft_idx - count + i + kHistLen) % kHistLen;
-            int i1 = (s_ft_idx - count + i + 1 + kHistLen) % kHistLen;
-            float v0 = (s_ft_hist[i0] - axis_min) / (axis_max - axis_min);
-            float v1 = (s_ft_hist[i1] - axis_min) / (axis_max - axis_min);
-            v0 = std::clamp(v0, 0.0f, 1.0f);
-            v1 = std::clamp(v1, 0.0f, 1.0f);
-            dl->AddLine(ImVec2(gx + step * i, gy + gh * (1.0f - v0)),
-                        ImVec2(gx + step * (i + 1), gy + gh * (1.0f - v1)),
-                        green, 2.0f * sf);
-        }
-
-        y += big_graph_h + gap;
-    }
-
     // --- Native frametime graph (render frames only, large style) ---
     if (has_native_graph) {
         constexpr int kNatHistLen = 64;
         int count = (s_nat_idx < kNatHistLen) ? s_nat_idx : kNatHistLen;
 
         // Label
-        const char* nat_label = "Native Cadence";
+        const char* nat_label = "Render Pacing";
         if (drop_shadow)
             dl->AddText(font, font_size, ImVec2(x + pad + sh_off, y + sh_off), shadow_col, nat_label);
         dl->AddText(font, font_size, ImVec2(x + pad, y), IM_COL32(180, 220, 255, 255), nat_label);
@@ -1100,9 +1001,7 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
             toggle("1% Low FPS", g_cfg.show_1pct_low, "Worst 1% frame rate over a rolling window.");
             toggle("Frametime", g_cfg.show_frametime, "Time per frame in milliseconds.");
             toggle("Native FPS", g_cfg.show_native_fps, "Real render rate excluding generated frames.");
-            toggle("Frametime Graph", g_cfg.show_graph, "Rolling frametime history graph.");
-            toggle("Large Graph", g_cfg.show_big_graph, "Large frametime graph with labeled axis limits.");
-            toggle("Native Graph", g_cfg.show_native_graph, "Render frame cadence graph (excludes FG-generated frames).");
+            toggle("Render Pacing", g_cfg.show_native_graph, "Frame time graph for real rendered frames (excludes FG-generated frames).");
             toggle("GPU Render Time", g_cfg.show_gpu_time, "GPU active render time from Reflex.");
             toggle("Render Latency", g_cfg.show_render_lat, "Sim-start to GPU-render-end latency.");
             toggle("Present Latency", g_cfg.show_present_lat, "Present start-to-end latency.");
@@ -1352,6 +1251,10 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
             ul_log::Write("OnInitSwapchain: ConnectReflex done");
 
 #ifdef _WIN64
+            // Deferred NGX hook — nvngx DLLs may not be loaded at DLL_PROCESS_ATTACH.
+            // Retry here since the game has initialized its rendering pipeline by now.
+            ul_ngx_res::InstallHooks();
+
             // Acquire GSync surface handle from back buffer
             // NvAPI_D3D_GetObjectHandleForResource needs the real D3D device and resource.
             // For DX12, we get ID3D12Device from the resource itself to ensure it's the
@@ -1599,6 +1502,9 @@ static void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* sc,
     // clear the render resolution. This avoids flickering in FG games where
     // generated frames may not trigger the viewport callback.
     static int s_no_vp_frames = 0;
+    static int s_dlaa_streak = 0;     // consecutive frames detecting DLAA
+    static int s_upscale_streak = 0;  // consecutive frames detecting upscaling
+    static constexpr int kResHysteresis = 10;  // frames before switching display
     if (s_vp_bucket_count > 0) {
         int best = 0;
         for (int i = 1; i < s_vp_bucket_count; i++) {
@@ -1607,26 +1513,38 @@ static void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* sc,
             if (area_i > area_b)
                 best = i;
         }
-        // When the only sub-native viewport is exactly half the output (within
-        // 2%), it's almost certainly a half-res post-process pass (bloom, DOF,
-        // motion vectors) rather than the actual render resolution. This happens
-        // with DLAA or native rendering where the upscaler DLL is loaded but
-        // the game renders at full resolution. Suppress in this case.
+        // Detect DLAA/native: when all sub-native viewports are small enough
+        // to be internal passes (≤55% of output on both axes), the game is
+        // rendering at native resolution. With DLAA, the upscaler DLL is loaded
+        // but the render resolution equals output — all sub-native viewports
+        // are post-process passes (bloom, DOF, motion vectors, shadow maps).
+        //
+        // When at least one viewport exceeds the threshold, it's likely the
+        // real DLSS render resolution (Balanced ~58%, Quality ~67%, etc.).
         uint32_t bw = s_vp_buckets[best].w, bh = s_vp_buckets[best].h;
         uint32_t ow2 = s_out_w.load(std::memory_order_relaxed);
         uint32_t oh2 = s_out_h.load(std::memory_order_relaxed);
-        bool is_half = ow2 > 0 && oh2 > 0
-                    && (bw > ow2 * 48 / 100 && bw < ow2 * 52 / 100)
-                    && (bh > oh2 * 48 / 100 && bh < oh2 * 52 / 100);
-        if (is_half && s_vp_bucket_count == 1) {
-            // Only one sub-native size and it's half-res — likely DLAA/native
-            s_rnd_w.store(0, std::memory_order_relaxed);
-            s_rnd_h.store(0, std::memory_order_relaxed);
-            s_dlaa_detected.store(true, std::memory_order_relaxed);
+        bool largest_is_internal = ow2 > 0 && oh2 > 0
+                    && (bw <= ow2 * 55 / 100)
+                    && (bh <= oh2 * 55 / 100);
+        if (largest_is_internal) {
+            // Only one sub-native size and it's half-res — likely DLAA/native.
+            // Use hysteresis to prevent flickering when bucket count varies.
+            s_dlaa_streak++;
+            s_upscale_streak = 0;
+            if (s_dlaa_streak >= kResHysteresis) {
+                s_rnd_w.store(0, std::memory_order_relaxed);
+                s_rnd_h.store(0, std::memory_order_relaxed);
+                s_dlaa_detected.store(true, std::memory_order_relaxed);
+            }
         } else {
-            s_rnd_w.store(bw, std::memory_order_relaxed);
-            s_rnd_h.store(bh, std::memory_order_relaxed);
-            s_dlaa_detected.store(false, std::memory_order_relaxed);
+            s_upscale_streak++;
+            s_dlaa_streak = 0;
+            if (s_upscale_streak >= kResHysteresis) {
+                s_rnd_w.store(bw, std::memory_order_relaxed);
+                s_rnd_h.store(bh, std::memory_order_relaxed);
+                s_dlaa_detected.store(false, std::memory_order_relaxed);
+            }
         }
         s_vp_bucket_count = 0;
         s_no_vp_frames = 0;
@@ -1713,8 +1631,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             VkReflexHookCreateDevice();
 #endif
 
+            // Hook NGX CreateFeature to read DLSS render resolution and quality mode.
+            // Must be installed before the game creates its DLSS feature.
+#ifdef _WIN64
+            ul_ngx_res::InstallHooks();
+#endif
+
             SetSLPresentCb(OnSLPresentCb);
             SetMarkerCb(OnMarkerCb);
+#ifdef _WIN64
+            SetVkMarkerCb(OnMarkerCb);
+#endif
             StartWorker();
 
             reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
@@ -1739,6 +1666,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         StopWorker();
 #ifdef _WIN64
         VkReflexUnhookCreateDevice();
+        ul_ngx_res::RemoveHooks();
 #endif
         reshade::unregister_overlay("ReLimiter", DrawOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_overlay>(DrawOSD);

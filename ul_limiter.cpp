@@ -884,14 +884,6 @@ float UlLimiter::ComputeRenderFps() const {
         return cap / static_cast<float>(div);
     }
 
-    // In GPU overload mode, use actual render rate from cadence measurement
-    // instead of the unreachable target. This makes sleep interval, GPU load,
-    // and all adaptive thresholds compute against reality.
-    if (gpu_overload_mode_ && pipeline_predictor_.cadence.count >= 8
-        && pipeline_predictor_.cadence.mean_delta_us > 0.0f) {
-        return 1'000'000.0f / pipeline_predictor_.cadence.mean_delta_us;
-    }
-
     int div = DetectFGDivisor();
     return (div > 1) ? target / static_cast<float>(div) : target;
 }
@@ -943,6 +935,7 @@ void UlLimiter::Shutdown() {
     if (htimer_delay_) { CloseHandle(htimer_delay_); htimer_delay_ = nullptr; }
     if (htimer_fallback_) { CloseHandle(htimer_fallback_); htimer_fallback_ = nullptr; }
     if (htimer_queue_) { CloseHandle(htimer_queue_); htimer_queue_ = nullptr; }
+    if (htimer_bg_) { CloseHandle(htimer_bg_); htimer_bg_ = nullptr; }
 
     delete latency_buf_;
     latency_buf_ = nullptr;
@@ -1097,12 +1090,18 @@ NvSleepParams UlLimiter::BuildSleepParams() const {
         ? static_cast<NvU32>(std::round(1'000'000.0 / static_cast<double>(render_fps)))
         : 0;
 
-    // Predictive sleep — 1:1 path only, when GPU has headroom
+    // Predictive sleep — 1:1 path only, when GPU has headroom.
+    // Only shorten the interval when enforcement actually happens at
+    // SIM_START (queue_depth <= 1).  When queue_depth > 1, OnMarker
+    // redirects enforcement to PRESENT_BEGIN, where a shorter interval
+    // directly reduces frame-to-frame time and causes FPS overshoot.
     bool fg = (DetectFGDivisor() > 1);
-    if (raw_interval > 0 && pipeline_predictor_.active
+    bool marker_pacing = g_game_uses_reflex.load(std::memory_order_relaxed);
+    int eff_queue = pipeline_stats_.pacing.queue_depth;
+    if (raw_interval > 0 && pipeline_predictor_.active && marker_pacing
         && !(pipeline_stats_.valid && pipeline_stats_.gpu_load_ratio > 1.0f)) {
         if (!fg) {
-            if (pipeline_stats_.auto_site == SIM_START) {
+            if (pipeline_stats_.auto_site == SIM_START && eff_queue <= 1) {
                 NvU32 predictive_interval = static_cast<NvU32>(
                     std::round(pipeline_predictor_.predicted_total_us
                                + pipeline_predictor_.safety_margin_us));
@@ -1175,6 +1174,7 @@ void UlLimiter::UpdatePipelineStats() {
     int n_sim = 0, n_submit = 0, n_driver = 0;
     int n_idle_gap = 0, n_input_disp = 0;
     float target_interval_us = 0.0f;
+    float target_load_ratio = 0.0f;  // target-based GPU load for site selection + load gate
     {
         float rfps = ComputeRenderFps();
         if (rfps > 0.0f) target_interval_us = 1'000'000.0f / rfps;
@@ -1296,39 +1296,57 @@ void UlLimiter::UpdatePipelineStats() {
         // basis to actual render FPS so all adaptive systems get sane inputs.
         // Only evaluate when GPU load gate is open (gameplay, not menus/loading).
         if (gpu_load_gate_open_) {
-            float target_load = ps.gpu_load_ratio;  // computed against target interval
+            // Compute load against the USER's original target interval.
+            // gpu_overload_mode_ is now metrics-only (no pacing effect),
+            // so target_interval_us always reflects the user's target.
+            // user_load drives both entry (>1.05) and recovery (<0.95).
+            float user_target_fps = g_cfg.fps_limit.load(std::memory_order_relaxed);
+            int div = DetectFGDivisor();
+            if (div > 1) user_target_fps /= static_cast<float>(div);
+            float user_interval_us = (user_target_fps > 0.0f)
+                ? 1'000'000.0f / user_target_fps : target_interval_us;
+            float user_load = ps.avg_gpu_active_us / user_interval_us;
 
             if (!gpu_overload_mode_) {
-                if (target_load > 1.05f) {
+                if (user_load > 1.05f) {
                     gpu_overload_count_++;
                     gpu_recover_count_ = 0;
                     if (gpu_overload_count_ >= kOverloadThreshold) {
                         gpu_overload_mode_ = true;
-                        ul_log::Write("GPU overload: switching to actual render FPS (load=%.2f)", target_load);
+                        ul_log::Write("GPU overload: load=%.2f (metrics only, pacing unchanged)", user_load);
                     }
                 } else {
                     gpu_overload_count_ = 0;
                 }
             } else {
-                // In overload mode — check if GPU has recovered
-                if (target_load < 0.95f) {
+                if (user_load < 0.95f) {
                     gpu_recover_count_++;
                     gpu_overload_count_ = 0;
                     if (gpu_recover_count_ >= kOverloadThreshold) {
                         gpu_overload_mode_ = false;
-                        ul_log::Write("GPU recovered: switching back to target render FPS (load=%.2f)", target_load);
+                        ul_log::Write("GPU recovered: load=%.2f", user_load);
                     }
                 } else {
                     gpu_recover_count_ = 0;
                 }
 
-                // Recompute load ratio against actual interval
+                // Recompute load ratio against actual interval for adaptive systems
+                // (interval adjustment, consistency buffer). Enforcement site selection
+                // uses the original target-based ratio to avoid flip-flopping.
                 if (pipeline_predictor_.cadence.mean_delta_us > 0.0f) {
                     ps.gpu_load_ratio = ps.avg_gpu_active_us / pipeline_predictor_.cadence.mean_delta_us;
                     ps.pipeline_load_ratio = ps.avg_pipeline_total_us / pipeline_predictor_.cadence.mean_delta_us;
                 }
             }
         }
+
+        // Save target-based load ratio for enforcement site and load gate.
+        // In overload mode, gpu_load_ratio has been recomputed against actual
+        // cadence (for adaptive systems), but site selection and the load gate
+        // should use the original target to avoid oscillation.
+        target_load_ratio = gpu_overload_mode_
+            ? (ps.avg_gpu_active_us / target_interval_us)
+            : ps.gpu_load_ratio;
 
         if (ps.gpu_load_ratio < 0.70f)
             ps.interval_adjust_us = -3;
@@ -1362,9 +1380,9 @@ void UlLimiter::UpdatePipelineStats() {
     if (fg_active) {
         // Hysteresis band: only switch when gpu_load crosses 0.55 or 0.70
         // to avoid oscillation when hovering near the boundary.
-        if (ps.gpu_load_ratio < 0.55f)
+        if (target_load_ratio < 0.55f)
             ps.auto_site = SIM_START;
-        else if (ps.gpu_load_ratio > 0.70f)
+        else if (target_load_ratio > 0.70f)
             ps.auto_site = PRESENT_FINISH;
         // else: keep previous site (dead zone)
     } else if (ps.bottleneck == Bottleneck::Gpu)
@@ -1372,9 +1390,9 @@ void UlLimiter::UpdatePipelineStats() {
     else if (ps.bottleneck == Bottleneck::CpuSim || ps.bottleneck == Bottleneck::CpuSubmit)
         ps.auto_site = PRESENT_FINISH;
     else {
-        if (ps.gpu_load_ratio > 0.85f)
+        if (target_load_ratio > 0.85f)
             ps.auto_site = SIM_START;
-        else if (ps.gpu_load_ratio < 0.65f)
+        else if (target_load_ratio < 0.65f)
             ps.auto_site = PRESENT_FINISH;
     }
 
@@ -1531,8 +1549,10 @@ void UlLimiter::UpdatePipelineStats() {
     // --- GPU Load Gate ---
     // When GPU load is below 50%, freeze ConsistencyBuffer tick only.
     // DynamicPacing and BoostController continue running as before.
+    // Use target-based load ratio for the gate — in overload mode the
+    // cadence-based ratio is artificially low and would falsely close the gate.
     bool was_gate_open = gpu_load_gate_open_;
-    gpu_load_gate_open_ = (ps.gpu_load_ratio >= 0.50f);
+    gpu_load_gate_open_ = (target_load_ratio >= 0.50f);
 
     // Flush overload state when transitioning from gameplay to menu/loading
     // (gate closing). Overload detection from gameplay is invalid in menus.
@@ -1576,6 +1596,7 @@ void UlLimiter::UpdatePipelineStats() {
             gpu_overload_mode_ = false;
             gpu_overload_count_ = 0;
             gpu_recover_count_ = 0;
+            pipeline_predictor_.cadence.Reset();
 
             last_fg_tier_ = fg_tier;
         }
@@ -1815,16 +1836,19 @@ void UlLimiter::DoOwnSleep() {
     // Vulkan path: update driver hints, then use our grid for timing
 #ifdef _WIN64
     if (VK_REFLEX_ACTIVE()) {
-        if (g_game_uses_reflex.load(std::memory_order_relaxed))
-            return;
+        // For native Reflex games, SetSleepMode is handled by the game
+        // (forwarded to driver via our wrapper). For non-native, we set it here.
+        bool native = g_game_uses_reflex.load(std::memory_order_relaxed);
 
         NvSleepParams p = BuildSleepParams();
         if (p.minimumIntervalUs == 0) return;
 
-        vk_reflex_->SetSleepMode(
-            p.bLowLatencyMode != 0,
-            p.bLowLatencyBoost != 0,
-            p.minimumIntervalUs);
+        if (!native) {
+            vk_reflex_->SetSleepMode(
+                p.bLowLatencyMode != 0,
+                p.bLowLatencyBoost != 0,
+                p.minimumIntervalUs);
+        }
 
         // Grid sleep with our timers
         int64_t frame_ns = static_cast<int64_t>(p.minimumIntervalUs) * 1000LL;
@@ -2096,7 +2120,7 @@ void UlLimiter::OnPresent() {
                     // SleepUntilNs blocks indefinitely on refocus.
                     int64_t max_wake = now_ns + bg_ns;
                     int64_t wake = (grid_next_ns_ < max_wake) ? grid_next_ns_ : max_wake;
-                    ul_timing::SleepUntilNs(wake, htimer_fallback_);
+                    ul_timing::SleepUntilNs(wake, htimer_bg_);
                 }
                 grid_next_ns_ = now_ns + bg_ns;
             }
@@ -2120,17 +2144,12 @@ void UlLimiter::OnPresent() {
         bool vsync_changed = (s_last_vsync >= 0 && cur_vsync != s_last_vsync);
         bool excl_changed = (s_last_vsync >= 0 && cur_excl != s_last_excl);
 
-        // Detect FG divisor change (FG turning on/off) as a settings-level reset trigger
-        int cur_fg_div = DetectFGDivisor();
-        bool fg_changed = (last_fg_div_ > 0 && cur_fg_div != last_fg_div_);
-
-        if (fps_changed || vsync_changed || excl_changed || fg_changed)
+        if (fps_changed || vsync_changed || excl_changed)
             ResetAdaptiveState();
 
         last_fps_limit_ = cur_fps;
         s_last_vsync = cur_vsync;
         s_last_excl = cur_excl;
-        last_fg_div_ = cur_fg_div;
 
         if (pipeline_stats_.pacing.vote_window_size <= 0 && cur_fps > 0.0f)
             pipeline_stats_.pacing.ResizeWindow(cur_fps);
@@ -2198,11 +2217,14 @@ void UlLimiter::OnPresent() {
     // DoOwnSleep handles all timing via our grid, then passes through to
     // Reflex for driver state management. No separate DoTimingFallback needed.
     bool vk_active = VK_REFLEX_ACTIVE();
-    bool vk_native = vk_active && g_game_uses_reflex.load(std::memory_order_relaxed);
     if (vk_active) {
-        // When the game uses native Reflex, it handles its own sleep cycle.
-        if (!vk_native)
-            DoOwnSleep();
+#ifdef _WIN64
+        // Both native and non-native Vulkan Reflex: DoOwnSleep handles grid
+        // sleep for FPS cap enforcement. For native games, it skips SetSleepMode
+        // (the game's own calls are forwarded to the driver by our wrapper).
+        // For non-native, it also sets our sleep mode params.
+        DoOwnSleep();
+#endif
     } else if (ReflexActive() && dev_) {
         if (g_game_uses_reflex.load(std::memory_order_relaxed)) {
             // Marker pacing — OnMarker calls DoOwnSleep at enforcement site.

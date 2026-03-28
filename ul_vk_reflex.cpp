@@ -5,6 +5,8 @@
 // No code from any other project.
 
 #include "ul_vk_reflex.hpp"
+#include "ul_reflex.hpp"   // g_ring, kRingSize, kMarkerCount, MarkerCb, LatencyMarker
+#include "ul_timing.hpp"   // ul_timing::NowNs
 #include "ul_log.hpp"
 
 #include <MinHook.h>
@@ -12,6 +14,10 @@
 #include <vector>
 
 VkReflex g_vk_reflex;
+
+// Forward declaration — defined early so VkReflex::Init can use the trampoline
+// to resolve real (unhooked) driver functions.
+static PFN_vkGetDeviceProcAddr s_orig_vkGetDeviceProcAddr = nullptr;
 
 bool VkReflex::Init(VkDevice device) {
     if (!device) return false;
@@ -23,8 +29,13 @@ bool VkReflex::Init(VkDevice device) {
         return false;
     }
 
-    auto vkGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
-        GetProcAddress(vk_dll, "vkGetDeviceProcAddr"));
+    // Use the original (unhooked) vkGetDeviceProcAddr if available, so we
+    // get the real driver functions rather than our own wrappers.
+    PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr = s_orig_vkGetDeviceProcAddr;
+    if (!vkGetDeviceProcAddr) {
+        vkGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+            GetProcAddress(vk_dll, "vkGetDeviceProcAddr"));
+    }
     if (!vkGetDeviceProcAddr) {
         ul_log::Write("VkReflex::Init: vkGetDeviceProcAddr not found");
         return false;
@@ -268,7 +279,9 @@ bool VkReflex::GetLatencyTimings(NvLatencyResult* out) {
 // ============================================================================
 
 static PFN_vkSetLatencySleepModeNV s_real_vkSetLatencySleepMode = nullptr;
-static PFN_vkGetDeviceProcAddr s_orig_vkGetDeviceProcAddr = nullptr;
+static PFN_vkSetLatencyMarkerNV s_real_vkSetLatencyMarker = nullptr;
+static PFN_vkLatencySleepNV s_real_vkLatencySleep = nullptr;
+static MarkerCb s_vk_marker_cb = nullptr;
 static std::atomic<bool> s_gdpa_hook_installed{false};
 
 static VkResult Wrapped_vkSetLatencySleepModeNV(
@@ -280,9 +293,74 @@ static VkResult Wrapped_vkSetLatencySleepModeNV(
         g_game_uses_reflex.store(true, std::memory_order_relaxed);
         ul_log::Write("VkHook: game uses native Reflex (vkSetLatencySleepModeNV)");
     }
+    // Forward to driver — keep the latency pipeline coherent for accurate
+    // GetLatencyTimings results. The limiter controls pacing via markers.
     if (s_real_vkSetLatencySleepMode)
         return s_real_vkSetLatencySleepMode(device, swapchain, pSleepModeInfo);
     return VK_SUCCESS;
+}
+
+// Intercept vkLatencySleepNV: forward to driver so latency tracking stays
+// accurate. The limiter's grid timing (DoOwnSleep at enforcement site)
+// provides the actual pacing on top of the driver's sleep.
+static VkResult Wrapped_vkLatencySleepNV(
+    VkDevice device,
+    VkSwapchainKHR swapchain,
+    const VkLatencySleepInfoNV* pSleepInfo)
+{
+    // Forward to driver — the game's sleep cycle keeps the driver's latency
+    // measurement pipeline coherent.
+    if (s_real_vkLatencySleep)
+        return s_real_vkLatencySleep(device, swapchain, pSleepInfo);
+    return VK_SUCCESS;
+}
+
+// Intercept vkSetLatencyMarkerNV: record timestamp in g_ring, fire callback,
+// forward to driver. Mirrors the DX Hook_SetMarker logic for Vulkan native
+// Reflex games so marker-based enforcement pacing works identically.
+static void Wrapped_vkSetLatencyMarkerNV(
+    VkDevice device,
+    VkSwapchainKHR swapchain,
+    const VkSetLatencyMarkerInfoNV* pLatencyMarkerInfo)
+{
+    if (!pLatencyMarkerInfo) {
+        if (s_real_vkSetLatencyMarker)
+            s_real_vkSetLatencyMarker(device, swapchain, pLatencyMarkerInfo);
+        return;
+    }
+
+    g_game_uses_reflex.store(true, std::memory_order_relaxed);
+
+    // VkLatencyMarkerNV values map 1:1 with LatencyMarker enum (0-7)
+    int mt = static_cast<int>(pLatencyMarkerInfo->marker);
+    uint64_t fid = pLatencyMarkerInfo->presentID;
+
+    // Record in ring buffer (same as DX Hook_SetMarker)
+    if (mt >= 0 && mt < kMarkerCount) {
+        size_t slot = static_cast<size_t>(fid % kRingSize);
+        g_ring[slot].frame_id.store(fid, std::memory_order_relaxed);
+        g_ring[slot].timestamp_ns[mt].store(ul_timing::NowNs(), std::memory_order_relaxed);
+
+        // Dedup: skip if we already saw this marker for this frame
+        if (g_ring[slot].seen_frame[mt].load(std::memory_order_relaxed) == fid) {
+            return;
+        }
+        g_ring[slot].seen_frame[mt].store(fid, std::memory_order_relaxed);
+    }
+
+    // For PRESENT_FINISH: forward to driver first, then notify callback.
+    // For all others: notify callback first, then forward.
+    bool forwarded = false;
+    if (mt == static_cast<int>(PRESENT_FINISH)) {
+        if (s_real_vkSetLatencyMarker)
+            s_real_vkSetLatencyMarker(device, swapchain, pLatencyMarkerInfo);
+        forwarded = true;
+    }
+
+    if (s_vk_marker_cb) s_vk_marker_cb(mt, fid);
+
+    if (!forwarded && s_real_vkSetLatencyMarker)
+        s_real_vkSetLatencyMarker(device, swapchain, pLatencyMarkerInfo);
 }
 
 static void* Hooked_vkGetDeviceProcAddr(VkDevice device, const char* pName) {
@@ -293,6 +371,22 @@ static void* Hooked_vkGetDeviceProcAddr(VkDevice device, const char* pName) {
         }
         if (s_real_vkSetLatencySleepMode)
             return reinterpret_cast<void*>(&Wrapped_vkSetLatencySleepModeNV);
+    }
+    if (pName && strcmp(pName, "vkLatencySleepNV") == 0) {
+        if (!s_real_vkLatencySleep && s_orig_vkGetDeviceProcAddr) {
+            s_real_vkLatencySleep = reinterpret_cast<PFN_vkLatencySleepNV>(
+                s_orig_vkGetDeviceProcAddr(device, pName));
+        }
+        if (s_real_vkLatencySleep)
+            return reinterpret_cast<void*>(&Wrapped_vkLatencySleepNV);
+    }
+    if (pName && strcmp(pName, "vkSetLatencyMarkerNV") == 0) {
+        if (!s_real_vkSetLatencyMarker && s_orig_vkGetDeviceProcAddr) {
+            s_real_vkSetLatencyMarker = reinterpret_cast<PFN_vkSetLatencyMarkerNV>(
+                s_orig_vkGetDeviceProcAddr(device, pName));
+        }
+        if (s_real_vkSetLatencyMarker)
+            return reinterpret_cast<void*>(&Wrapped_vkSetLatencyMarkerNV);
     }
     return s_orig_vkGetDeviceProcAddr ? s_orig_vkGetDeviceProcAddr(device, pName) : nullptr;
 }
@@ -336,6 +430,8 @@ static void UnhookVkGetDeviceProcAddr() {
     s_gdpa_hook_installed.store(false, std::memory_order_relaxed);
     s_orig_vkGetDeviceProcAddr = nullptr;
     s_real_vkSetLatencySleepMode = nullptr;
+    s_real_vkSetLatencyMarker = nullptr;
+    s_real_vkLatencySleep = nullptr;
 }
 
 // ============================================================================
@@ -369,6 +465,57 @@ static bool PhysicalDeviceSupportsLL2(VkPhysicalDevice physDev) {
     return false;
 }
 
+// Hook the actual VK_NV_low_latency2 functions via MinHook after device creation.
+// This catches all calls regardless of whether the game uses the global or
+// device-level vkGetDeviceProcAddr dispatch.
+static void HookLL2Functions(VkDevice device) {
+    if (!device || !s_orig_vkGetDeviceProcAddr) return;
+
+    // Resolve real function addresses via the trampoline (unhooked path)
+    auto real_set_sleep = reinterpret_cast<void*>(
+        s_orig_vkGetDeviceProcAddr(device, "vkSetLatencySleepModeNV"));
+    auto real_sleep = reinterpret_cast<void*>(
+        s_orig_vkGetDeviceProcAddr(device, "vkLatencySleepNV"));
+    auto real_marker = reinterpret_cast<void*>(
+        s_orig_vkGetDeviceProcAddr(device, "vkSetLatencyMarkerNV"));
+
+    if (real_set_sleep && !s_real_vkSetLatencySleepMode) {
+        MH_STATUS st = MH_CreateHook(real_set_sleep,
+            reinterpret_cast<void*>(&Wrapped_vkSetLatencySleepModeNV),
+            reinterpret_cast<void**>(&s_real_vkSetLatencySleepMode));
+        if (st == MH_OK) {
+            MH_EnableHook(real_set_sleep);
+            ul_log::Write("VkHook: vkSetLatencySleepModeNV hooked via MinHook");
+        } else {
+            ul_log::Write("VkHook: MH_CreateHook vkSetLatencySleepModeNV failed (%d)", st);
+        }
+    }
+
+    if (real_sleep && !s_real_vkLatencySleep) {
+        MH_STATUS st = MH_CreateHook(real_sleep,
+            reinterpret_cast<void*>(&Wrapped_vkLatencySleepNV),
+            reinterpret_cast<void**>(&s_real_vkLatencySleep));
+        if (st == MH_OK) {
+            MH_EnableHook(real_sleep);
+            ul_log::Write("VkHook: vkLatencySleepNV hooked via MinHook");
+        } else {
+            ul_log::Write("VkHook: MH_CreateHook vkLatencySleepNV failed (%d)", st);
+        }
+    }
+
+    if (real_marker && !s_real_vkSetLatencyMarker) {
+        MH_STATUS st = MH_CreateHook(real_marker,
+            reinterpret_cast<void*>(&Wrapped_vkSetLatencyMarkerNV),
+            reinterpret_cast<void**>(&s_real_vkSetLatencyMarker));
+        if (st == MH_OK) {
+            MH_EnableHook(real_marker);
+            ul_log::Write("VkHook: vkSetLatencyMarkerNV hooked via MinHook");
+        } else {
+            ul_log::Write("VkHook: MH_CreateHook vkSetLatencyMarkerNV failed (%d)", st);
+        }
+    }
+}
+
 static VkResult Hooked_vkCreateDevice(
     VkPhysicalDevice physicalDevice,
     const VkDeviceCreateInfo* pCreateInfo,
@@ -381,46 +528,44 @@ static VkResult Hooked_vkCreateDevice(
             : VK_ERROR_EXTENSION_NOT_PRESENT;
     }
 
-    // Check if the game already enabled VK_NV_low_latency2
-    bool already_enabled = false;
+    // Build the extension list:
+    // - Inject VK_NV_low_latency2 if not already present
+    bool has_ll2 = false;
+
+    std::vector<const char*> ext_names;
+    ext_names.reserve(pCreateInfo->enabledExtensionCount + 1);
     for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
-        if (pCreateInfo->ppEnabledExtensionNames[i] &&
-            strcmp(pCreateInfo->ppEnabledExtensionNames[i], "VK_NV_low_latency2") == 0) {
-            already_enabled = true;
-            break;
+        const char* name = pCreateInfo->ppEnabledExtensionNames[i];
+        if (!name) continue;
+        if (strcmp(name, "VK_NV_low_latency2") == 0) {
+            has_ll2 = true;
         }
+        ext_names.push_back(name);
     }
 
-    if (already_enabled) {
-        ul_log::Write("VkHook: game already enables VK_NV_low_latency2 — native Reflex detected");
-        s_extension_injected.store(true, std::memory_order_relaxed);
+    if (has_ll2) {
         g_game_uses_reflex.store(true, std::memory_order_relaxed);
-        return s_orig_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
-    }
-
-    if (!PhysicalDeviceSupportsLL2(physicalDevice)) {
+        ul_log::Write("VkHook: game already enables VK_NV_low_latency2 — native Reflex detected");
+    } else if (PhysicalDeviceSupportsLL2(physicalDevice)) {
+        ext_names.push_back("VK_NV_low_latency2");
+        ul_log::Write("VkHook: injecting VK_NV_low_latency2 into vkCreateDevice");
+    } else {
         ul_log::Write("VkHook: VK_NV_low_latency2 not supported by physical device");
         return s_orig_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
     }
 
-    ul_log::Write("VkHook: injecting VK_NV_low_latency2 into vkCreateDevice");
-
-    uint32_t new_count = pCreateInfo->enabledExtensionCount + 1;
-    std::vector<const char*> ext_names(new_count);
-    for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++)
-        ext_names[i] = pCreateInfo->ppEnabledExtensionNames[i];
-    ext_names[pCreateInfo->enabledExtensionCount] = "VK_NV_low_latency2";
-
     VkDeviceCreateInfo modified = *pCreateInfo;
-    modified.enabledExtensionCount = new_count;
+    modified.enabledExtensionCount = static_cast<uint32_t>(ext_names.size());
     modified.ppEnabledExtensionNames = ext_names.data();
 
     VkResult res = s_orig_vkCreateDevice(physicalDevice, &modified, pAllocator, pDevice);
     if (res == VK_SUCCESS) {
         s_extension_injected.store(true, std::memory_order_relaxed);
-        ul_log::Write("VkHook: VK_NV_low_latency2 injected successfully");
+        ul_log::Write("VkHook: vkCreateDevice succeeded (extensions: %u)", modified.enabledExtensionCount);
+        if (pDevice && *pDevice)
+            HookLL2Functions(*pDevice);
     } else {
-        ul_log::Write("VkHook: vkCreateDevice with injected ext failed (%d), retrying without", res);
+        ul_log::Write("VkHook: vkCreateDevice with modified exts failed (%d), retrying original", res);
         res = s_orig_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
     }
 
@@ -479,4 +624,8 @@ void VkReflexUnhookCreateDevice() {
 
 bool VkReflexExtensionInjected() {
     return s_extension_injected.load(std::memory_order_relaxed);
+}
+
+void SetVkMarkerCb(MarkerCb cb) {
+    s_vk_marker_cb = cb;
 }

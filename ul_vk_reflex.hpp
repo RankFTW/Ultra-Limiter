@@ -240,4 +240,8 @@ void VkReflexUnhookCreateDevice();
 // vkCreateDevice call (i.e., the device should support low_latency2).
 bool VkReflexExtensionInjected();
 
+// Vulkan marker callback — set to receive marker notifications from native
+// Reflex games (mirrors DX SetMarkerCb for Vulkan path).
+void SetVkMarkerCb(MarkerCb cb);
+
 #endif // _WIN64

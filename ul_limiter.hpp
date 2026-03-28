@@ -411,6 +411,7 @@ private:
     HANDLE htimer_delay_ = nullptr;
     HANDLE htimer_fallback_ = nullptr;
     HANDLE htimer_queue_ = nullptr;
+    HANDLE htimer_bg_ = nullptr;  // dedicated timer for background limiter (avoids race with htimer_fallback_)
 
     int64_t grid_epoch_ns_ = 0;
     int64_t grid_interval_ns_ = 0;
@@ -441,7 +442,7 @@ private:
     bool is_dmfg_ = false;  // true when FG tier comes from driver (no FG DLL)
     DiagCSVLogger diag_csv_logger_;
 
-    // GPU overload detection — switch to actual render FPS when target unreachable
+    // GPU overload detection — recomputes load metrics against actual cadence
     bool gpu_overload_mode_ = false;
     int gpu_overload_count_ = 0;
     int gpu_recover_count_ = 0;
@@ -452,7 +453,6 @@ private:
     static constexpr int64_t kWarmupDurationSec = 2;
 
     bool is_background_ = false;
-    int last_fg_div_ = 0;  // previous FG divisor for settings-change detection
 
     // PLL state — phase-locked grid correction from display feedback
     float pll_smoothed_error_ns_ = 0.0f;

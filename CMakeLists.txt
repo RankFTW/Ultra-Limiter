@@ -36,7 +36,7 @@ add_library(ultra_limiter SHARED
 
 # Vulkan Reflex backend — 64-bit only (requires vulkan-1.dll / VK_NV_low_latency2)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    target_sources(ultra_limiter PRIVATE ul_vk_reflex.cpp)
+    target_sources(ultra_limiter PRIVATE ul_vk_reflex.cpp ul_ngx_res.cpp)
 endif()
 
 # Include directories
