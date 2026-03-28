@@ -99,6 +99,7 @@ static void WriteDefaults(const char* path) {
         "osd_scale=100\n"
         "show_smoothness=true\n"
         "show_big_graph=false\n"
+        "show_native_graph=false\n"
         "csv_diagnostics=false\n"
     );
     fclose(f);
@@ -210,6 +211,7 @@ void LoadSettings(HMODULE addon_module) {
     g_cfg.osd_scale.store(GetPrivateProfileIntA("UltraLimiter", "osd_scale", 100, ini));
     g_cfg.show_smoothness.store(ReadBool(ini, "show_smoothness", true));
     g_cfg.show_big_graph.store(ReadBool(ini, "show_big_graph", false));
+    g_cfg.show_native_graph.store(ReadBool(ini, "show_native_graph", false));
     g_cfg.csv_diagnostics.store(ReadBool(ini, "csv_diagnostics", false));
     ul_log::Write("LoadSettings: fps=%.0f bg_fps=%.0f",
                   g_cfg.fps_limit.load(), g_cfg.bg_fps_limit.load());
@@ -252,5 +254,6 @@ void SaveSettings() {
     WBool("fake_fullscreen", g_cfg.fake_fullscreen.load());
     WBool("show_smoothness", g_cfg.show_smoothness.load());
     WBool("show_big_graph", g_cfg.show_big_graph.load());
+    WBool("show_native_graph", g_cfg.show_native_graph.load());
     WBool("csv_diagnostics", g_cfg.csv_diagnostics.load());
 }

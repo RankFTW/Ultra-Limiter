@@ -3,6 +3,8 @@
 //   - QueryPerformanceCounter / QueryPerformanceFrequency (MSDN)
 //   - CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Win10 1803+, MSDN)
 //   - ZwSetTimerResolution / ZwQueryTimerResolution (ntdll, well-known)
+//   - SetThreadPriority / THREAD_PRIORITY_TIME_CRITICAL (MSDN)
+// No code from any other frame limiter project.
 // No code from any other frame limiter project.
 
 #include "ul_timing.hpp"
@@ -117,9 +119,115 @@ void SleepUntilNs(int64_t target_ns, HANDLE& timer_handle) {
             WaitForSingleObject(timer_handle, INFINITE);
     }
 
-    // Busy-wait for the final stretch — sub-millisecond precision
+    // Busy-wait for the final stretch — sub-millisecond precision.
+    // Temporarily boost thread priority to minimize OS preemption risk
+    // during the critical timing window.
+    int prev_priority = GetThreadPriority(GetCurrentThread());
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
     while (NowQpc() < target_qpc)
         YieldProcessor();
+
+    SetThreadPriority(GetCurrentThread(), prev_priority);
+}
+
+}  // namespace ul_timing
+
+// ============================================================================
+// Global timer promotion — upgrade all waitable timers to high-resolution
+// ============================================================================
+//
+// Some drivers and middleware create standard waitable timers internally.
+// On systems where the default timer resolution is ~15.6ms, these timers
+// can introduce significant jitter. By hooking CreateWaitableTimer(Ex),
+// we promote all timers in the process to high-resolution, ensuring
+// consistent sub-millisecond precision throughout the rendering pipeline.
+
+#include <MinHook.h>
+
+namespace ul_timing {
+
+// Original function pointers
+using CreateWaitableTimerW_fn = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, BOOL, LPCWSTR);
+using CreateWaitableTimerExW_fn = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
+
+static CreateWaitableTimerW_fn   s_orig_create_timer_w = nullptr;
+static CreateWaitableTimerExW_fn s_orig_create_timer_ex_w = nullptr;
+static bool s_timer_hooks_installed = false;
+
+static HANDLE WINAPI Hook_CreateWaitableTimerW(
+    LPSECURITY_ATTRIBUTES lpAttrs, BOOL bManualReset, LPCWSTR lpName)
+{
+    // Promote to high-resolution via CreateWaitableTimerExW
+    DWORD flags = CREATE_WAITABLE_TIMER_HIGH_RESOLUTION;
+    if (bManualReset) flags |= CREATE_WAITABLE_TIMER_MANUAL_RESET;
+
+    HANDLE h = s_orig_create_timer_ex_w
+        ? s_orig_create_timer_ex_w(lpAttrs, lpName, flags, TIMER_ALL_ACCESS)
+        : nullptr;
+
+    // Fallback if high-res not supported
+    if (!h && s_orig_create_timer_w)
+        h = s_orig_create_timer_w(lpAttrs, bManualReset, lpName);
+
+    return h;
+}
+
+static HANDLE WINAPI Hook_CreateWaitableTimerExW(
+    LPSECURITY_ATTRIBUTES lpAttrs, LPCWSTR lpName, DWORD dwFlags, DWORD dwAccess)
+{
+    // Add high-resolution flag if not already present
+    dwFlags |= CREATE_WAITABLE_TIMER_HIGH_RESOLUTION;
+
+    return s_orig_create_timer_ex_w
+        ? s_orig_create_timer_ex_w(lpAttrs, lpName, dwFlags, dwAccess)
+        : nullptr;
+}
+
+void InstallTimerPromotionHooks() {
+    if (s_timer_hooks_installed) return;
+
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    if (!k32) return;
+
+    void* pCreateW = reinterpret_cast<void*>(GetProcAddress(k32, "CreateWaitableTimerW"));
+    void* pCreateExW = reinterpret_cast<void*>(GetProcAddress(k32, "CreateWaitableTimerExW"));
+
+    if (!pCreateW || !pCreateExW) return;
+
+    // Hook ExW first (needed by the W hook's promotion path)
+    MH_STATUS st = MH_CreateHook(pCreateExW, reinterpret_cast<void*>(Hook_CreateWaitableTimerExW),
+                                  reinterpret_cast<void**>(&s_orig_create_timer_ex_w));
+    if (st != MH_OK) return;
+    if (MH_EnableHook(pCreateExW) != MH_OK) { MH_RemoveHook(pCreateExW); return; }
+
+    st = MH_CreateHook(pCreateW, reinterpret_cast<void*>(Hook_CreateWaitableTimerW),
+                        reinterpret_cast<void**>(&s_orig_create_timer_w));
+    if (st != MH_OK) { MH_DisableHook(pCreateExW); MH_RemoveHook(pCreateExW); return; }
+    if (MH_EnableHook(pCreateW) != MH_OK) {
+        MH_RemoveHook(pCreateW);
+        MH_DisableHook(pCreateExW); MH_RemoveHook(pCreateExW);
+        return;
+    }
+
+    s_timer_hooks_installed = true;
+    ul_log::Write("Timer promotion hooks installed (all timers → high-resolution)");
+}
+
+void RemoveTimerPromotionHooks() {
+    if (!s_timer_hooks_installed) return;
+
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    if (k32) {
+        void* pCreateW = reinterpret_cast<void*>(GetProcAddress(k32, "CreateWaitableTimerW"));
+        void* pCreateExW = reinterpret_cast<void*>(GetProcAddress(k32, "CreateWaitableTimerExW"));
+        if (pCreateW) { MH_DisableHook(pCreateW); MH_RemoveHook(pCreateW); }
+        if (pCreateExW) { MH_DisableHook(pCreateExW); MH_RemoveHook(pCreateExW); }
+    }
+
+    s_orig_create_timer_w = nullptr;
+    s_orig_create_timer_ex_w = nullptr;
+    s_timer_hooks_installed = false;
 }
 
 }  // namespace ul_timing

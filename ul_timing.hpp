@@ -24,4 +24,10 @@ int64_t NowNs();
 // timer_handle is lazily created on first call and reused thereafter.
 void SleepUntilNs(int64_t target_ns, HANDLE& timer_handle);
 
+// Hook CreateWaitableTimer to promote all timers in the process to
+// high-resolution. Improves timing precision for driver-internal timers.
+// Requires MinHook to be initialized. Safe to call multiple times.
+void InstallTimerPromotionHooks();
+void RemoveTimerPromotionHooks();
+
 }  // namespace ul_timing

@@ -1,5 +1,23 @@
 # Changelog
 
+## v2.2.1
+
+FG tier detection improvements, timing precision, and stability fixes.
+
+- FPS-ratio FG tier monitor: extracted tier computation from OSD into standalone `ul_fg_monitor` module. Tier is computed every frame from `output_fps / native_fps` independent of OSD draw path. Thresholds at > 1.5, > 2.5, > 3.5, > 4.5, > 5.5 for tiers 2-6.
+- Tier lock-in hysteresis: first detection is immediate, subsequent tier changes require 30 consecutive frames at the new tier before applying. Prevents oscillation at ratio boundaries (e.g. 3.5 bouncing between tier 3 and 4).
+- Tier state resets on background/refocus via `ul_fg_monitor::Reset()`, preventing stale tier from persisting across alt-tab cycles
+- Removed `g_fps_fg_tier` global atomic — tier is now accessed via `ul_fg_monitor::GetTier()` from the limiter and `ul_fg_monitor::GetMultiplierString()` from the OSD
+- Added `ul_fg_monitor::HasData()` — returns true once 30+ updates processed, used by `DetectFGDivisor` to distinguish "no FG confirmed" from "not enough data yet"
+- `DetectFGDivisor` reworked: FPS-based monitor is now ground truth for runtime FG state. DLLs stay loaded even when the game disables FG (e.g. in menus), so DLL presence alone is no longer trusted. When `HasData()` reports tier 0, returns 1 (confirmed no FG). DLL presence is fallback only before FPS data is available.
+- FG divisor change detection: `ResetAdaptiveState()` now triggers when FG divisor changes at runtime (e.g. toggling FG in-game), tracked via `last_fg_div_`
+- GPU overload state flushed on load gate close (gameplay to menu/loading transition) and on FG tier change — prevents stale overload detection from a previous scene or FG state carrying over
+- SEH guard on `DoOwnSleep` Reflex passthrough — wraps `MaybeUpdateSleepMode` + `InvokeSleep` in `__try/__except` to protect against driver crashes during swapchain recreation or alt-tab
+- Background early-return in `DoTimingFallback` — prevents the timing fallback path from running while the game is backgrounded
+- Timer promotion hooks: `CreateWaitableTimerW` and `CreateWaitableTimerExW` hooked via MinHook to force `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` on all waitable timers in the process. Improves timing precision for driver-internal and middleware timers that would otherwise use the default ~15.6ms resolution.
+- Thread priority boost to `THREAD_PRIORITY_TIME_CRITICAL` during the busy-wait tail in `SleepUntilNs`, restored to previous priority after. Reduces OS preemption risk during the critical sub-millisecond timing window.
+- PLL grid correction from display feedback: reads `presentEndTime` from GetLatency reports, computes phase error between actual present time and nearest grid slot, EMA-smooths (alpha=0.05), and nudges `grid_epoch_ns_` by 10% of the smoothed error. Slowly aligns the timing grid to the display's actual present cadence, correcting for drift that the present-to-present feedback loop alone can't catch.
+
 ## v2.2.0
 
 VRR and Frame Generation consistency improvements -- perceptual threshold tuning, GSync detection, frame splitting control, smoothness OSD, diagnostic telemetry, and OSD enhancements.

@@ -9,6 +9,7 @@
 #define NOMINMAX
 #endif
 
+#include "ul_fg_monitor.hpp"
 #include "ul_limiter.hpp"
 #include "ul_log.hpp"
 #include "ul_timing.hpp"
@@ -131,11 +132,48 @@ void CadenceTracker::ComputeStats() {
     for (int i = 0; i < count; i++)
         sum += deltas_us[(head - count + i + kWindowSize) % kWindowSize];
     mean_delta_us = sum / static_cast<float>(count);
+
+    // First pass: compute raw stddev for outlier detection
     float var_sum = 0.0f;
     for (int i = 0; i < count; i++) {
         float d = deltas_us[(head - count + i + kWindowSize) % kWindowSize] - mean_delta_us;
         var_sum += d * d;
     }
+    float raw_stddev = std::sqrt(var_sum / static_cast<float>(count));
+
+    // Second pass: exclude outliers > 3σ from mean, recompute stats
+    // This prevents a single anomalous frame from polluting the window.
+    float threshold = raw_stddev * 3.0f;
+    if (threshold > 0.0f && count >= 8) {
+        float filt_sum = 0.0f;
+        int filt_count = 0;
+        for (int i = 0; i < count; i++) {
+            float v = deltas_us[(head - count + i + kWindowSize) % kWindowSize];
+            if (std::abs(v - mean_delta_us) <= threshold) {
+                filt_sum += v;
+                filt_count++;
+            }
+        }
+        // Only use filtered stats if we didn't reject too many samples
+        // (rejecting > 25% suggests real instability, not outliers)
+        if (filt_count >= count * 3 / 4 && filt_count >= 4) {
+            float filt_mean = filt_sum / static_cast<float>(filt_count);
+            float filt_var = 0.0f;
+            for (int i = 0; i < count; i++) {
+                float v = deltas_us[(head - count + i + kWindowSize) % kWindowSize];
+                if (std::abs(v - mean_delta_us) <= threshold) {
+                    float d = v - filt_mean;
+                    filt_var += d * d;
+                }
+            }
+            mean_delta_us = filt_mean;
+            variance_us2 = filt_var / static_cast<float>(filt_count);
+            stddev_us = std::sqrt(variance_us2);
+            return;
+        }
+    }
+
+    // Fallback: use unfiltered stats (small window or no outliers)
     variance_us2 = var_sum / static_cast<float>(count);
     stddev_us = std::sqrt(variance_us2);
 }
@@ -181,6 +219,21 @@ float QPCCadenceMonitor::ComputeCV() const {
     return stddev / mean;
 }
 
+float QPCCadenceMonitor::ComputeStddev() const {
+    if (count < 4) return 0.0f;
+    float sum = 0.0f;
+    for (int i = 0; i < count; i++)
+        sum += deltas_us[(head - count + i + kWindowSize) % kWindowSize];
+    float mean = sum / static_cast<float>(count);
+    if (mean == 0.0f) return 0.0f;
+    float var_sum = 0.0f;
+    for (int i = 0; i < count; i++) {
+        float d = deltas_us[(head - count + i + kWindowSize) % kWindowSize] - mean;
+        var_sum += d * d;
+    }
+    return std::sqrt(var_sum / static_cast<float>(count));
+}
+
 void QPCCadenceMonitor::Reset() {
     last_qpc = 0;
     head = 0;
@@ -210,12 +263,21 @@ void ConsistencyBuffer::Reset(int fg_divisor) {
     consecutive_stable_ticks = 0;
 }
 
-void ConsistencyBuffer::Tick(float cadence_stddev_us, float qpc_cv, float vrr_proximity, bool dmfg) {
+void ConsistencyBuffer::Tick(float cadence_stddev_us, float qpc_cv, float qpc_stddev_us,
+                             float vrr_proximity, bool fg_active,
+                             float render_interval_us) {
     // QPC brake: immediate STABILIZE on QPC variance spike.
-    // Disabled for DMFG — driver-injected frames cause inherently high QPC
-    // variance from the app's perspective; cadence stddev is the only
-    // reliable stability signal.
-    if (!dmfg && qpc_cv > active_params.qpc_brake_threshold_cv) {
+    //
+    // Under FG the QPC monitor measures present-to-present (output) intervals,
+    // but the alternating real/generated cadence inflates the raw CV.  Instead
+    // of disabling the brake, re-normalise: compare QPC stddev against the
+    // render interval so it still catches real submission jitter without
+    // false-triggering on the normal FG interleaving pattern.
+    float effective_cv = qpc_cv;
+    if (fg_active && render_interval_us > 0.0f && qpc_stddev_us > 0.0f) {
+        effective_cv = qpc_stddev_us / render_interval_us;
+    }
+    if (effective_cv > active_params.qpc_brake_threshold_cv) {
         mode = Mode::Stabilize;
         consecutive_stable_ticks = 0;
     }
@@ -253,7 +315,7 @@ void ConsistencyBuffer::Tick(float cadence_stddev_us, float qpc_cv, float vrr_pr
     }
 
     // Final clamp
-    if (buffer_us < 0) buffer_us = 0;
+    if (buffer_us < active_params.min_buffer_us) buffer_us = active_params.min_buffer_us;
     if (buffer_us > active_params.max_buffer_us) buffer_us = active_params.max_buffer_us;
 }
 
@@ -304,7 +366,7 @@ void DiagCSVLogger::Open(HMODULE addon_module) {
     }
 
     fprintf(file, "timestamp,smoothness,cadence_stddev_us,cadence_mean_delta_us,"
-                  "cadence_cv,qpc_cv,gsync_active,cb_mode,cb_buffer_us,"
+                  "cadence_cv,qpc_cv,qpc_cv_render,gsync_active,cb_mode,cb_buffer_us,"
                   "pred_gpu_us,pred_sim_us,pred_fg_us,enforcement_site,"
                   "queue_depth,fg_tier,vrr_proximity,gpu_load_ratio,final_interval_us\n");
     fflush(file);
@@ -318,6 +380,7 @@ void DiagCSVLogger::WriteRow(int64_t timestamp_qpc,
                              float cadence_mean_delta_us,
                              float cadence_cv,
                              float qpc_cv,
+                             float qpc_cv_render,
                              bool gsync_active,
                              ConsistencyBuffer::Mode cb_mode,
                              int32_t cb_buffer_us,
@@ -333,13 +396,14 @@ void DiagCSVLogger::WriteRow(int64_t timestamp_qpc,
     if (!enabled || !file) return;
 
     const char* mode_str = (cb_mode == ConsistencyBuffer::Mode::Tighten) ? "TIGHTEN" : "STABILIZE";
-    fprintf(file, "%lld,%.2f,%.2f,%.2f,%.6f,%.6f,%d,%s,%d,%.2f,%.2f,%.2f,%d,%d,%d,%.4f,%.4f,%u\n",
+    fprintf(file, "%lld,%.2f,%.2f,%.2f,%.6f,%.6f,%.6f,%d,%s,%d,%.2f,%.2f,%.2f,%d,%d,%d,%.4f,%.4f,%u\n",
             static_cast<long long>(timestamp_qpc),
             smoothness,
             cadence_stddev_us,
             cadence_mean_delta_us,
             cadence_cv,
             qpc_cv,
+            qpc_cv_render,
             gsync_active ? 1 : 0,
             mode_str,
             cb_buffer_us,
@@ -759,29 +823,28 @@ int UlLimiter::DetectFGDivisor() const {
     UINT game_lat = GetGameRequestedLatency();
     int lat_hint = 1;
     if (!fg_dll && !fsr_dll) {
-        // No FG DLL — driver-side DMFG or no FG at all.
-        // Generated frames are injected by the driver below the swapchain,
-        // so OnPresent only fires for real frames and we can't observe the
-        // actual multiplier directly.
-        // Empirically, the game's MaxFrameLatency value matches the DMFG
-        // multiplier shown in the NVIDIA overlay (e.g. game_lat=6 → 6x FG).
-        // Use it directly as the tier.
         if (game_lat >= 3) {
             lat_hint = static_cast<int>(game_lat);
             if (lat_hint > 6) lat_hint = 6;
         }
     }
 
-    // If cadence data has refined the tier, use the higher of cadence vs latency hint.
-    // This prevents cadence from downgrading a known DMFG session to 2x.
-    if (last_fg_tier_ > 1) return (lat_hint > last_fg_tier_) ? lat_hint : last_fg_tier_;
+    // FPS-based monitor is ground truth for runtime FG state.
+    // It detects FG on/off from the output/native FPS ratio.
+    // When it has data, trust it over DLL presence (DLLs stay loaded
+    // even when the game disables FG, e.g. in menus).
+    int fps_tier = ul_fg_monitor::GetTier();
+    if (fps_tier >= 2) return fps_tier;
+    if (fps_tier == 0 && ul_fg_monitor::HasData()) return 1;  // confirmed no FG
 
-    // Use latency hint if available (driver-side DMFG only, no DLL)
+    // No FPS-based data yet — fall back to static detection.
+    // DMFG latency hint (no DLL case)
     if (lat_hint > 1) return lat_hint;
 
-    if (!fg_dll && !fsr_dll) return 1;
+    // DLL loaded = assume 2x until FPS monitor confirms otherwise
+    if (fg_dll || fsr_dll) return 2;
 
-    return 2;  // standard 2x FG (DLSS FG or FSR FG)
+    return 1;
 }
 
 // Compute the Reflex cap from the monitor refresh rate.
@@ -819,6 +882,14 @@ float UlLimiter::ComputeRenderFps() const {
         float cap = ComputeReflexCapFromMonitor(hwnd_);
         if (cap <= 0.0f) return 0.0f;
         return cap / static_cast<float>(div);
+    }
+
+    // In GPU overload mode, use actual render rate from cadence measurement
+    // instead of the unreachable target. This makes sleep interval, GPU load,
+    // and all adaptive thresholds compute against reality.
+    if (gpu_overload_mode_ && pipeline_predictor_.cadence.count >= 8
+        && pipeline_predictor_.cadence.mean_delta_us > 0.0f) {
+        return 1'000'000.0f / pipeline_predictor_.cadence.mean_delta_us;
     }
 
     int div = DetectFGDivisor();
@@ -924,6 +995,11 @@ void UlLimiter::ResetAdaptiveState() {
     ptp_sample_count_ = 0;
     last_ptp_present_ns_ = 0;
     last_pred_frame_id_ = 0;
+    gpu_overload_mode_ = false;
+    gpu_overload_count_ = 0;
+    gpu_recover_count_ = 0;
+    pll_smoothed_error_ns_ = 0.0f;
+    last_pll_frame_id_ = 0;
 
     grid_epoch_ns_ = 0;
     grid_next_ns_ = 0;
@@ -1021,9 +1097,10 @@ NvSleepParams UlLimiter::BuildSleepParams() const {
         ? static_cast<NvU32>(std::round(1'000'000.0 / static_cast<double>(render_fps)))
         : 0;
 
-    // Predictive sleep — mode-dependent
-    if (raw_interval > 0 && pipeline_predictor_.active) {
-        bool fg = (DetectFGDivisor() > 1);
+    // Predictive sleep — 1:1 path only, when GPU has headroom
+    bool fg = (DetectFGDivisor() > 1);
+    if (raw_interval > 0 && pipeline_predictor_.active
+        && !(pipeline_stats_.valid && pipeline_stats_.gpu_load_ratio > 1.0f)) {
         if (!fg) {
             if (pipeline_stats_.auto_site == SIM_START) {
                 NvU32 predictive_interval = static_cast<NvU32>(
@@ -1213,6 +1290,46 @@ void UlLimiter::UpdatePipelineStats() {
     if (target_interval_us > 0.0f) {
         ps.gpu_load_ratio = ps.avg_gpu_active_us / target_interval_us;
         ps.pipeline_load_ratio = ps.avg_pipeline_total_us / target_interval_us;
+
+        // --- GPU overload mode detection ---
+        // When the GPU can't sustain the target render rate, switch the interval
+        // basis to actual render FPS so all adaptive systems get sane inputs.
+        // Only evaluate when GPU load gate is open (gameplay, not menus/loading).
+        if (gpu_load_gate_open_) {
+            float target_load = ps.gpu_load_ratio;  // computed against target interval
+
+            if (!gpu_overload_mode_) {
+                if (target_load > 1.05f) {
+                    gpu_overload_count_++;
+                    gpu_recover_count_ = 0;
+                    if (gpu_overload_count_ >= kOverloadThreshold) {
+                        gpu_overload_mode_ = true;
+                        ul_log::Write("GPU overload: switching to actual render FPS (load=%.2f)", target_load);
+                    }
+                } else {
+                    gpu_overload_count_ = 0;
+                }
+            } else {
+                // In overload mode — check if GPU has recovered
+                if (target_load < 0.95f) {
+                    gpu_recover_count_++;
+                    gpu_overload_count_ = 0;
+                    if (gpu_recover_count_ >= kOverloadThreshold) {
+                        gpu_overload_mode_ = false;
+                        ul_log::Write("GPU recovered: switching back to target render FPS (load=%.2f)", target_load);
+                    }
+                } else {
+                    gpu_recover_count_ = 0;
+                }
+
+                // Recompute load ratio against actual interval
+                if (pipeline_predictor_.cadence.mean_delta_us > 0.0f) {
+                    ps.gpu_load_ratio = ps.avg_gpu_active_us / pipeline_predictor_.cadence.mean_delta_us;
+                    ps.pipeline_load_ratio = ps.avg_pipeline_total_us / pipeline_predictor_.cadence.mean_delta_us;
+                }
+            }
+        }
+
         if (ps.gpu_load_ratio < 0.70f)
             ps.interval_adjust_us = -3;
         else if (ps.gpu_load_ratio > 0.90f)
@@ -1243,10 +1360,13 @@ void UlLimiter::UpdatePipelineStats() {
 
     // Auto enforcement site (enhanced with bottleneck + FG awareness)
     if (fg_active) {
-        if (ps.gpu_load_ratio < 0.60f)
+        // Hysteresis band: only switch when gpu_load crosses 0.55 or 0.70
+        // to avoid oscillation when hovering near the boundary.
+        if (ps.gpu_load_ratio < 0.55f)
             ps.auto_site = SIM_START;
-        else
+        else if (ps.gpu_load_ratio > 0.70f)
             ps.auto_site = PRESENT_FINISH;
+        // else: keep previous site (dead zone)
     } else if (ps.bottleneck == Bottleneck::Gpu)
         ps.auto_site = SIM_START;
     else if (ps.bottleneck == Bottleneck::CpuSim || ps.bottleneck == Bottleneck::CpuSubmit)
@@ -1264,13 +1384,25 @@ void UlLimiter::UpdatePipelineStats() {
     else
         ps.queue_pressure = false;
 
-    // Adaptive DLSSG pacing offset
+    // Adaptive DLSSG pacing offset (with rate-of-change clamping)
     if (fg_active && n_fg > 0) {
         int32_t measured = static_cast<int32_t>(std::round(ps.avg_fg_overhead_us));
         measured = std::clamp(measured, 4, 60);
+
+        // Clamp rate of change to ±2µs per tick to prevent oscillation
+        // under GPU-bound conditions where FG overhead fluctuates.
+        if (ps.prev_adaptive_fg_offset_us >= 0) {
+            int32_t delta = measured - ps.prev_adaptive_fg_offset_us;
+            constexpr int32_t kMaxDelta = 2;
+            if (delta > kMaxDelta) measured = ps.prev_adaptive_fg_offset_us + kMaxDelta;
+            else if (delta < -kMaxDelta) measured = ps.prev_adaptive_fg_offset_us - kMaxDelta;
+            measured = std::clamp(measured, 4, 60);
+        }
+        ps.prev_adaptive_fg_offset_us = measured;
         ps.adaptive_fg_offset_us = measured;
     } else if (!fg_active) {
         ps.adaptive_fg_offset_us = -1;
+        ps.prev_adaptive_fg_offset_us = -1;
     }
 
     // Predictive sleep — pipeline-aware wake scheduling
@@ -1350,81 +1482,81 @@ void UlLimiter::UpdatePipelineStats() {
         pred.cadence.ComputeStats();
     }
 
+    // --- PLL: phase-locked grid correction from display feedback ---
+    // Use the most recent presentEndTime to measure phase error between
+    // our grid and actual display timing. Nudge grid epoch to converge.
+    if (grid_interval_ns_ > 0 && grid_epoch_ns_ > 0) {
+        uint64_t newest_id = 0;
+        uint64_t newest_present = 0;
+        for (int i = 0; i < 64; i++) {
+            auto& f = latency_buf_->frameReport[i];
+            if (f.frameID > newest_id && f.presentEndTime > 0) {
+                newest_id = f.frameID;
+                newest_present = f.presentEndTime;
+            }
+        }
+
+        if (newest_id > last_pll_frame_id_ && newest_present > 0) {
+            last_pll_frame_id_ = newest_id;
+
+            // Convert presentEndTime (QPC ticks) to nanoseconds
+            int64_t actual_ns = static_cast<int64_t>(
+                static_cast<double>(newest_present) * 1e9
+                / static_cast<double>(ul_timing::g_qpc_freq));
+
+            // Nearest grid slot to the actual present time
+            int64_t elapsed = actual_ns - grid_epoch_ns_;
+            int64_t expected_slot = (elapsed / grid_interval_ns_) * grid_interval_ns_
+                                  + grid_epoch_ns_;
+            int64_t phase_error_ns = actual_ns - expected_slot;
+
+            // Wrap to [-interval/2, +interval/2] for slot ambiguity
+            if (phase_error_ns > grid_interval_ns_ / 2)
+                phase_error_ns -= grid_interval_ns_;
+            else if (phase_error_ns < -grid_interval_ns_ / 2)
+                phase_error_ns += grid_interval_ns_;
+
+            // EMA smooth the error
+            pll_smoothed_error_ns_ = pll_smoothed_error_ns_ * (1.0f - kPllAlpha)
+                                   + static_cast<float>(phase_error_ns) * kPllAlpha;
+
+            // Nudge grid epoch
+            int64_t correction = static_cast<int64_t>(
+                pll_smoothed_error_ns_ * kPllCorrectionGain);
+            if (correction != 0)
+                grid_epoch_ns_ += correction;
+        }
+    }
+
     // --- GPU Load Gate ---
     // When GPU load is below 50%, freeze ConsistencyBuffer tick only.
     // DynamicPacing and BoostController continue running as before.
+    bool was_gate_open = gpu_load_gate_open_;
     gpu_load_gate_open_ = (ps.gpu_load_ratio >= 0.50f);
+
+    // Flush overload state when transitioning from gameplay to menu/loading
+    // (gate closing). Overload detection from gameplay is invalid in menus.
+    if (was_gate_open && !gpu_load_gate_open_) {
+        gpu_overload_mode_ = false;
+        gpu_overload_count_ = 0;
+        gpu_recover_count_ = 0;
+    }
 
     if (gpu_load_gate_open_) {
         // --- FG tier change detection ---
-        // DetectFGDivisor() returns the latency-hint-aware base tier.
-        // Refine the actual multiplier from cadence data when available.
-        // Promotions are instant; demotions require sustained confirmation
-        // to avoid false downgrades from transient load spikes.
-        //
-        // DMFG floor: when the game's requested latency implies a high tier
-        // (e.g. latency=6 → tier 4), cadence-based demotion must never go
-        // below that floor. Without this, the feedback loop (wrong tier →
-        // wrong sleep interval → cadence reads ~2x → confirms demotion to 2)
-        // defeats the latency hint entirely.
+        // DetectFGDivisor() returns the latency-hint-aware base tier (DLL
+        // presence for standard FG, latency hint for DMFG).
+        // g_fps_fg_tier (from main.cpp) provides the FPS-based multiplier
+        // computed from output_fps / native_fps — immune to GPU load
+        // inflating cadence mean_delta.  Prefer it when available.
         int fg_tier = DetectFGDivisor();
-        int dmfg_floor = fg_tier;  // latency-hint tier before cadence refinement
-        is_dmfg_ = (dmfg_floor >= 3);  // tier from latency hint = driver-side DMFG
-        if (fg_tier > 1 && pipeline_predictor_.cadence.count >= 8
-            && pipeline_predictor_.cadence.mean_delta_us > 0.0f) {
-            float target_fps = g_cfg.fps_limit.load(std::memory_order_relaxed);
-            float ratio = 0.0f;
-            if (target_fps > 0.0f) {
-                // Capped: cadence mean_delta is the render frame interval (from
-                // GetLatency, which only reports real frames). The FG multiplier
-                // is render_interval / output_interval.
-                float output_interval_us = 1'000'000.0f / target_fps;
-                ratio = pipeline_predictor_.cadence.mean_delta_us / output_interval_us;
-            }
-            // For DMFG (no DLL), DetectFGDivisor() already returns the correct
-            // tier from the latency hint. No cadence refinement needed — the
-            // driver controls frame injection below the swapchain level so we
-            // can't observe the actual multiplier from either cadence or QPC.
-            if (ratio > 1.3f) {
-                int cadence_tier = 2;
-                if (ratio > 5.5f)      cadence_tier = 6;
-                else if (ratio > 4.5f) cadence_tier = 5;
-                else if (ratio > 3.5f) cadence_tier = 4;
-                else if (ratio > 2.5f) cadence_tier = 3;
+        int dmfg_floor = fg_tier;
+        is_dmfg_ = (dmfg_floor >= 3);
 
-                // Cadence can never demote below the DMFG latency hint floor.
-                // The sleep interval is computed from fg_tier, so cadence measured
-                // under the wrong tier is not a valid demotion signal.
-                if (cadence_tier < dmfg_floor) cadence_tier = dmfg_floor;
-
-                if (cadence_tier > last_fg_tier_ || last_fg_tier_ <= 1) {
-                    // Promotion: accept immediately
-                    fg_tier = cadence_tier;
-                    pending_fg_tier_ = 0;
-                    fg_tier_confirm_ticks_ = 0;
-                } else if (cadence_tier < last_fg_tier_) {
-                    // Demotion: require 30 consecutive ticks at lower tier
-                    if (cadence_tier == pending_fg_tier_) {
-                        fg_tier_confirm_ticks_++;
-                        if (fg_tier_confirm_ticks_ >= 30) {
-                            fg_tier = cadence_tier;
-                            pending_fg_tier_ = 0;
-                            fg_tier_confirm_ticks_ = 0;
-                        } else {
-                            fg_tier = last_fg_tier_;  // hold current tier
-                        }
-                    } else {
-                        pending_fg_tier_ = cadence_tier;
-                        fg_tier_confirm_ticks_ = 1;
-                        fg_tier = last_fg_tier_;  // hold current tier
-                    }
-                } else {
-                    // Same tier: reset demotion counter
-                    fg_tier = last_fg_tier_;
-                    pending_fg_tier_ = 0;
-                    fg_tier_confirm_ticks_ = 0;
-                }
-            }
+        // FPS-based tier override (DLL-based FG only — DMFG uses latency hint)
+        int fps_tier = ul_fg_monitor::GetTier();
+        if (!is_dmfg_ && fps_tier >= 2) {
+            fg_tier = fps_tier;
         }
         if (fg_tier != last_fg_tier_) {
             // Only reset the consistency buffer when the tuning params actually
@@ -1437,6 +1569,14 @@ void UlLimiter::UpdatePipelineStats() {
                 || consistency_buf_.active_params.max_buffer_us != prev_params.max_buffer_us) {
                 consistency_buf_.Reset(fg_tier);
             }
+
+            // Flush GPU overload state — FG state change fundamentally changes
+            // what "target render FPS" means, so overload detection from the
+            // previous FG state is invalid.
+            gpu_overload_mode_ = false;
+            gpu_overload_count_ = 0;
+            gpu_recover_count_ = 0;
+
             last_fg_tier_ = fg_tier;
         }
 
@@ -1473,11 +1613,17 @@ void UlLimiter::UpdatePipelineStats() {
         float cadence_stddev_us = (pipeline_predictor_.cadence.count >= 8)
             ? pipeline_predictor_.cadence.stddev_us : 0.0f;
 
-        // --- QPC CV ---
+        // --- QPC CV + stddev ---
         float qpc_cv = qpc_monitor_.ComputeCV();
+        float qpc_stddev_us = qpc_monitor_.ComputeStddev();
+
+        // Render interval from cadence tracker (real frames only via GetLatency)
+        float render_interval_us = (pipeline_predictor_.cadence.count >= 8)
+            ? pipeline_predictor_.cadence.mean_delta_us : 0.0f;
 
         // --- Tick consistency buffer state machine ---
-        consistency_buf_.Tick(cadence_stddev_us, qpc_cv, vrr_proximity, is_dmfg_);
+        consistency_buf_.Tick(cadence_stddev_us, qpc_cv, qpc_stddev_us,
+                             vrr_proximity, fg_tier > 1, render_interval_us);
 
         // --- Expanded diagnostic CSV logging ---
         if (g_cfg.csv_diagnostics.load(std::memory_order_relaxed) && diag_csv_logger_.enabled) {
@@ -1503,6 +1649,12 @@ void UlLimiter::UpdatePipelineStats() {
             if (smoothness < 0.0f) smoothness = 0.0f;
             if (smoothness > 100.0f) smoothness = 100.0f;
 
+            // Compute render-relative QPC CV for diagnostics (same logic as
+            // ConsistencyBuffer::Tick uses for the brake decision).
+            float qpc_cv_render = qpc_cv;
+            if (fg_tier > 1 && render_interval_us > 0.0f && qpc_stddev_us > 0.0f)
+                qpc_cv_render = qpc_stddev_us / render_interval_us;
+
             diag_csv_logger_.WriteRow(
                 ul_timing::NowQpc(),
                 smoothness,
@@ -1511,6 +1663,7 @@ void UlLimiter::UpdatePipelineStats() {
                     ? pipeline_predictor_.cadence.mean_delta_us : 0.0f,
                 diag_cv,
                 qpc_cv,
+                qpc_cv_render,
 #ifdef _WIN64
                 gsync_detector_.gsync_active,
 #else
@@ -1547,7 +1700,12 @@ void UlLimiter::UpdatePipelineStats() {
         else if (margin > 800.0f || miss_rate > 0.10f)
             suggested = 2;
 
-        if (fg_active && suggested < 2)
+        // FG floor: when the GPU has no meaningful safety margin, FG needs
+        // deeper queuing to absorb cadence variance from the generation
+        // pipeline.  When margin is healthy the limiter controls cadence
+        // and q=1 is fine.  Reuses the same margin threshold (400µs) that
+        // the base suggestion logic considers "tight".
+        if (fg_active && margin < 400.0f && suggested < 2)
             suggested = 2;
         if (ps.queue_pressure)
             suggested = (std::min)(suggested + 1, 3);
@@ -1586,10 +1744,9 @@ void UlLimiter::UpdatePipelineStats() {
                     int votes_shallower = 0;
                     for (int d = 1; d < current; d++) votes_shallower += counts[d];
                     if (votes_shallower >= static_cast<int>(dp.vote_count * 0.80f)) {
-                        int best = current - 1;
-                        for (int d = 1; d < current - 1; d++)
-                            if (counts[d] > counts[best]) best = d;
-                        dp.queue_depth = (std::max)(1, best);
+                        // Demote by one step only — avoid large jumps (e.g. 3→1)
+                        // that cause cadence disruption under FG.
+                        dp.queue_depth = current - 1;
                         dp.last_change_qpc = now_qpc;
                     }
                 }
@@ -1643,6 +1800,106 @@ void UlLimiter::DoReflexSleep() {
     NvSleepParams p = BuildSleepParams();
     MaybeUpdateSleepMode(p);
     InvokeSleep(dev_);
+}
+
+// ============================================================================
+// Own-the-sleep unified pacer — replaces dual DoReflexSleep + DoTimingFallback
+// ============================================================================
+//
+// Single pacer: our high-res timers handle all sleep timing via the
+// phase-locked grid. Reflex receives the real interval for driver state
+// management (queue management, boost, markers) but InvokeSleep returns
+// near-instantly since we already consumed the wait time.
+
+void UlLimiter::DoOwnSleep() {
+    // Vulkan path: update driver hints, then use our grid for timing
+#ifdef _WIN64
+    if (VK_REFLEX_ACTIVE()) {
+        if (g_game_uses_reflex.load(std::memory_order_relaxed))
+            return;
+
+        NvSleepParams p = BuildSleepParams();
+        if (p.minimumIntervalUs == 0) return;
+
+        vk_reflex_->SetSleepMode(
+            p.bLowLatencyMode != 0,
+            p.bLowLatencyBoost != 0,
+            p.minimumIntervalUs);
+
+        // Grid sleep with our timers
+        int64_t frame_ns = static_cast<int64_t>(p.minimumIntervalUs) * 1000LL;
+        int64_t now = ul_timing::NowNs();
+
+        if (grid_epoch_ns_ == 0) {
+            grid_epoch_ns_ = now;
+            grid_interval_ns_ = frame_ns;
+            grid_next_ns_ = now + frame_ns;
+        } else {
+            constexpr float kGridAlpha = 0.05f;
+            grid_interval_ns_ = static_cast<int64_t>(
+                grid_interval_ns_ * (1.0 - kGridAlpha) + frame_ns * kGridAlpha);
+            if (grid_next_ns_ > now) {
+                ul_timing::SleepUntilNs(grid_next_ns_, htimer_fallback_);
+                grid_next_ns_ += grid_interval_ns_;
+            } else {
+                int64_t elapsed = now - grid_epoch_ns_;
+                int64_t slots = elapsed / grid_interval_ns_;
+                grid_next_ns_ = grid_epoch_ns_ + (slots + 1) * grid_interval_ns_;
+            }
+        }
+        return;  // Vulkan path complete — no DX passthrough
+    }
+#endif
+
+    // DX path
+    if (!ReflexActive() || !dev_) return;
+
+    // Build params — real interval for both grid and driver hint
+    NvSleepParams p = BuildSleepParams();
+    if (p.minimumIntervalUs == 0) return;
+
+    // Convert adjusted interval to nanoseconds for the grid
+    int64_t frame_ns = static_cast<int64_t>(p.minimumIntervalUs) * 1000LL;
+    int64_t now = ul_timing::NowNs();
+
+    // --- Phase-locked grid (DX path) ---
+    if (grid_epoch_ns_ == 0) {
+        // First frame — establish grid, no sleep
+        grid_epoch_ns_ = now;
+        grid_interval_ns_ = frame_ns;
+        grid_next_ns_ = now + frame_ns;
+    } else {
+        // Smooth the grid interval to prevent sawtooth from frame-to-frame
+        // micro-oscillations in adaptive corrections. Sustained changes
+        // (consistency buffer, FG offset) still converge in ~20 frames.
+        constexpr float kGridAlpha = 0.05f;
+        grid_interval_ns_ = static_cast<int64_t>(
+            grid_interval_ns_ * (1.0 - kGridAlpha) + frame_ns * kGridAlpha);
+
+        if (grid_next_ns_ > now) {
+            // Frame arrived early — sleep until grid slot
+            ul_timing::SleepUntilNs(grid_next_ns_, htimer_fallback_);
+            grid_next_ns_ += grid_interval_ns_;
+        } else {
+            // Frame arrived late — snap grid forward to next slot ahead of now
+            int64_t elapsed = now - grid_epoch_ns_;
+            int64_t slots = elapsed / grid_interval_ns_;
+            grid_next_ns_ = grid_epoch_ns_ + (slots + 1) * grid_interval_ns_;
+        }
+    }
+
+    // --- Reflex passthrough ---
+    // Pass real interval so driver maintains correct internal state.
+    // InvokeSleep returns near-instantly since we already consumed the wait.
+    // SEH guard: device/swapchain can be in a transitional state during
+    // alt-tab or swapchain recreation — protect against driver crashes.
+    __try {
+        MaybeUpdateSleepMode(p);
+        InvokeSleep(dev_);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        // Silently absorb — the grid sleep already paced the frame.
+        // The driver will recover on the next valid call.
+    }
 }
 
 // ============================================================================
@@ -1701,6 +1958,7 @@ void UlLimiter::OnMarker(int marker_type, uint64_t frame_id) {
     bool has_reflex = (ReflexActive() && dev_) || VK_REFLEX_ACTIVE();
     if (!has_reflex) return;
     if (!warmup_done_) return;
+    if (is_background_) return;
 
     if (s_smooth_motion.load(std::memory_order_relaxed)) return;
 
@@ -1721,7 +1979,7 @@ void UlLimiter::OnMarker(int marker_type, uint64_t frame_id) {
         effective_site = PRESENT_BEGIN;
 
     if (marker_type == effective_site)
-        DoReflexSleep();
+        DoOwnSleep();
 }
 
 // ============================================================================
@@ -1808,6 +2066,10 @@ void UlLimiter::OnPresent() {
         } else if (!bg && is_background_) {
             is_background_ = false;
             ResetAdaptiveState();
+            // Clear stale FPS-based FG tier — background limiter distorts
+            // the output/native FPS ratio.  Falls back to DLL-based detection
+            // until the ratio stabilizes after warmup.
+            ul_fg_monitor::Reset();
             ul_log::Write("Background: refocused, full reset");
         }
         if (is_background_) {
@@ -1827,9 +2089,16 @@ void UlLimiter::OnPresent() {
                 grid_next_ns_ = now_ns + bg_ns;
             } else {
                 grid_interval_ns_ = bg_ns;
-                if (grid_next_ns_ > now_ns)
-                    ul_timing::SleepUntilNs(grid_next_ns_, htimer_fallback_);
-                grid_next_ns_ += bg_ns;
+                if (grid_next_ns_ > now_ns) {
+                    // Cap sleep to one background interval to prevent blocking
+                    // the render thread when alt-tabbing back into the game.
+                    // Without this, grid_next_ns_ can drift far ahead and
+                    // SleepUntilNs blocks indefinitely on refocus.
+                    int64_t max_wake = now_ns + bg_ns;
+                    int64_t wake = (grid_next_ns_ < max_wake) ? grid_next_ns_ : max_wake;
+                    ul_timing::SleepUntilNs(wake, htimer_fallback_);
+                }
+                grid_next_ns_ = now_ns + bg_ns;
             }
             return;
         }
@@ -1851,12 +2120,17 @@ void UlLimiter::OnPresent() {
         bool vsync_changed = (s_last_vsync >= 0 && cur_vsync != s_last_vsync);
         bool excl_changed = (s_last_vsync >= 0 && cur_excl != s_last_excl);
 
-        if (fps_changed || vsync_changed || excl_changed)
+        // Detect FG divisor change (FG turning on/off) as a settings-level reset trigger
+        int cur_fg_div = DetectFGDivisor();
+        bool fg_changed = (last_fg_div_ > 0 && cur_fg_div != last_fg_div_);
+
+        if (fps_changed || vsync_changed || excl_changed || fg_changed)
             ResetAdaptiveState();
 
         last_fps_limit_ = cur_fps;
         s_last_vsync = cur_vsync;
         s_last_excl = cur_excl;
+        last_fg_div_ = cur_fg_div;
 
         if (pipeline_stats_.pacing.vote_window_size <= 0 && cur_fps > 0.0f)
             pipeline_stats_.pacing.ResizeWindow(cur_fps);
@@ -1921,29 +2195,27 @@ void UlLimiter::OnPresent() {
     }
 
     // Reflex path — DX or Vulkan
+    // DoOwnSleep handles all timing via our grid, then passes through to
+    // Reflex for driver state management. No separate DoTimingFallback needed.
     bool vk_active = VK_REFLEX_ACTIVE();
     bool vk_native = vk_active && g_game_uses_reflex.load(std::memory_order_relaxed);
     if (vk_active) {
         // When the game uses native Reflex, it handles its own sleep cycle.
-        // We don't call SetSleepMode or Sleep to avoid conflicts/crashes.
-        // For non-native games, update driver hints only (no semaphore wait).
         if (!vk_native)
-            DoReflexSleep();
+            DoOwnSleep();
     } else if (ReflexActive() && dev_) {
         if (g_game_uses_reflex.load(std::memory_order_relaxed)) {
+            // Marker pacing — OnMarker calls DoOwnSleep at enforcement site.
+            // Just update sleep mode params here (no sleep, no grid).
             NvSleepParams p = BuildSleepParams();
             MaybeUpdateSleepMode(p);
         } else {
-            DoReflexSleep();
+            DoOwnSleep();
         }
+    } else {
+        // Non-Reflex games — timing grid is the only pacer
+        DoTimingFallback();
     }
-
-    // Timing fallback — always runs as a hard backstop.
-    // For Vulkan (native or not) this is the primary/backstop pacer.
-    // For DX non-Reflex games this is the only pacer.
-    // For DX Reflex games, InvokeSleep already blocked above, but
-    // DoTimingFallback gracefully no-ops when the frame is already late.
-    DoTimingFallback();
 }
 
 // ============================================================================
@@ -1953,5 +2225,5 @@ void UlLimiter::OnPresent() {
 void UlLimiter::OnSLPresent() {
     if (!g_cfg.use_sl_proxy.load(std::memory_order_relaxed)) return;
     if (!ReflexActive() || !dev_) return;
-    DoReflexSleep();
+    DoOwnSleep();
 }

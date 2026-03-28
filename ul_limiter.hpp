@@ -96,6 +96,7 @@ struct PipelineStats {
     int auto_site = 5;  // PRESENT_FINISH default
     int32_t interval_adjust_us = 0;
     int32_t adaptive_fg_offset_us = -1;
+    int32_t prev_adaptive_fg_offset_us = -1;  // previous tick value for rate-of-change clamping
     bool queue_pressure = false;
 
     Bottleneck bottleneck = Bottleneck::None;
@@ -164,6 +165,7 @@ struct QPCCadenceMonitor {
 
     void Feed(int64_t now_qpc);
     float ComputeCV() const;
+    float ComputeStddev() const;
     void Reset();
 };
 
@@ -181,6 +183,7 @@ struct ConsistencyBuffer {
     struct TuningParams {
         int32_t initial_buffer_us;
         int32_t max_buffer_us;
+        int32_t min_buffer_us;       // floor — TIGHTEN won't drain below this
         int32_t stabilize_step_us;
         int32_t tighten_step_us;
         float stability_threshold_us;
@@ -189,14 +192,16 @@ struct ConsistencyBuffer {
         float qpc_brake_threshold_cv;
     };
 
-    static constexpr TuningParams kTier1x1      = {4,  20, 2, 1, 1000.0f, 3000.0f, 15, 0.12f};
-    static constexpr TuningParams kTier2xFG     = {12, 50, 4, 2, 700.0f, 2000.0f, 12, 0.10f};
-    static constexpr TuningParams kTier3xMFG    = {20, 80, 6, 3, 500.0f, 1500.0f, 10, 0.10f};
-    static constexpr TuningParams kTier4xPlusMFG = {30, 120, 8, 4, 400.0f, 1200.0f, 8, 0.10f};
+    static constexpr TuningParams kTier1x1      = {4,  20,  0, 2, 1, 1000.0f, 3000.0f, 15, 0.12f};
+    static constexpr TuningParams kTier2xFG     = {12, 50,  0, 4, 2, 700.0f, 2500.0f, 12, 0.10f};
+    static constexpr TuningParams kTier3xMFG    = {20, 80, 10, 6, 3, 500.0f, 2000.0f, 10, 0.10f};
+    static constexpr TuningParams kTier4xPlusMFG = {30, 120, 20, 8, 4, 400.0f, 1600.0f, 8, 0.10f};
 
     TuningParams active_params = kTier1x1;
 
-    void Tick(float cadence_stddev_us, float qpc_cv, float vrr_proximity, bool dmfg = false);
+    void Tick(float cadence_stddev_us, float qpc_cv, float qpc_stddev_us,
+             float vrr_proximity, bool fg_active = false,
+             float render_interval_us = 0.0f);
     void SelectTier(int fg_divisor);
     void Reset(int fg_divisor);
 };
@@ -217,6 +222,7 @@ struct DiagCSVLogger {
                   float cadence_mean_delta_us,
                   float cadence_cv,
                   float qpc_cv,
+                  float qpc_cv_render,
                   bool gsync_active,
                   ConsistencyBuffer::Mode cb_mode,
                   int32_t cb_buffer_us,
@@ -382,6 +388,7 @@ private:
     int DetectFGDivisor() const;
 
     void DoReflexSleep();
+    void DoOwnSleep();
     void DoTimingFallback();
     void HandleDelayPresent(uint64_t frame_id);
     void HandleQueuedFrames(uint64_t frame_id, int max_q);
@@ -434,9 +441,22 @@ private:
     bool is_dmfg_ = false;  // true when FG tier comes from driver (no FG DLL)
     DiagCSVLogger diag_csv_logger_;
 
+    // GPU overload detection — switch to actual render FPS when target unreachable
+    bool gpu_overload_mode_ = false;
+    int gpu_overload_count_ = 0;
+    int gpu_recover_count_ = 0;
+    static constexpr int kOverloadThreshold = 10;  // consecutive polls to confirm
+
     int64_t warmup_start_qpc_ = 0;
     bool warmup_done_ = false;
     static constexpr int64_t kWarmupDurationSec = 2;
 
     bool is_background_ = false;
+    int last_fg_div_ = 0;  // previous FG divisor for settings-change detection
+
+    // PLL state — phase-locked grid correction from display feedback
+    float pll_smoothed_error_ns_ = 0.0f;
+    static constexpr float kPllAlpha = 0.05f;
+    static constexpr float kPllCorrectionGain = 0.1f;
+    uint64_t last_pll_frame_id_ = 0;
 };

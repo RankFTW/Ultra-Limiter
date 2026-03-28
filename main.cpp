@@ -10,6 +10,7 @@
 #include <imgui.h>
 
 #include "ul_config.hpp"
+#include "ul_fg_monitor.hpp"
 #include "ul_limiter.hpp"
 #include "ul_log.hpp"
 #include "ul_timing.hpp"
@@ -101,16 +102,8 @@ static void UpdateFGString() {
         s_fg_logged = true;
     }
 
-    const char* mult = "";
-    bool from_fps = false;
-    if (s_has_native.load(std::memory_order_relaxed) && s_native_fps > 1.0f && s_fps > 1.0f) {
-        float r = s_fps / s_native_fps;
-        if (r > 5.5f)      { mult = " 6x"; from_fps = true; }
-        else if (r > 4.5f) { mult = " 5x"; from_fps = true; }
-        else if (r > 3.5f) { mult = " 4x"; from_fps = true; }
-        else if (r > 2.5f) { mult = " 3x"; from_fps = true; }
-        else if (r > 1.3f) { mult = " 2x"; from_fps = true; }
-    }
+    const char* mult = ul_fg_monitor::GetMultiplierString();
+    bool from_fps = (ul_fg_monitor::GetTier() >= 2);
 
     if (dlssg)          snprintf(s_fg_str, sizeof(s_fg_str), "DLSS FG%s", mult);
     else if (fsr)       snprintf(s_fg_str, sizeof(s_fg_str), "FSR FG%s", mult);
@@ -271,6 +264,10 @@ static void UpdateStats() {
         for (int i = 0; i < n; i++) sum += s_ft_hist[(s_ft_idx - 1 - i + kHistLen) % kHistLen];
         s_ft_ms = sum / static_cast<float>(n);
         s_fps = (s_ft_ms > 0.0f) ? 1000.0f / s_ft_ms : 0.0f;
+
+        // Update FG tier from FPS ratio every frame (independent of OSD)
+        if (s_has_native.load(std::memory_order_relaxed))
+            ul_fg_monitor::Update(s_fps, s_native_fps);
 
         // Feed 1% low rolling window
         s_low_pct_hist[s_low_pct_head] = dt;
@@ -471,8 +468,10 @@ static void DrawOSD(reshade::api::effect_runtime*) {
                 ((s_ft_idx < kHistLen ? s_ft_idx : kHistLen) > 1);
     bool has_big_graph = g_cfg.show_big_graph.load(std::memory_order_relaxed) &&
                          ((s_ft_idx < kHistLen ? s_ft_idx : kHistLen) > 1);
+    bool has_native_graph = g_cfg.show_native_graph.load(std::memory_order_relaxed) &&
+                            s_has_native.load(std::memory_order_relaxed) && s_nat_idx > 1;
 
-    if (line_count == 0 && !has_graph && !has_big_graph) return;
+    if (line_count == 0 && !has_graph && !has_big_graph && !has_native_graph) return;
 
     // --- Compute bounding box ---
     float content_h = line_count * (lh + gap);
@@ -480,9 +479,11 @@ static void DrawOSD(reshade::api::effect_runtime*) {
     float big_graph_w = 400.0f * sf, big_graph_h = 120.0f * sf;
     if (has_graph) content_h += graph_h + gap;
     if (has_big_graph) content_h += big_graph_h + gap;
+    if (has_native_graph) content_h += big_graph_h + gap + lh;  // graph + label
     float content_w = max_w + pad * 2;
     if (has_graph && (graph_w + pad * 2) > content_w) content_w = graph_w + pad * 2;
     if (has_big_graph && (big_graph_w + pad * 2) > content_w) content_w = big_graph_w + pad * 2;
+    if (has_native_graph && (big_graph_w + pad * 2) > content_w) content_w = big_graph_w + pad * 2;
 
     // --- Draw background ---
     int bg_pct = g_cfg.osd_bg_opacity.load(std::memory_order_relaxed);
@@ -607,6 +608,101 @@ static void DrawOSD(reshade::api::effect_runtime*) {
             dl->AddLine(ImVec2(gx + step * i, gy + gh * (1.0f - v0)),
                         ImVec2(gx + step * (i + 1), gy + gh * (1.0f - v1)),
                         green, 2.0f * sf);
+        }
+
+        y += big_graph_h + gap;
+    }
+
+    // --- Native frametime graph (render frames only, large style) ---
+    if (has_native_graph) {
+        constexpr int kNatHistLen = 64;
+        int count = (s_nat_idx < kNatHistLen) ? s_nat_idx : kNatHistLen;
+
+        // Label
+        const char* nat_label = "Native Cadence";
+        if (drop_shadow)
+            dl->AddText(font, font_size, ImVec2(x + pad + sh_off, y + sh_off), shadow_col, nat_label);
+        dl->AddText(font, font_size, ImVec2(x + pad, y), IM_COL32(180, 220, 255, 255), nat_label);
+        y += lh + gap;
+
+        // Compute dynamic range
+        float dmin = 1e9f, dmax = 0.0f;
+        for (int i = 0; i < count; i++) {
+            int idx = (s_nat_idx - count + i + kNatHistLen) % kNatHistLen;
+            float v = s_nat_hist[idx];
+            if (v < dmin) dmin = v;
+            if (v > dmax) dmax = v;
+        }
+        float range = dmax - dmin;
+        if (range < 1.0f) range = 1.0f;
+        float axis_min = std::floor((dmin - range * 0.1f) * 10.0f) / 10.0f;
+        float axis_max = std::ceil((dmax + range * 0.1f) * 10.0f) / 10.0f;
+        if (axis_min < 0.0f) axis_min = 0.0f;
+        if (axis_max - axis_min < 1.0f) axis_max = axis_min + 1.0f;
+
+        // Label sizing
+        float label_font_size = ImGui::GetFontSize() * sf * 0.75f;
+        char top_lbl[16], bot_lbl[16];
+        snprintf(top_lbl, sizeof(top_lbl), "%.1f", axis_max);
+        snprintf(bot_lbl, sizeof(bot_lbl), "%.1f", axis_min);
+        float top_w = ImGui::CalcTextSize(top_lbl).x * sf * 0.75f;
+        float bot_w = ImGui::CalcTextSize(bot_lbl).x * sf * 0.75f;
+        float label_w = (std::max)(top_w, bot_w) + 8.0f * sf;
+
+        float gx = x + pad + label_w;
+        float gy = y;
+        float gw = big_graph_w - label_w;
+        if (gw < 100.0f * sf) gw = 100.0f * sf;
+        float gh = big_graph_h;
+
+        // Background
+        dl->AddRectFilled(ImVec2(gx, gy), ImVec2(gx + gw, gy + gh),
+                          IM_COL32(0, 0, 0, 120), 2.0f);
+        dl->AddRect(ImVec2(gx, gy), ImVec2(gx + gw, gy + gh),
+                    IM_COL32(80, 80, 80, 200), 2.0f, 0, 1.0f);
+
+        // Grid lines: top, middle, bottom
+        float lbl_h = ImGui::CalcTextSize("0").y * sf * 0.75f;
+        for (int g = 0; g <= 2; g++) {
+            float frac = g / 2.0f;
+            float line_y = gy + gh * frac;
+            float val = axis_max - (axis_max - axis_min) * frac;
+            char lbl[16];
+            snprintf(lbl, sizeof(lbl), "%.1f", val);
+            float lsz_x = ImGui::CalcTextSize(lbl).x * sf * 0.75f;
+            float label_y;
+            if (g == 0)
+                label_y = line_y + 2.0f * sf;
+            else if (g == 2)
+                label_y = line_y - lbl_h - 2.0f * sf;
+            else
+                label_y = line_y - lbl_h * 0.5f;
+            dl->AddText(font, label_font_size,
+                        ImVec2(gx - lsz_x - 4.0f * sf, label_y),
+                        IM_COL32(180, 180, 180, 200), lbl);
+            if (g > 0 && g < 2) {
+                for (float dx = 0; dx < gw; dx += 8.0f * sf) {
+                    float x0 = gx + dx, x1 = gx + dx + 4.0f * sf;
+                    if (x1 > gx + gw) x1 = gx + gw;
+                    dl->AddLine(ImVec2(x0, line_y), ImVec2(x1, line_y),
+                                IM_COL32(60, 60, 60, 150), 1.0f);
+                }
+            }
+        }
+
+        // Plot native cadence line (cyan to distinguish from output frametime)
+        ImU32 cyan = IM_COL32(100, 220, 255, 255);
+        float step = gw / static_cast<float>(count - 1);
+        for (int i = 0; i < count - 1; i++) {
+            int i0 = (s_nat_idx - count + i + kNatHistLen) % kNatHistLen;
+            int i1 = (s_nat_idx - count + i + 1 + kNatHistLen) % kNatHistLen;
+            float v0 = (s_nat_hist[i0] - axis_min) / (axis_max - axis_min);
+            float v1 = (s_nat_hist[i1] - axis_min) / (axis_max - axis_min);
+            v0 = std::clamp(v0, 0.0f, 1.0f);
+            v1 = std::clamp(v1, 0.0f, 1.0f);
+            dl->AddLine(ImVec2(gx + step * i, gy + gh * (1.0f - v0)),
+                        ImVec2(gx + step * (i + 1), gy + gh * (1.0f - v1)),
+                        cyan, 2.0f * sf);
         }
 
         y += big_graph_h + gap;
@@ -1006,6 +1102,7 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
             toggle("Native FPS", g_cfg.show_native_fps, "Real render rate excluding generated frames.");
             toggle("Frametime Graph", g_cfg.show_graph, "Rolling frametime history graph.");
             toggle("Large Graph", g_cfg.show_big_graph, "Large frametime graph with labeled axis limits.");
+            toggle("Native Graph", g_cfg.show_native_graph, "Render frame cadence graph (excludes FG-generated frames).");
             toggle("GPU Render Time", g_cfg.show_gpu_time, "GPU active render time from Reflex.");
             toggle("Render Latency", g_cfg.show_render_lat, "Sim-start to GPU-render-end latency.");
             toggle("Present Latency", g_cfg.show_present_lat, "Present start-to-end latency.");
@@ -1603,6 +1700,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             return FALSE;
         }
 
+        // Promote all waitable timers in the process to high-resolution.
+        // Improves timing precision for driver-internal timers.
+        ul_timing::InstallTimerPromotionHooks();
+
         __try {
             s_limiter.Init(hModule);
 
@@ -1642,6 +1743,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         reshade::unregister_overlay("ReLimiter", DrawOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_overlay>(DrawOSD);
         s_limiter.Shutdown();
+        ul_timing::RemoveTimerPromotionHooks();
         MH_Uninitialize();
         reshade::unregister_addon(hModule);
         ul_log::Shutdown();

@@ -26,6 +26,7 @@ file(WRITE "${CMAKE_CURRENT_LIST_DIR}/version.h"
 add_library(ultra_limiter SHARED
     main.cpp
     ul_config.cpp
+    ul_fg_monitor.cpp
     ul_limiter.cpp
     ul_log.cpp
     ul_reflex.cpp
@@ -70,6 +71,9 @@ else()
     message(FATAL_ERROR "MinHook not found at ${UL_MINHOOK_DIR}. Clone it: git clone https://github.com/TsudaKageyu/minhook external/minhook")
 endif()
 
+# Prevent Windows.h min/max macros from colliding with std::min/std::max
+target_compile_definitions(ultra_limiter PRIVATE NOMINMAX)
+
 # C++17 for ReShade headers
 target_compile_features(ultra_limiter PRIVATE cxx_std_17)
 
@@ -93,4 +97,10 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     set_target_properties(ultra_limiter PROPERTIES SUFFIX ".addon64")
 else()
     set_target_properties(ultra_limiter PROPERTIES SUFFIX ".addon32")
+endif()
+
+# --- Tests (opt-in) ---
+option(BUILD_TESTS "Build property-based tests" OFF)
+if(BUILD_TESTS)
+    add_subdirectory(tests)
 endif()

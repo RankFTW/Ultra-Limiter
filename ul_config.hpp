@@ -81,6 +81,9 @@ struct UlConfig {
     // Large frametime graph with labeled axis
     std::atomic<bool> show_big_graph{false};
 
+    // Native frametime graph (render frames only, excludes FG)
+    std::atomic<bool> show_native_graph{false};
+
     // Expanded per-frame diagnostic CSV
     std::atomic<bool> csv_diagnostics{false};
 };
