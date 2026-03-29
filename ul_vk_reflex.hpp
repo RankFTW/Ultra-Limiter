@@ -223,6 +223,10 @@ private:
     PFN_vkCreateSemaphore pfn_CreateSemaphore_ = nullptr;
     PFN_vkDestroySemaphore pfn_DestroySemaphore_ = nullptr;
     PFN_vkWaitSemaphores pfn_WaitSemaphores_ = nullptr;
+
+    // Timeline semaphore counter query — used for recovery if wait fails
+    using PFN_vkGetSemaphoreCounterValue = VkResult(*)(VkDevice, VkSemaphore, uint64_t*);
+    PFN_vkGetSemaphoreCounterValue pfn_GetSemaphoreCounterValue_ = nullptr;
 };
 
 // Global Vulkan Reflex instance

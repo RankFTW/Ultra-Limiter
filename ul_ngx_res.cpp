@@ -198,8 +198,16 @@ static void UpdateDlssParamsFromEval(void* params, void* handle) {
         }
     }
 
-    // Only process evaluations for the DLSS SR handle
-    if (!handle || handle != s_dlss_sr_handle) return;
+    // Only process evaluations for the DLSS SR handle.
+    // Exception: if s_dlss_sr_handle is null (we missed CreateFeature because
+    // the DLL loaded before our hooks installed), try to adopt this handle
+    // by checking if the params contain DLSS SR data.
+    if (!handle) return;
+    if (s_dlss_sr_handle && handle != s_dlss_sr_handle) {
+        // Handle mismatch — the game may have recreated the DLSS feature
+        // (swapchain recreate, settings change). Reset so we can re-adopt.
+        s_dlss_sr_handle = nullptr;
+    }
     if (!params) return;
 
     unsigned int w = 0, h = 0, ow = 0, oh = 0;
@@ -221,6 +229,18 @@ static void UpdateDlssParamsFromEval(void* params, void* handle) {
 
     if (w == 0 || h == 0) return;
 
+    // Late adoption: if we missed CreateFeature, adopt this handle now.
+    // Only adopt if quality is valid (0-5) — this distinguishes SR from RR
+    // which doesn't have PerfQualityValue.
+    if (!s_dlss_sr_handle) {
+        if (quality >= 0 && quality <= 5) {
+            s_dlss_sr_handle = handle;
+            ul_log::Write("NGX: DLSS SR handle adopted from EvaluateFeature (late hook)");
+        } else {
+            return;  // not an SR call, skip
+        }
+    }
+
     // Only update and log if something actually changed
     uint32_t prev_w = s_render_w.load(std::memory_order_relaxed);
     uint32_t prev_h = s_render_h.load(std::memory_order_relaxed);
@@ -238,6 +258,7 @@ static void UpdateDlssParamsFromEval(void* params, void* handle) {
     s_out_w.store(ow, std::memory_order_relaxed);
     s_out_h.store(oh, std::memory_order_relaxed);
     s_quality.store(quality, std::memory_order_relaxed);
+    s_has_data.store(true, std::memory_order_relaxed);
 
     const char* mode_str = "Unknown";
     switch (quality) {

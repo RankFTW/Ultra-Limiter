@@ -1,5 +1,40 @@
 # Changelog
 
+## v2.5.2
+
+Vulkan Streamline compatibility, semaphore recovery, FG grid timing, NGX late-hook resolution detection, OSD improvements, and Vulkan polling overhaul.
+
+### Streamline DLSS-G Compatibility (Vulkan)
+- Skip VK_NV_low_latency2 injection and MinHook LL2 function patches when Streamline (sl.common.dll) is detected. Streamline manages LL2 through its own interposer layer — our injection conflicted with it and prevented FG from generating frames in games like X4 Foundations.
+- UI status correctly shows "Streamline (managed)" for Reflex and "Streamline + Timing" for pacing mode.
+- Native FPS and render pacing graph are hidden for Streamline-managed games (no marker data available — no data is better than wrong data).
+
+### Vulkan Semaphore Recovery
+- Added `vkGetSemaphoreCounterValue` function pointer to VkReflex (loaded optionally during Init).
+- If a timeline semaphore wait times out or fails, the tracked counter is re-synced with the driver's actual value. Handles missed signals from crashes, device transitions, or driver hiccups.
+
+### Vulkan FG Grid Timing Fix
+- Two intervals in the Vulkan DoOwnSleep path: SetSleepMode receives the render-rate interval, while the grid receives the output-rate interval (render interval / fg_divisor) to pace present callbacks that fire for every frame including generated ones.
+- Without the grid division, generated frames were blocked by the render-rate grid, capping output at the render rate instead of the full FG output rate.
+
+### Vulkan Sleep Passthrough
+- Added a `vk_reflex_->Sleep()` passthrough call for non-native Vulkan games after grid sleep. Keeps the driver's semaphore-based frame tracking alive without double-signaling for native Reflex games.
+
+### Vulkan OSD Polling Overhaul
+- PollVkGpuLatency now extracts all valid consecutive simStartTime deltas from the 64-frame report buffer per poll (with dedup tracking), instead of just the single most-recent pair.
+- Vulkan poll frequency increased from every 30 presents to every 10 presents. Pacing graph and native FPS populate within 1-2 seconds instead of 13+.
+
+### OSD Improvements
+- Smoothness score always shows when enabled, even at 0% (previously hidden at 0).
+- Increased line gap (4→6) and padding (8→12) to prevent text clipping into graph edges.
+- Background box vertical margin matches horizontal padding for consistent spacing.
+- Extra gap before render pacing graph to clear text descenders.
+
+### NGX Late-Hook Resolution Detection
+- EvaluateFeature hook now adopts the DLSS SR handle when CreateFeature was missed (NGX DLLs loaded after hook installation). Fixes incorrect DLAA display in games like RDR2 where _nvngx.dll loads lazily.
+- Handle mismatch detection: when the game recreates the DLSS feature (swapchain recreate, settings change), the stale handle is reset and re-adopted from the next EvaluateFeature call.
+- EvaluateFeature path now sets HasData flag so the OSD uses NGX-reported quality mode instead of falling through to the viewport-based heuristic.
+
 ## v2.5.0
 
 Vulkan native Reflex overhaul, NGX resolution detection, FG detection rework, and pacing safety improvements.

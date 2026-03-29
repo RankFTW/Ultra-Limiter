@@ -1851,14 +1851,21 @@ void UlLimiter::DoOwnSleep() {
         }
 
         // Grid sleep with our timers.
-        // When FG is active, OnPresent fires for both real and generated frames.
-        // The grid must pace at the OUTPUT rate (e.g. 157 FPS) not the render
-        // rate (e.g. 78.5 FPS for 2x FG), otherwise generated frames get
-        // blocked and total output is capped at the render rate.
+        //
+        // Two intervals are in play:
+        //   SetSleepMode (above): render rate (p.minimumIntervalUs) — tells
+        //     the driver how fast we're rendering. Unchanged.
+        //   Grid interval: output rate (render interval / fg_divisor) — paces
+        //     the present callbacks, which fire for every frame including
+        //     generated ones. Without this division, generated frames get
+        //     blocked by the render-rate grid.
+        //
+        // DX path stays unchanged — on DX, OnPresent only fires for real
+        // frames, so the grid interval matches the render rate.
         int fg_div = DetectFGDivisor();
         int64_t grid_ns = static_cast<int64_t>(p.minimumIntervalUs) * 1000LL;
         if (fg_div > 1)
-            grid_ns /= fg_div;
+            grid_ns /= fg_div;  // output rate for grid only
         int64_t now = ul_timing::NowNs();
 
         if (grid_epoch_ns_ == 0) {
@@ -1878,6 +1885,19 @@ void UlLimiter::DoOwnSleep() {
                 grid_next_ns_ = grid_epoch_ns_ + (slots + 1) * grid_interval_ns_;
             }
         }
+
+        // Vulkan Sleep passthrough — keeps the driver's semaphore-based frame
+        // tracking alive. Only needed for non-native games; native games
+        // already call vkLatencySleepNV themselves (forwarded by our wrapper),
+        // so a second Sleep would double-signal the semaphore.
+        if (!native) {
+            __try {
+                vk_reflex_->Sleep();
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                // Absorb — grid already paced the frame.
+            }
+        }
+
         return;  // Vulkan path complete — no DX passthrough
     }
 #endif

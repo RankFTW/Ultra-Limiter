@@ -266,34 +266,52 @@ static void PollVkGpuLatency() {
     // On Vulkan, marker callbacks may not flow (Streamline caches function
     // pointers before our hook installs), so derive render cadence from
     // GetLatencyTimings frame reports instead.
+    //
+    // Extract ALL valid consecutive simStartTime deltas from the report
+    // buffer (up to 64 entries), not just the most recent pair. This fills
+    // the pacing graph and native FPS reading much faster — one poll can
+    // contribute many samples instead of just one.
     {
-        // Find the two most recent frames with valid simStartTime
+        // Collect frames with valid simStartTime, sorted by frame ID
         struct SimFrame { uint64_t id; uint64_t sim_start; };
-        SimFrame recent[2] = {};
-        int n_recent = 0;
-        for (int i = 63; i >= 0 && n_recent < 2; i--) {
+        SimFrame frames[64];
+        int n_frames = 0;
+        for (int i = 0; i < 64; i++) {
             auto& f = buf->frameReport[i];
-            if (f.frameID && f.simStartTime > 0) {
-                recent[n_recent++] = { f.frameID, f.simStartTime };
-            }
+            if (f.frameID && f.simStartTime > 0)
+                frames[n_frames++] = { f.frameID, f.simStartTime };
         }
-        // Sort by frame ID (descending — most recent first)
-        if (n_recent == 2 && recent[0].id < recent[1].id)
-            std::swap(recent[0], recent[1]);
+        // Sort ascending by frame ID
+        for (int i = 0; i < n_frames - 1; i++)
+            for (int j = i + 1; j < n_frames; j++)
+                if (frames[j].id < frames[i].id)
+                    std::swap(frames[i], frames[j]);
 
-        if (n_recent == 2 && recent[0].sim_start > recent[1].sim_start) {
-            // simStartTime is in microseconds (Vulkan LL2 convention)
-            float dt_ms = static_cast<float>(recent[0].sim_start - recent[1].sim_start) / 1000.0f;
+        // Track last processed frame ID to avoid re-feeding duplicates
+        // across consecutive polls (the report buffer overlaps).
+        static uint64_t s_vk_last_sim_frame_id = 0;
+
+        for (int i = 1; i < n_frames; i++) {
+            // Skip frames we've already processed
+            if (frames[i].id <= s_vk_last_sim_frame_id) continue;
+            if (frames[i].sim_start <= frames[i - 1].sim_start) continue;
+
+            float dt_ms = static_cast<float>(frames[i].sim_start - frames[i - 1].sim_start) / 1000.0f;
             if (dt_ms > 0.5f && dt_ms < 200.0f) {
                 s_nat_hist[s_nat_idx % 64] = dt_ms;
                 s_nat_idx++;
-                int n = (s_nat_idx < 64) ? s_nat_idx : 64;
-                float sum = 0.0f;
-                for (int i = 0; i < n; i++) sum += s_nat_hist[(s_nat_idx - 1 - i + 64) % 64];
-                s_native_ft_ms = sum / static_cast<float>(n);
-                s_native_fps = (s_native_ft_ms > 0.0f) ? 1000.0f / s_native_ft_ms : 0.0f;
-                s_has_native.store(true, std::memory_order_relaxed);
             }
+            s_vk_last_sim_frame_id = frames[i].id;
+        }
+
+        // Recompute native FPS from the updated history
+        if (s_nat_idx > 0) {
+            int n = (s_nat_idx < 64) ? s_nat_idx : 64;
+            float sum = 0.0f;
+            for (int i = 0; i < n; i++) sum += s_nat_hist[(s_nat_idx - 1 - i + 64) % 64];
+            s_native_ft_ms = sum / static_cast<float>(n);
+            s_native_fps = (s_native_ft_ms > 0.0f) ? 1000.0f / s_native_ft_ms : 0.0f;
+            s_has_native.store(true, std::memory_order_relaxed);
         }
     }
 }
@@ -397,7 +415,7 @@ static void DrawOSD(reshade::api::effect_runtime*) {
     if (scale_pct > 300) scale_pct = 300;
     float sf = scale_pct / 100.0f;
 
-    float lh = 18.0f * sf, gap = 4.0f * sf, pad = 8.0f * sf;
+    float lh = 18.0f * sf, gap = 6.0f * sf, pad = 12.0f * sf;
 
     // Text brightness scaling (0–100 → 0.0–1.0)
     int bri_pct = g_cfg.osd_text_brightness.load(std::memory_order_relaxed);
@@ -426,6 +444,7 @@ static void DrawOSD(reshade::api::effect_runtime*) {
     // output FPS (real + interpolated).
     bool sm = GetModuleHandleW(L"NvPresent64.dll") != nullptr;
     bool has_nat = s_has_native.load(std::memory_order_relaxed) && s_native_fps > 0.0f;
+
     float disp_fps = sm ? s_fps * 2.0f : s_fps;
     float disp_native_fps = (sm && has_nat) ? s_fps : ((has_nat) ? s_native_fps : 0.0f);
     float disp_native_ft = (sm && has_nat) ? s_ft_ms : s_native_ft_ms;
@@ -557,10 +576,8 @@ static void DrawOSD(reshade::api::effect_runtime*) {
         s_limiter.GetCadenceCount() >= 8) {
         float cv = s_limiter.GetCadenceCV();
         float score = ComputeSmoothnessScore(cv);
-        if (score > 0.0f) {
-            snprintf(buf, sizeof(buf), "Smoothness: %.0f%%", score);
-            add_line(buf, SmoothnessColor(score, bri));
-        }
+        snprintf(buf, sizeof(buf), "Smoothness: %.0f%%", score);
+        add_line(buf, SmoothnessColor(score, bri));
     }
 
     has_graph = false;  // small/big frametime graphs removed — native cadence graph only
@@ -572,7 +589,7 @@ static void DrawOSD(reshade::api::effect_runtime*) {
     // --- Compute bounding box ---
     float content_h = line_count * (lh + gap);
     float big_graph_w = 400.0f * sf, big_graph_h = 120.0f * sf;
-    if (has_native_graph) content_h += big_graph_h + gap + lh;  // graph + label
+    if (has_native_graph) content_h += big_graph_h + gap * 2 + lh;  // graph + label + descender gap
     float content_w = max_w + pad * 2;
     if (has_native_graph && (big_graph_w + pad * 2) > content_w) content_w = big_graph_w + pad * 2;
 
@@ -582,7 +599,7 @@ static void DrawOSD(reshade::api::effect_runtime*) {
         if (bg_pct > 100) bg_pct = 100;
         uint8_t alpha = static_cast<uint8_t>(bg_pct * 255 / 100);
         ImU32 bg_col = IM_COL32(0, 0, 0, alpha);
-        float margin = 4.0f;
+        float margin = pad;  // vertical margin matches horizontal padding
         dl->AddRectFilled(
             ImVec2(x, y_start - margin),
             ImVec2(x + content_w, y_start + content_h + margin),
@@ -607,7 +624,7 @@ static void DrawOSD(reshade::api::effect_runtime*) {
         if (drop_shadow)
             dl->AddText(font, font_size, ImVec2(x + pad + sh_off, y + sh_off), shadow_col, nat_label);
         dl->AddText(font, font_size, ImVec2(x + pad, y), IM_COL32(180, 220, 255, 255), nat_label);
-        y += lh + gap;
+        y += lh + gap * 2;  // extra gap for descenders (g, p, y) before graph edge
 
         // Compute dynamic range
         float dmin = 1e9f, dmax = 0.0f;
@@ -1200,9 +1217,16 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
     ImGui::Text("Reflex: %s",
 #ifdef _WIN64
                 g_vk_reflex.IsActive() ? "Vulkan (VK_NV_low_latency2)" :
+                (GetModuleHandleW(L"sl.common.dll") ? "Streamline (managed)" :
 #endif
-                ReflexActive() ? "Hooked" : "Not hooked");
-    ImGui::Text("Native Reflex: %s", g_game_uses_reflex.load() ? "Detected" : "No");
+                (ReflexActive() ? "Hooked" : "Not hooked"))
+#ifdef _WIN64
+                )
+#endif
+                ;
+    ImGui::Text("Native Reflex: %s",
+                g_game_uses_reflex.load() ? "Detected" :
+                (GetModuleHandleW(L"sl.common.dll") ? "Streamline" : "No"));
 
     bool native = g_game_uses_reflex.load();
 #ifdef _WIN64
@@ -1218,7 +1242,13 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
             mode = "Vulkan Low-Latency + Timing";
         }
     }
-    else if (!ReflexActive()) mode = "Timing (no Reflex)";
+    else if (!ReflexActive()) {
+        // Check if Streamline is managing pacing through its own LL2
+        if (GetModuleHandleW(L"sl.common.dll"))
+            mode = "Streamline + Timing";
+        else
+            mode = "Timing (no Reflex)";
+    }
     else if (native) {
         // Show the dynamically resolved enforcement site
         const auto& ps = s_limiter.GetPipelineStats();
@@ -1567,7 +1597,10 @@ static void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* sc,
         UpdateStats();
         if (cnt > 300 && cnt % 30 == 0) PollGpuLatency();
 #ifdef _WIN64
-        if (cnt > 300 && cnt % 30 == 0) PollVkGpuLatency();
+        // Poll Vulkan more frequently — the batch extraction in
+        // PollVkGpuLatency processes all new frames per call, so higher
+        // frequency means the pacing graph and native FPS update faster.
+        if (cnt > 300 && cnt % 10 == 0) PollVkGpuLatency();
 #endif
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         ul_log::Write("OnPresent: exception 0x%08X", GetExceptionCode());

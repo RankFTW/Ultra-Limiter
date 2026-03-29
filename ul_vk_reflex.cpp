@@ -63,6 +63,10 @@ bool VkReflex::Init(VkDevice device) {
     pfn_WaitSemaphores_ = reinterpret_cast<PFN_vkWaitSemaphores>(
         vkGetDeviceProcAddr(device, "vkWaitSemaphores"));
 
+    // Optional — used for semaphore recovery if a wait fails or times out
+    pfn_GetSemaphoreCounterValue_ = reinterpret_cast<PFN_vkGetSemaphoreCounterValue>(
+        vkGetDeviceProcAddr(device, "vkGetSemaphoreCounterValue"));
+
     if (!pfn_CreateSemaphore_ || !pfn_DestroySemaphore_ || !pfn_WaitSemaphores_) {
         ul_log::Write("VkReflex::Init: timeline semaphore functions not available");
         return false;
@@ -183,6 +187,20 @@ bool VkReflex::Sleep() {
         active_ = false;
         return false;
     }
+
+    // Recovery: if the wait timed out or failed, re-sync our tracked value
+    // with the driver's actual semaphore counter. This handles missed signals
+    // from crashes, device transitions, or driver hiccups.
+    if (res != VK_SUCCESS && pfn_GetSemaphoreCounterValue_) {
+        uint64_t actual_val = 0;
+        __try {
+            if (pfn_GetSemaphoreCounterValue_(device_, sleep_semaphore_, &actual_val) == VK_SUCCESS) {
+                semaphore_value_ = actual_val;
+                ul_log::Write("VkReflex::Sleep: semaphore re-synced to %llu after wait failure", actual_val);
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
     return (res == VK_SUCCESS);
 }
 
@@ -554,8 +572,24 @@ static VkResult Hooked_vkCreateDevice(
         g_game_uses_reflex.store(true, std::memory_order_relaxed);
         ul_log::Write("VkHook: game already enables VK_NV_low_latency2 — native Reflex detected");
     } else if (PhysicalDeviceSupportsLL2(physicalDevice)) {
-        ext_names.push_back("VK_NV_low_latency2");
-        ul_log::Write("VkHook: injecting VK_NV_low_latency2 into vkCreateDevice");
+        // Check if Streamline is managing LL2 through its own layer.
+        // Streamline (sl.common.dll) handles VK_NV_low_latency2 internally —
+        // it adds LL2 support after device creation through its interposer,
+        // not through the game's extension list. If we inject LL2 into the
+        // extension list ourselves, both we and Streamline think we own the
+        // LL2 state, which conflicts and prevents FG from initializing.
+        //
+        // When Streamline is present, skip injection and let Streamline
+        // handle LL2 entirely. Our vkGetDeviceProcAddr hook still provides
+        // native Reflex detection and marker interception.
+        bool streamline_present = GetModuleHandleW(L"sl.common.dll") != nullptr;
+        if (streamline_present) {
+            ul_log::Write("VkHook: Streamline detected (sl.common.dll) — "
+                          "skipping LL2 injection, Streamline manages LL2");
+        } else {
+            ext_names.push_back("VK_NV_low_latency2");
+            ul_log::Write("VkHook: injecting VK_NV_low_latency2 into vkCreateDevice");
+        }
     } else {
         ul_log::Write("VkHook: VK_NV_low_latency2 not supported by physical device");
         return s_orig_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
@@ -569,7 +603,13 @@ static VkResult Hooked_vkCreateDevice(
     if (res == VK_SUCCESS) {
         s_extension_injected.store(true, std::memory_order_relaxed);
         ul_log::Write("VkHook: vkCreateDevice succeeded (extensions: %u)", modified.enabledExtensionCount);
-        if (pDevice && *pDevice)
+
+        // Only hook LL2 functions when WE injected the extension.
+        // When Streamline manages LL2, don't patch its internal dispatch —
+        // our MinHook patches on the LL2 functions would intercept
+        // Streamline's internal calls and disrupt FG initialization.
+        bool streamline_present = GetModuleHandleW(L"sl.common.dll") != nullptr;
+        if (!streamline_present && pDevice && *pDevice)
             HookLL2Functions(*pDevice);
     } else {
         ul_log::Write("VkHook: vkCreateDevice with modified exts failed (%d), retrying original", res);
