@@ -311,25 +311,26 @@ static VkResult Wrapped_vkSetLatencySleepModeNV(
         g_game_uses_reflex.store(true, std::memory_order_relaxed);
         ul_log::Write("VkHook: game uses native Reflex (vkSetLatencySleepModeNV)");
     }
-    // Forward to driver — keep the latency pipeline coherent for accurate
-    // GetLatencyTimings results. The limiter controls pacing via markers.
+    // Forward to driver — the game's SetSleepMode enables the low-latency
+    // pipeline which DLSS FG depends on. We override the interval later via
+    // MaybeUpdateSleepMode, but the initial enable must reach the driver.
+    // This matches DX where Hook_SetSleepMode captures params but the limiter
+    // still calls InvokeSetSleepMode (the real driver function) on its own.
     if (s_real_vkSetLatencySleepMode)
         return s_real_vkSetLatencySleepMode(device, swapchain, pSleepModeInfo);
     return VK_SUCCESS;
 }
 
-// Intercept vkLatencySleepNV: forward to driver so latency tracking stays
-// accurate. The limiter's grid timing (DoOwnSleep at enforcement site)
-// provides the actual pacing on top of the driver's sleep.
+// Intercept vkLatencySleepNV: swallow the game's sleep call.
+// Our grid (DoOwnSleep) handles all pacing. Matches DX Hook_Sleep behavior.
+// The driver's LL2 pipeline stays coherent because SetSleepMode is forwarded
+// and markers flow — the sleep call itself is just the timing wait.
 static VkResult Wrapped_vkLatencySleepNV(
     VkDevice device,
     VkSwapchainKHR swapchain,
     const VkLatencySleepInfoNV* pSleepInfo)
 {
-    // Forward to driver — the game's sleep cycle keeps the driver's latency
-    // measurement pipeline coherent.
-    if (s_real_vkLatencySleep)
-        return s_real_vkLatencySleep(device, swapchain, pSleepInfo);
+    (void)device; (void)swapchain; (void)pSleepInfo;
     return VK_SUCCESS;
 }
 
@@ -419,6 +420,7 @@ static void* Hooked_vkGetDeviceProcAddr(VkDevice device, const char* pName) {
 static void HookVkGetDeviceProcAddr() {
     if (s_gdpa_hook_installed.load(std::memory_order_relaxed)) return;
 
+    // Hook vkGetDeviceProcAddr in vulkan-1.dll (the loader).
     HMODULE vk_dll = GetModuleHandleW(L"vulkan-1.dll");
     if (!vk_dll) return;
 
@@ -439,11 +441,15 @@ static void HookVkGetDeviceProcAddr() {
         return;
     }
     s_gdpa_hook_installed.store(true, std::memory_order_relaxed);
-    ul_log::Write("VkHook: vkGetDeviceProcAddr hook installed");
+    ul_log::Write("VkHook: vkGetDeviceProcAddr hook installed (vulkan-1.dll)");
+
+    // NOTE: sl.interposer.dll hooks disabled — patching Streamline's exports
+    // breaks DLSS FG. The vulkan-1.dll hook + deferred LL2 hooks are sufficient.
 }
 
 static void UnhookVkGetDeviceProcAddr() {
     if (!s_gdpa_hook_installed.load(std::memory_order_relaxed)) return;
+
     HMODULE vk_dll = GetModuleHandleW(L"vulkan-1.dll");
     if (vk_dll) {
         auto target = reinterpret_cast<void*>(GetProcAddress(vk_dll, "vkGetDeviceProcAddr"));
@@ -457,6 +463,77 @@ static void UnhookVkGetDeviceProcAddr() {
     s_real_vkSetLatencySleepMode = nullptr;
     s_real_vkSetLatencyMarker = nullptr;
     s_real_vkLatencySleep = nullptr;
+}
+
+// ============================================================================
+// vkEnumerateDeviceExtensionProperties hook — strip VK_NV_present_metering
+// on non-Blackwell GPUs. Present metering is the Vulkan equivalent of
+// D3D12 flip metering (SetFlipConfig). On pre-Blackwell, it adds latency.
+// ============================================================================
+
+static PFN_vkEnumerateDeviceExtensionProperties s_orig_vkEnumExts = nullptr;
+static std::atomic<bool> s_enum_exts_hooked{false};
+
+static VkResult Hooked_vkEnumerateDeviceExtensionProperties(
+    VkPhysicalDevice physicalDevice,
+    const char* pLayerName,
+    uint32_t* pPropertyCount,
+    VkExtensionProperties* pProperties)
+{
+    VkResult res = s_orig_vkEnumExts(physicalDevice, pLayerName, pPropertyCount, pProperties);
+
+    if (res == VK_SUCCESS && pProperties && pPropertyCount && !IsBlackwell()) {
+        uint32_t count = *pPropertyCount;
+        for (uint32_t i = 0; i < count; i++) {
+            if (strcmp(pProperties[i].extensionName, "VK_NV_present_metering") == 0) {
+                // Overwrite with an adjacent extension to hide it
+                if (i > 0)
+                    memcpy(&pProperties[i], &pProperties[i - 1], sizeof(VkExtensionProperties));
+                else if (count > 1)
+                    memcpy(&pProperties[i], &pProperties[i + 1], sizeof(VkExtensionProperties));
+                static bool s_logged = false;
+                if (!s_logged) {
+                    ul_log::Write("VkHook: stripped VK_NV_present_metering (non-Blackwell)");
+                    s_logged = true;
+                }
+                break;
+            }
+        }
+    }
+
+    return res;
+}
+
+static void HookVkEnumExtensions() {
+    if (s_enum_exts_hooked.load(std::memory_order_relaxed)) return;
+
+    HMODULE vk_dll = GetModuleHandleW(L"vulkan-1.dll");
+    if (!vk_dll) return;
+
+    auto target = reinterpret_cast<void*>(
+        GetProcAddress(vk_dll, "vkEnumerateDeviceExtensionProperties"));
+    if (!target) return;
+
+    MH_STATUS st = MH_CreateHook(target,
+        reinterpret_cast<void*>(&Hooked_vkEnumerateDeviceExtensionProperties),
+        reinterpret_cast<void**>(&s_orig_vkEnumExts));
+    if (st != MH_OK) return;
+    st = MH_EnableHook(target);
+    if (st != MH_OK) { MH_RemoveHook(target); return; }
+    s_enum_exts_hooked.store(true, std::memory_order_relaxed);
+    ul_log::Write("VkHook: vkEnumerateDeviceExtensionProperties hooked (present metering filter)");
+}
+
+static void UnhookVkEnumExtensions() {
+    if (!s_enum_exts_hooked.load(std::memory_order_relaxed)) return;
+    HMODULE vk_dll = GetModuleHandleW(L"vulkan-1.dll");
+    if (vk_dll) {
+        auto target = reinterpret_cast<void*>(
+            GetProcAddress(vk_dll, "vkEnumerateDeviceExtensionProperties"));
+        if (target) { MH_DisableHook(target); MH_RemoveHook(target); }
+    }
+    s_enum_exts_hooked.store(false, std::memory_order_relaxed);
+    s_orig_vkEnumExts = nullptr;
 }
 
 // ============================================================================
@@ -555,16 +632,20 @@ static VkResult Hooked_vkCreateDevice(
 
     // Build the extension list:
     // - Inject VK_NV_low_latency2 if not already present
+    // - Inject VK_KHR_present_id for accurate frame-to-present mapping
+    // - Inject VK_KHR_timeline_semaphore for our sleep semaphore
     bool has_ll2 = false;
+    bool has_present_id = false;
+    bool has_timeline_sem = false;
 
     std::vector<const char*> ext_names;
-    ext_names.reserve(pCreateInfo->enabledExtensionCount + 1);
+    ext_names.reserve(pCreateInfo->enabledExtensionCount + 3);
     for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
         const char* name = pCreateInfo->ppEnabledExtensionNames[i];
         if (!name) continue;
-        if (strcmp(name, "VK_NV_low_latency2") == 0) {
-            has_ll2 = true;
-        }
+        if (strcmp(name, "VK_NV_low_latency2") == 0) has_ll2 = true;
+        if (strcmp(name, "VK_KHR_present_id") == 0) has_present_id = true;
+        if (strcmp(name, "VK_KHR_timeline_semaphore") == 0) has_timeline_sem = true;
         ext_names.push_back(name);
     }
 
@@ -593,6 +674,39 @@ static VkResult Hooked_vkCreateDevice(
     } else {
         ul_log::Write("VkHook: VK_NV_low_latency2 not supported by physical device");
         return s_orig_vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
+    }
+
+    // Inject VK_KHR_present_id — accurate frame-to-present mapping for
+    // GetLatencyTimings, especially under FG where presents interleave.
+    if (!has_present_id) {
+        auto check_fn = s_orig_vkEnumExts ? s_orig_vkEnumExts
+            : reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+                GetProcAddress(GetModuleHandleW(L"vulkan-1.dll"),
+                               "vkEnumerateDeviceExtensionProperties"));
+        bool supported = false;
+        if (check_fn) {
+            uint32_t ec = 0;
+            if (check_fn(physicalDevice, nullptr, &ec, nullptr) == VK_SUCCESS && ec > 0) {
+                std::vector<VkExtensionProperties> ep(ec);
+                if (check_fn(physicalDevice, nullptr, &ec, ep.data()) == VK_SUCCESS) {
+                    for (uint32_t i = 0; i < ec; i++) {
+                        if (strcmp(ep[i].extensionName, "VK_KHR_present_id") == 0) {
+                            supported = true; break;
+                        }
+                    }
+                }
+            }
+        }
+        if (supported) {
+            ext_names.push_back("VK_KHR_present_id");
+            ul_log::Write("VkHook: injecting VK_KHR_present_id");
+        }
+    }
+
+    // Inject VK_KHR_timeline_semaphore — required for our sleep semaphore.
+    if (!has_timeline_sem) {
+        ext_names.push_back("VK_KHR_timeline_semaphore");
+        ul_log::Write("VkHook: injecting VK_KHR_timeline_semaphore");
     }
 
     VkDeviceCreateInfo modified = *pCreateInfo;
@@ -644,9 +758,13 @@ bool VkReflexHookCreateDevice() {
     }
 
     s_hook_installed.store(true, std::memory_order_relaxed);
-    ul_log::Write("VkReflexHookCreateDevice: hook installed");
+    ul_log::Write("VkReflexHookCreateDevice: hook installed (vulkan-1.dll)");
+
+    // NOTE: sl.interposer.dll hooks disabled — patching Streamline's exports
+    // breaks DLSS FG.
 
     HookVkGetDeviceProcAddr();
+    HookVkEnumExtensions();
 
     return true;
 }
@@ -655,6 +773,7 @@ void VkReflexUnhookCreateDevice() {
     if (!s_hook_installed.load(std::memory_order_relaxed)) return;
 
     UnhookVkGetDeviceProcAddr();
+    UnhookVkEnumExtensions();
 
     HMODULE vk_dll = GetModuleHandleW(L"vulkan-1.dll");
     if (vk_dll) {
@@ -675,4 +794,22 @@ bool VkReflexExtensionInjected() {
 
 void SetVkMarkerCb(MarkerCb cb) {
     s_vk_marker_cb = cb;
+}
+
+// ============================================================================
+// Deferred hook attempt — called from OnInitSwapchain when the Vulkan device
+// is known to exist. By this point sl.interposer.dll is loaded (if present)
+// and the device has LL2 functions available. This catches the case where
+// vkCreateDevice was called through Streamline before our DllMain hooks
+// installed, so Hooked_vkCreateDevice never fired.
+// ============================================================================
+
+void VkReflexDeferredHook(VkDevice device) {
+    if (!device) return;
+
+    HMODULE sl_dll = GetModuleHandleW(L"sl.interposer.dll");
+    if (sl_dll)
+        ul_log::Write("VkDeferredHook: sl.interposer.dll detected");
+
+    ul_log::Write("VkDeferredHook: LL2 MinHook disabled (FG compat)");
 }

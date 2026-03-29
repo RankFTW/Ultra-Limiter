@@ -248,4 +248,9 @@ bool VkReflexExtensionInjected();
 // Reflex games (mirrors DX SetMarkerCb for Vulkan path).
 void SetVkMarkerCb(MarkerCb cb);
 
+// Deferred hook attempt — call from OnInitSwapchain when the Vulkan device
+// is known to exist. Hooks sl.interposer.dll and LL2 functions that were
+// missed because vkCreateDevice went through Streamline before our DllMain.
+void VkReflexDeferredHook(VkDevice device);
+
 #endif // _WIN64

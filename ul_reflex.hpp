@@ -183,6 +183,10 @@ void ReleaseSwapchainHooks();
 // skipped to avoid crashing Streamline's swapchain management.
 bool IsStreamlineSafeMode();
 
+// Returns true if the GPU is Blackwell (RTX 50-series) or newer.
+// Cached at NVAPI init time.
+bool IsBlackwell();
+
 using SLPresentCb = void(*)();
 void SetSLPresentCb(SLPresentCb cb);
 

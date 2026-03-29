@@ -388,13 +388,14 @@ private:
     int DetectFGDivisor() const;
 
     void DoReflexSleep();
-    void DoOwnSleep();
+    void DoOwnSleep(int fg_div = 1);
     void DoTimingFallback();
     void HandleDelayPresent(uint64_t frame_id);
     void HandleQueuedFrames(uint64_t frame_id, int max_q);
 
     NvSleepParams BuildSleepParams() const;
     bool MaybeUpdateSleepMode(const NvSleepParams& p);
+    void InvokeReflexSleep();
     void UpdatePipelineStats();
     void ResetAdaptiveState();
     int ResolveEnforcementSite() const;

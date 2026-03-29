@@ -841,9 +841,16 @@ int UlLimiter::DetectFGDivisor() const {
     // DMFG latency hint (no DLL case)
     if (lat_hint > 1) return lat_hint;
 
-    // DLL loaded = assume 2x until FPS monitor confirms otherwise
-    if (fg_dll || fsr_dll) return 2;
-
+    // DLL loaded but no FPS confirmation yet — default to 1 (no FG).
+    // FG DLLs stay loaded even when FG is disabled (menus, user toggle),
+    // so DLL presence alone is not proof of active frame generation.
+    // The FPS monitor will promote to 2x+ once it confirms the ratio.
+    // Exception: when Streamline is present, trust DLL presence as a hint
+    // since marker-based native FPS may not be available on Vulkan.
+    if (fg_dll || fsr_dll) {
+        if (GetModuleHandleW(L"sl.interposer.dll") != nullptr)
+            return 2;  // Streamline present — assume 2x until FPS confirms
+    }
     return 1;
 }
 
@@ -1131,10 +1138,44 @@ bool UlLimiter::MaybeUpdateSleepMode(const NvSleepParams& p) {
         last_sleep_params_.minimumIntervalUs == p.minimumIntervalUs) {
         return false;
     }
-    NvSleepParams copy = p;
-    NvStatus st = InvokeSetSleepMode(dev_, &copy);
-    if (st == NV_OK) { last_sleep_params_ = p; last_sleep_valid_ = true; }
-    return (st == NV_OK);
+
+    bool ok = false;
+#ifdef _WIN64
+    if (VK_REFLEX_ACTIVE()) {
+        bool native = g_game_uses_reflex.load(std::memory_order_relaxed);
+        if (!native) {
+            ok = vk_reflex_->SetSleepMode(
+                p.bLowLatencyMode != 0,
+                p.bLowLatencyBoost != 0,
+                p.minimumIntervalUs);
+        } else {
+            // Native game forwards its own SetSleepMode to the driver.
+            // Don't override — our interval is communicated via the grid only.
+            ok = true;
+        }
+    } else
+#endif
+    {
+        NvSleepParams copy = p;
+        NvStatus st = InvokeSetSleepMode(dev_, &copy);
+        ok = (st == NV_OK);
+    }
+
+    if (ok) { last_sleep_params_ = p; last_sleep_valid_ = true; }
+    return ok;
+}
+
+// Invoke the driver's sleep function (returns near-instantly when we already
+// consumed the wait via our grid). Keeps the driver's internal state coherent.
+void UlLimiter::InvokeReflexSleep() {
+#ifdef _WIN64
+    // Vulkan: the game's vkLatencySleepNV is swallowed by our wrapper —
+    // our grid handles all timing. No need to call VkReflex::Sleep() here,
+    // that would create a competing semaphore sequence and break FG.
+    if (VK_REFLEX_ACTIVE()) return;
+#endif
+    if (ReflexActive() && dev_)
+        InvokeSleep(dev_);
 }
 
 // ============================================================================
@@ -1832,124 +1873,44 @@ void UlLimiter::DoReflexSleep() {
 // management (queue management, boost, markers) but InvokeSleep returns
 // near-instantly since we already consumed the wait time.
 
-void UlLimiter::DoOwnSleep() {
-    // Vulkan path: update driver hints, then use our grid for timing
-#ifdef _WIN64
-    if (VK_REFLEX_ACTIVE()) {
-        // For native Reflex games, SetSleepMode is handled by the game
-        // (forwarded to driver via our wrapper). For non-native, we set it here.
-        bool native = g_game_uses_reflex.load(std::memory_order_relaxed);
-
-        NvSleepParams p = BuildSleepParams();
-        if (p.minimumIntervalUs == 0) return;
-
-        if (!native) {
-            vk_reflex_->SetSleepMode(
-                p.bLowLatencyMode != 0,
-                p.bLowLatencyBoost != 0,
-                p.minimumIntervalUs);
-        }
-
-        // Grid sleep with our timers.
-        //
-        // Two intervals are in play:
-        //   SetSleepMode (above): render rate (p.minimumIntervalUs) — tells
-        //     the driver how fast we're rendering. Unchanged.
-        //   Grid interval: output rate (render interval / fg_divisor) — paces
-        //     the present callbacks, which fire for every frame including
-        //     generated ones. Without this division, generated frames get
-        //     blocked by the render-rate grid.
-        //
-        // DX path stays unchanged — on DX, OnPresent only fires for real
-        // frames, so the grid interval matches the render rate.
-        int fg_div = DetectFGDivisor();
-        int64_t grid_ns = static_cast<int64_t>(p.minimumIntervalUs) * 1000LL;
-        if (fg_div > 1)
-            grid_ns /= fg_div;  // output rate for grid only
-        int64_t now = ul_timing::NowNs();
-
-        if (grid_epoch_ns_ == 0) {
-            grid_epoch_ns_ = now;
-            grid_interval_ns_ = grid_ns;
-            grid_next_ns_ = now + grid_ns;
-        } else {
-            constexpr float kGridAlpha = 0.05f;
-            grid_interval_ns_ = static_cast<int64_t>(
-                grid_interval_ns_ * (1.0 - kGridAlpha) + grid_ns * kGridAlpha);
-            if (grid_next_ns_ > now) {
-                ul_timing::SleepUntilNs(grid_next_ns_, htimer_fallback_);
-                grid_next_ns_ += grid_interval_ns_;
-            } else {
-                int64_t elapsed = now - grid_epoch_ns_;
-                int64_t slots = elapsed / grid_interval_ns_;
-                grid_next_ns_ = grid_epoch_ns_ + (slots + 1) * grid_interval_ns_;
-            }
-        }
-
-        // Vulkan Sleep passthrough — keeps the driver's semaphore-based frame
-        // tracking alive. Only needed for non-native games; native games
-        // already call vkLatencySleepNV themselves (forwarded by our wrapper),
-        // so a second Sleep would double-signal the semaphore.
-        if (!native) {
-            __try {
-                vk_reflex_->Sleep();
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                // Absorb — grid already paced the frame.
-            }
-        }
-
-        return;  // Vulkan path complete — no DX passthrough
-    }
-#endif
-
-    // DX path
-    if (!ReflexActive() || !dev_) return;
-
-    // Build params — real interval for both grid and driver hint
+void UlLimiter::DoOwnSleep(int fg_div) {
     NvSleepParams p = BuildSleepParams();
     if (p.minimumIntervalUs == 0) return;
 
-    // Convert adjusted interval to nanoseconds for the grid
+    // --- Unified phase-locked grid ---
+    // minimumIntervalUs is the render interval. When fg_div > 1 and the caller
+    // is OnPresent (fires for real + generated frames), divide to get the
+    // output interval so generated frames pass through at the correct rate.
     int64_t frame_ns = static_cast<int64_t>(p.minimumIntervalUs) * 1000LL;
+    if (fg_div > 1)
+        frame_ns /= fg_div;
     int64_t now = ul_timing::NowNs();
 
-    // --- Phase-locked grid (DX path) ---
     if (grid_epoch_ns_ == 0) {
-        // First frame — establish grid, no sleep
         grid_epoch_ns_ = now;
         grid_interval_ns_ = frame_ns;
         grid_next_ns_ = now + frame_ns;
     } else {
-        // Smooth the grid interval to prevent sawtooth from frame-to-frame
-        // micro-oscillations in adaptive corrections. Sustained changes
-        // (consistency buffer, FG offset) still converge in ~20 frames.
         constexpr float kGridAlpha = 0.05f;
         grid_interval_ns_ = static_cast<int64_t>(
             grid_interval_ns_ * (1.0 - kGridAlpha) + frame_ns * kGridAlpha);
 
         if (grid_next_ns_ > now) {
-            // Frame arrived early — sleep until grid slot
             ul_timing::SleepUntilNs(grid_next_ns_, htimer_fallback_);
             grid_next_ns_ += grid_interval_ns_;
         } else {
-            // Frame arrived late — snap grid forward to next slot ahead of now
             int64_t elapsed = now - grid_epoch_ns_;
             int64_t slots = elapsed / grid_interval_ns_;
             grid_next_ns_ = grid_epoch_ns_ + (slots + 1) * grid_interval_ns_;
         }
     }
 
-    // --- Reflex passthrough ---
-    // Pass real interval so driver maintains correct internal state.
-    // InvokeSleep returns near-instantly since we already consumed the wait.
-    // SEH guard: device/swapchain can be in a transitional state during
-    // alt-tab or swapchain recreation — protect against driver crashes.
+    // --- Reflex passthrough (unified) ---
     __try {
         MaybeUpdateSleepMode(p);
-        InvokeSleep(dev_);
+        InvokeReflexSleep();
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         // Silently absorb — the grid sleep already paced the frame.
-        // The driver will recover on the next valid call.
     }
 }
 
@@ -2086,6 +2047,16 @@ void UlLimiter::OnPresent() {
     frame_num_++;
     g_present_count.fetch_add(1, std::memory_order_relaxed);
 
+    // Emit synthetic markers for non-native Vulkan games so the driver's
+    // latency pipeline has data. Without these, GetLatencyTimings returns
+    // empty reports and native FPS / the pacing graph never appear.
+#ifdef _WIN64
+    if (VK_REFLEX_ACTIVE() && !g_game_uses_reflex.load(std::memory_order_relaxed)) {
+        vk_reflex_->SetMarker(frame_num_, VK_LATENCY_MARKER_SIMULATION_START_NV);
+        vk_reflex_->SetMarker(frame_num_, VK_LATENCY_MARKER_PRESENT_START_NV);
+    }
+#endif
+
     int64_t now_qpc = ul_timing::NowQpc();
     if (!warmup_done_) {
         if (warmup_start_qpc_ == 0) {
@@ -2096,7 +2067,21 @@ void UlLimiter::OnPresent() {
         if (now_qpc - warmup_start_qpc_ < ul_timing::g_qpc_freq * kWarmupDurationSec)
             return;
         warmup_done_ = true;
-        ul_log::Write("OnPresent: warmup done, limiting active (frame %llu)", frame_num_);
+
+        // Log pacing mode summary
+        {
+            bool vk = VK_REFLEX_ACTIVE();
+            bool dx = !vk && ReflexActive() && dev_;
+            bool native = g_game_uses_reflex.load(std::memory_order_relaxed);
+            bool sl = GetModuleHandleW(L"sl.interposer.dll") != nullptr;
+            const char* api = vk ? "Vulkan" : dx ? "DX" : "None";
+            const char* reflex = native ? "native" : (vk || dx) ? "injected" : "none";
+            int fg = DetectFGDivisor();
+            float fps = g_cfg.fps_limit.load(std::memory_order_relaxed);
+            ul_log::Write("OnPresent: warmup done (frame %llu) — API=%s, Reflex=%s, "
+                          "Streamline=%s, FG=%dx, target=%.0f FPS",
+                          frame_num_, api, reflex, sl ? "yes" : "no", fg, fps);
+        }
 
         // Flush defaults so new config keys appear in the INI (one-shot, deferred from init)
         static bool s_settings_flushed = false;
@@ -2240,31 +2225,40 @@ void UlLimiter::OnPresent() {
         }
     }
 
-    // Reflex path — DX or Vulkan
-    // DoOwnSleep handles all timing via our grid, then passes through to
-    // Reflex for driver state management. No separate DoTimingFallback needed.
-    bool vk_active = VK_REFLEX_ACTIVE();
-    if (vk_active) {
-#ifdef _WIN64
-        // Both native and non-native Vulkan Reflex: DoOwnSleep handles grid
-        // sleep for FPS cap enforcement. For native games, it skips SetSleepMode
-        // (the game's own calls are forwarded to the driver by our wrapper).
-        // For non-native, it also sets our sleep mode params.
-        DoOwnSleep();
-#endif
-    } else if (ReflexActive() && dev_) {
+    // Reflex path — unified for DX and Vulkan.
+    // Native Reflex (markers flow): OnMarker calls DoOwnSleep at enforcement site.
+    // Non-native Reflex (no markers): DoOwnSleep here in OnPresent.
+    // No Reflex: timing grid only.
+    bool has_reflex = VK_REFLEX_ACTIVE() || (ReflexActive() && dev_);
+    if (has_reflex) {
         if (g_game_uses_reflex.load(std::memory_order_relaxed)) {
             // Marker pacing — OnMarker calls DoOwnSleep at enforcement site.
             // Just update sleep mode params here (no sleep, no grid).
             NvSleepParams p = BuildSleepParams();
             MaybeUpdateSleepMode(p);
         } else {
-            DoOwnSleep();
+            // Non-native: DoOwnSleep from OnPresent.
+            // On Vulkan, OnPresent fires for ALL frames (real + generated),
+            // so pass the FG divisor to pace the grid at output rate.
+            // On DX, OnPresent only fires for real frames — fg_div stays 1.
+            int fg_div = 1;
+#ifdef _WIN64
+            if (VK_REFLEX_ACTIVE())
+                fg_div = DetectFGDivisor();
+#endif
+            DoOwnSleep(fg_div);
         }
     } else {
         // Non-Reflex games — timing grid is the only pacer
         DoTimingFallback();
     }
+
+    // Close the synthetic marker pair for non-native Vulkan games.
+#ifdef _WIN64
+    if (VK_REFLEX_ACTIVE() && !g_game_uses_reflex.load(std::memory_order_relaxed)) {
+        vk_reflex_->SetMarker(frame_num_, VK_LATENCY_MARKER_PRESENT_END_NV);
+    }
+#endif
 }
 
 // ============================================================================

@@ -44,13 +44,27 @@ void Initialize(HMODULE addon_module) {
 
     wchar_t wpath[MAX_PATH] = {};
 
+    // Build a process-specific log filename: relimiter_<exename>.log
+    // This avoids file locking conflicts when a launcher spawns the real game
+    // (e.g. idTechLauncher.exe → DOOMTheDarkAges.exe), matching ReShade's
+    // pattern of using separate log files per process.
+    wchar_t exe_path[MAX_PATH] = {};
+    wchar_t log_name[MAX_PATH] = L"relimiter.log";  // fallback
+    if (GetModuleFileNameW(nullptr, exe_path, MAX_PATH)) {
+        wchar_t* slash = wcsrchr(exe_path, L'\\');
+        wchar_t* name = slash ? slash + 1 : exe_path;
+        wchar_t* dot = wcsrchr(name, L'.');
+        if (dot) *dot = L'\0';  // strip .exe
+        // Only use process-specific name if it's not the "main" game exe
+        // Actually, always use it — simpler and avoids guessing which is "main"
+        swprintf(log_name, MAX_PATH, L"relimiter_%s.log", name);
+    }
+
     // Try 1: next to the game executable (most user-visible location).
-    // The addon DLL may be loaded from a proxy directory (e.g. REFramework's
-    // _storage_ folder), so prefer the game exe directory.
     if (GetModuleFileNameW(nullptr, wpath, MAX_PATH)) {
         wchar_t* slash = wcsrchr(wpath, L'\\');
         if (slash) {
-            wcscpy(slash + 1, L"relimiter.log");
+            wcscpy(slash + 1, log_name);
             if (TryOpen(wpath)) goto opened;
             {
                 char dbg[256];
@@ -72,7 +86,13 @@ void Initialize(HMODULE addon_module) {
         }
         wchar_t* dot = wcsrchr(wpath, L'.');
         if (dot) {
-            wcscpy(dot, L".log");
+            // Replace addon extension with process-specific log name
+            wchar_t* slash = wcsrchr(wpath, L'\\');
+            if (slash) {
+                wcscpy(slash + 1, log_name);
+            } else {
+                wcscpy(wpath, log_name);
+            }
             if (TryOpen(wpath)) goto opened;
             {
                 char dbg[256];
@@ -91,8 +111,8 @@ void Initialize(HMODULE addon_module) {
     {
         wchar_t tmp[MAX_PATH] = {};
         DWORD len = GetTempPathW(MAX_PATH, tmp);
-        if (len > 0 && len < MAX_PATH - 32) {
-            wcscat(tmp, L"relimiter.log");
+        if (len > 0 && len < MAX_PATH - 64) {
+            wcscat(tmp, log_name);
             wcscpy(wpath, tmp);
             if (TryOpen(wpath)) goto opened;
             {

@@ -86,7 +86,6 @@ static void WriteDefaults(const char* path) {
         "show_render_lat=true\n"
         "show_present_lat=true\n"
         "show_fg_mode=true\n"
-        "show_resolution=true\n"
         "target_monitor=\n"
         "window_mode=none\n"
         "vsync_override=0\n"
@@ -190,7 +189,6 @@ void LoadSettings(HMODULE addon_module) {
     g_cfg.show_render_lat.store(ReadBool(ini, "show_render_lat", true));
     g_cfg.show_present_lat.store(ReadBool(ini, "show_present_lat", true));
     g_cfg.show_fg_mode.store(ReadBool(ini, "show_fg_mode", true));
-    g_cfg.show_resolution.store(ReadBool(ini, "show_resolution", true));
     {
         char mon[64] = {};
         GetPrivateProfileStringA("UltraLimiter", "target_monitor", "", mon, sizeof(mon), ini);
@@ -234,7 +232,6 @@ void SaveSettings() {
     WBool("show_render_lat", g_cfg.show_render_lat.load());
     WBool("show_present_lat", g_cfg.show_present_lat.load());
     WBool("show_fg_mode", g_cfg.show_fg_mode.load());
-    WBool("show_resolution", g_cfg.show_resolution.load());
     {
         std::lock_guard<std::mutex> lk(g_cfg.monitor_mtx);
         W("target_monitor", g_cfg.target_monitor.c_str());

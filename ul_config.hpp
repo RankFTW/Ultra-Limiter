@@ -42,7 +42,6 @@ struct UlConfig {
     std::atomic<bool> show_render_lat{true};
     std::atomic<bool> show_present_lat{true};
     std::atomic<bool> show_fg_mode{true};
-    std::atomic<bool> show_resolution{true};
 
     // Monitor
     std::mutex monitor_mtx;

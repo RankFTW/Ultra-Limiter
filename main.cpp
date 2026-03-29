@@ -16,7 +16,6 @@
 #include "ul_timing.hpp"
 #ifdef _WIN64
 #include "ul_vk_reflex.hpp"
-#include "ul_ngx_res.hpp"
 #endif
 
 #include <reshade.hpp>
@@ -68,10 +67,8 @@ static float s_present_lat_ms = 0.0f;
 static std::atomic<bool> s_has_gpu{false};
 static IUnknown* s_reflex_dev = nullptr;
 
-// Resolution
+// Resolution (output only — used by OnInitSwapchain log)
 static std::atomic<uint32_t> s_out_w{0}, s_out_h{0};
-static std::atomic<uint32_t> s_rnd_w{0}, s_rnd_h{0};
-static std::atomic<bool> s_dlaa_detected{false};
 
 // FG mode string
 static char s_fg_str[32] = "None";
@@ -245,12 +242,29 @@ static void PollVkGpuLatency() {
     if (!g_vk_reflex.IsActive()) return;
 
     static NvLatencyResult* buf = nullptr;
+    static uint64_t s_last_vk_native_frame_id = 0;
+    static uint64_t s_last_vk_sim_start = 0;  // bridge deltas across polls
     if (!buf) { buf = new (std::nothrow) NvLatencyResult{}; if (!buf) return; }
 
     if (!g_vk_reflex.GetLatencyTimings(buf)) return;
 
-    float gpu = 0;
-    int n_gpu = 0;
+    // One-shot diagnostic: dump first few frame reports to understand the data
+    static bool s_vk_diag_logged = false;
+    if (!s_vk_diag_logged) {
+        int logged = 0;
+        for (int i = 0; i < 64 && logged < 8; i++) {
+            auto& f = buf->frameReport[i];
+            if (!f.frameID) continue;
+            ul_log::Write("VkLatency[%d]: id=%llu sim=%llu-%llu gpu=%u present=%llu-%llu",
+                          i, f.frameID, f.simStartTime, f.simEndTime,
+                          f.gpuActiveRenderTimeUs, f.presentStartTime, f.presentEndTime);
+            logged++;
+        }
+        if (logged > 0) s_vk_diag_logged = true;
+    }
+
+    float gpu = 0, rlat = 0, plat = 0;
+    int n_gpu = 0, n_rlat = 0, n_plat = 0;
     for (int i = 63; i >= 0 && n_gpu < 8; i--) {
         auto& f = buf->frameReport[i];
         if (!f.frameID) continue;
@@ -258,60 +272,69 @@ static void PollVkGpuLatency() {
             gpu += static_cast<float>(f.gpuActiveRenderTimeUs) / 1000.0f;
             n_gpu++;
         }
+        // Only compute render/present latency for real frames (have a sim phase)
+        if (f.simStartTime > 0 && f.simEndTime > f.simStartTime) {
+            if (f.gpuRenderEndTime > f.simStartTime) {
+                float r = static_cast<float>(f.gpuRenderEndTime - f.simStartTime) / 1000.0f;
+                if (r < 500.0f) { rlat += r; n_rlat++; }
+            }
+            if (f.presentStartTime > 0 && f.presentEndTime > f.presentStartTime) {
+                float p = static_cast<float>(f.presentEndTime - f.presentStartTime) / 1000.0f;
+                if (p < 500.0f) { plat += p; n_plat++; }
+            }
+        }
     }
-    if (n_gpu > 0) s_gpu_ms = gpu / n_gpu;
-    if (n_gpu > 0) s_has_gpu.store(true, std::memory_order_relaxed);
+    if (n_gpu > 0) {
+        s_gpu_ms = gpu / n_gpu;
+        s_has_gpu.store(true, std::memory_order_relaxed);
+    }
+    if (n_rlat > 0) s_render_lat_ms = rlat / n_rlat;
+    if (n_plat > 0) s_present_lat_ms = plat / n_plat;
 
     // Feed native FPS tracker from simStartTime deltas.
-    // On Vulkan, marker callbacks may not flow (Streamline caches function
-    // pointers before our hook installs), so derive render cadence from
-    // GetLatencyTimings frame reports instead.
-    //
-    // Extract ALL valid consecutive simStartTime deltas from the report
-    // buffer (up to 64 entries), not just the most recent pair. This fills
-    // the pacing graph and native FPS reading much faster — one poll can
-    // contribute many samples instead of just one.
+    // On Vulkan with Streamline, marker callbacks don't flow (can't hook LL2
+    // functions without breaking FG). Derive render cadence from GetLatencyTimings
+    // frame reports instead, filtering to REAL frames only.
+    // Real frames have a sim phase (simEndTime > simStartTime). Generated frames
+    // either have simStartTime == simEndTime or duplicate the previous real frame's
+    // sim timestamps.
     {
-        // Collect frames with valid simStartTime, sorted by frame ID
-        struct SimFrame { uint64_t id; uint64_t sim_start; };
+        struct SimFrame { uint64_t id; uint64_t sim_start; uint64_t sim_end; };
         SimFrame frames[64];
         int n_frames = 0;
         for (int i = 0; i < 64; i++) {
             auto& f = buf->frameReport[i];
-            if (f.frameID && f.simStartTime > 0)
-                frames[n_frames++] = { f.frameID, f.simStartTime };
+            if (!f.frameID || f.frameID <= s_last_vk_native_frame_id) continue;
+            if (f.simStartTime == 0) continue;
+            // Only include frames with a real sim phase (not generated)
+            if (f.simEndTime <= f.simStartTime) continue;
+            frames[n_frames++] = { f.frameID, f.simStartTime, f.simEndTime };
         }
-        // Sort ascending by frame ID
+        // Sort by frame ID ascending
         for (int i = 0; i < n_frames - 1; i++)
             for (int j = i + 1; j < n_frames; j++)
                 if (frames[j].id < frames[i].id)
                     std::swap(frames[i], frames[j]);
 
-        // Track last processed frame ID to avoid re-feeding duplicates
-        // across consecutive polls (the report buffer overlaps).
-        static uint64_t s_vk_last_sim_frame_id = 0;
-
-        for (int i = 1; i < n_frames; i++) {
-            // Skip frames we've already processed
-            if (frames[i].id <= s_vk_last_sim_frame_id) continue;
-            if (frames[i].sim_start <= frames[i - 1].sim_start) continue;
-
-            float dt_ms = static_cast<float>(frames[i].sim_start - frames[i - 1].sim_start) / 1000.0f;
-            if (dt_ms > 0.5f && dt_ms < 200.0f) {
-                s_nat_hist[s_nat_idx % 64] = dt_ms;
-                s_nat_idx++;
+        for (int i = 0; i < n_frames; i++) {
+            uint64_t prev_sim = (i > 0) ? frames[i - 1].sim_start : s_last_vk_sim_start;
+            if (prev_sim > 0 && frames[i].sim_start > prev_sim) {
+                float dt_ms = static_cast<float>(frames[i].sim_start - prev_sim) / 1000.0f;
+                if (dt_ms > 0.5f && dt_ms < 200.0f) {
+                    s_nat_hist[s_nat_idx % 64] = dt_ms;
+                    s_nat_idx++;
+                    int n = (s_nat_idx < 64) ? s_nat_idx : 64;
+                    float sum = 0.0f;
+                    for (int k = 0; k < n; k++) sum += s_nat_hist[(s_nat_idx - 1 - k + 64) % 64];
+                    s_native_ft_ms = sum / static_cast<float>(n);
+                    s_native_fps = (s_native_ft_ms > 0.0f) ? 1000.0f / s_native_ft_ms : 0.0f;
+                    s_has_native.store(true, std::memory_order_relaxed);
+                }
             }
-            s_vk_last_sim_frame_id = frames[i].id;
         }
-
-        // Recompute native FPS from the updated history
-        if (s_nat_idx > 0) {
-            int n = (s_nat_idx < 64) ? s_nat_idx : 64;
-            float sum = 0.0f;
-            for (int i = 0; i < n; i++) sum += s_nat_hist[(s_nat_idx - 1 - i + 64) % 64];
-            s_native_ft_ms = sum / static_cast<float>(n);
-            s_native_fps = (s_native_ft_ms > 0.0f) ? 1000.0f / s_native_ft_ms : 0.0f;
-            s_has_native.store(true, std::memory_order_relaxed);
+        if (n_frames > 0) {
+            s_last_vk_native_frame_id = frames[n_frames - 1].id;
+            s_last_vk_sim_start = frames[n_frames - 1].sim_start;
         }
     }
 }
@@ -506,67 +529,6 @@ static void DrawOSD(reshade::api::effect_runtime*) {
         if (strcmp(s_fg_str, "None") != 0) {
             snprintf(buf, sizeof(buf), "FG: %s", s_fg_str);
             add_line(buf, gold);
-        }
-    }
-
-    if (g_cfg.show_resolution.load(std::memory_order_relaxed)) {
-#ifdef _WIN64
-        // Prefer NGX-reported resolution (exact DLSS parameters) over viewport heuristics
-        if (ul_ngx_res::HasData()) {
-            bool rr = false;  // RR OSD display disabled for now — detection needs refinement
-            if (ul_ngx_res::IsDLAA()) {
-                uint32_t ow = ul_ngx_res::GetOutWidth(), oh = ul_ngx_res::GetOutHeight();
-                if (ow > 0 && oh > 0) {
-                    snprintf(buf, sizeof(buf), rr ? "Res: DLAA+RR %ux%u" : "Res: DLAA %ux%u", ow, oh);
-                    add_line(buf, gold);
-                }
-            } else {
-                uint32_t rw = ul_ngx_res::GetRenderWidth(), rh = ul_ngx_res::GetRenderHeight();
-                uint32_t ow = ul_ngx_res::GetOutWidth(), oh = ul_ngx_res::GetOutHeight();
-                int qm = ul_ngx_res::GetQualityMode();
-                if (rw > 0 && rh > 0 && ow > 0 && rw < ow) {
-                    int pct = static_cast<int>(100.0f * rw / static_cast<float>(ow));
-                    if (rr)
-                        snprintf(buf, sizeof(buf), "Res: %ux%u -> %ux%u (%d%%) RR", rw, rh, ow, oh, pct);
-                    else
-                        snprintf(buf, sizeof(buf), "Res: %ux%u -> %ux%u (%d%%)", rw, rh, ow, oh, pct);
-                    add_line(buf, gold);
-                } else if (rw == ow && rh == oh && qm >= 0) {
-                    // Streamline: render res == output but quality mode is known.
-                    // Show the quality mode name from the viewport-detected resolution.
-                    uint32_t vw = s_rnd_w.load(), vh = s_rnd_h.load();
-                    if (vw > 0 && vh > 0 && vw < ow) {
-                        int pct = static_cast<int>(100.0f * vw / static_cast<float>(ow));
-                        const char* mode = "";
-                        switch (qm) {
-                            case 0: mode = "Perf"; break;
-                            case 1: mode = "Balanced"; break;
-                            case 2: mode = "Quality"; break;
-                            case 3: mode = "Ultra Perf"; break;
-                            case 4: mode = "Ultra Quality"; break;
-                        }
-                        if (rr)
-                            snprintf(buf, sizeof(buf), "Res: %ux%u -> %ux%u (%d%% %s) RR", vw, vh, ow, oh, pct, mode);
-                        else
-                            snprintf(buf, sizeof(buf), "Res: %ux%u -> %ux%u (%d%% %s)", vw, vh, ow, oh, pct, mode);
-                        add_line(buf, gold);
-                    }
-                }
-            }
-        } else
-#endif
-        {
-            // Fallback: viewport-based detection (non-DLSS upscalers)
-            uint32_t ow = s_out_w.load(), oh = s_out_h.load();
-            uint32_t rw = s_rnd_w.load(), rh = s_rnd_h.load();
-            if (rw > 0 && rh > 0 && ow > 0 && rw < ow) {
-                int pct = static_cast<int>(100.0f * rw / static_cast<float>(ow));
-                snprintf(buf, sizeof(buf), "Res: %ux%u -> %ux%u (%d%%)", rw, rh, ow, oh, pct);
-                add_line(buf, gold);
-            } else if (s_dlaa_detected.load(std::memory_order_relaxed) && ow > 0 && oh > 0) {
-                snprintf(buf, sizeof(buf), "Res: DLAA %ux%u", ow, oh);
-                add_line(buf, gold);
-            }
         }
     }
 
@@ -1106,7 +1068,6 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
             toggle("Render Latency", g_cfg.show_render_lat, "Sim-start to GPU-render-end latency.");
             toggle("Present Latency", g_cfg.show_present_lat, "Present start-to-end latency.");
             toggle("FG Mode", g_cfg.show_fg_mode, "Detected frame generation technology.");
-            toggle("Output Resolution", g_cfg.show_resolution, "Render and output resolution with scale %.");
             toggle("Smoothness", g_cfg.show_smoothness, "Cadence smoothness score (CV-based).");
 
             ImGui::Spacing();
@@ -1321,6 +1282,12 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
             if (vk_dev) {
                 ul_log::Write("OnInitSwapchain: Vulkan device detected (ext injected=%d)",
                               VkReflexExtensionInjected() ? 1 : 0);
+
+                // Deferred hook: if vkCreateDevice was called through Streamline
+                // before our DllMain hooks, the LL2 functions weren't hooked.
+                // Try now that the device and sl.interposer.dll are loaded.
+                VkReflexDeferredHook(vk_dev);
+
                 if (g_vk_reflex.Init(vk_dev)) {
                     VkSwapchainKHR vk_sc = sc->get_native();
                     if (vk_sc && g_vk_reflex.AttachSwapchain(vk_sc)) {
@@ -1364,10 +1331,6 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
             ul_log::Write("OnInitSwapchain: ConnectReflex done");
 
 #ifdef _WIN64
-            // Deferred NGX hook — nvngx DLLs may not be loaded at DLL_PROCESS_ATTACH.
-            // Retry here since the game has initialized its rendering pipeline by now.
-            ul_ngx_res::InstallHooks();
-
             // Acquire GSync surface handle from back buffer
             // NvAPI_D3D_GetObjectHandleForResource needs the real D3D device and resource.
             // For DX12, we get ID3D12Device from the resource itself to ensure it's the
@@ -1470,120 +1433,6 @@ static void OnDestroySwapchain(reshade::api::swapchain* sc, bool) {
     ReleaseSwapchainHooks();
 }
 
-// Track render resolution via viewport dimensions.
-// When DLSS/FSR is active, the game sets a viewport matching the internal
-// render resolution for the main 3D pass. This is the most reliable signal.
-// We track the most frequently bound viewport size per frame to filter noise.
-
-struct VpBucket {
-    uint32_t w, h;
-    int count;
-};
-static constexpr int kMaxVpBuckets = 8;
-static VpBucket s_vp_buckets[kMaxVpBuckets] = {};
-static int s_vp_bucket_count = 0;
-
-static std::atomic<int> s_vp_calls{0};
-static bool s_vp_logged = false;
-static bool s_vp_sub_logged = false;
-
-static void OnBindViewports(reshade::api::command_list*,
-                            uint32_t first,
-                            uint32_t count,
-                            const reshade::api::viewport* viewports) {
-    if (!count || !viewports) return;
-
-    s_vp_calls.fetch_add(1, std::memory_order_relaxed);
-
-    // Only track sub-native viewports when an upscaler DLL is loaded.
-    // Without this gate, shadow maps / reflections / post-process passes
-    // produce false positives in non-upscaled games.
-    static bool s_upscaler_checked = false;
-    static bool s_upscaler_present = false;
-    if (!s_upscaler_checked || (s_vp_calls.load(std::memory_order_relaxed) % 300 == 0)) {
-        s_upscaler_present =
-            GetModuleHandleW(L"nvngx_dlss.dll") != nullptr ||
-            GetModuleHandleW(L"_nvngx_dlss.dll") != nullptr ||
-            GetModuleHandleW(L"nvngx_dlssd.dll") != nullptr ||
-            GetModuleHandleW(L"nvngx_dlssg.dll") != nullptr ||
-            GetModuleHandleW(L"_nvngx_dlssg.dll") != nullptr ||
-            GetModuleHandleW(L"sl.dlss.dll") != nullptr ||
-            GetModuleHandleW(L"sl.dlss_g.dll") != nullptr ||
-            GetModuleHandleW(L"dlss-g.dll") != nullptr ||
-            GetModuleHandleW(L"libxess.dll") != nullptr ||
-            GetModuleHandleW(L"amd_fidelityfx_opticalflow.dll") != nullptr ||
-            GetModuleHandleW(L"ffx_opticalflow.dll") != nullptr ||
-            GetModuleHandleW(L"amd_fidelityfx_framegeneration.dll") != nullptr ||
-            GetModuleHandleW(L"ffx_fsr3upscaler.dll") != nullptr ||
-            GetModuleHandleW(L"ffx_fsr2.dll") != nullptr ||
-            GetModuleHandleW(L"nvngx.dll") != nullptr ||
-            GetModuleHandleW(L"_nvngx.dll") != nullptr;
-        if (!s_upscaler_checked && s_upscaler_present)
-            ul_log::Write("Viewport: upscaler DLL detected — viewport tracking active");
-        if (!s_upscaler_checked && !s_upscaler_present)
-            ul_log::Write("Viewport: no upscaler DLL detected — viewport tracking disabled");
-        s_upscaler_checked = true;
-    }
-    if (!s_upscaler_present) return;
-
-    uint32_t ow = s_out_w.load(std::memory_order_relaxed);
-    uint32_t oh = s_out_h.load(std::memory_order_relaxed);
-    if (!ow || !oh) return;
-
-    // One-time log of first viewport seen
-    if (!s_vp_logged) {
-        float fw0 = viewports[0].width;
-        float fh0 = viewports[0].height;
-        if (fh0 < 0.0f) fh0 = -fh0;
-        ul_log::Write("Viewport: first seen %.0fx%.0f (output %ux%u, count=%u)",
-                      fw0, fh0, ow, oh, count);
-        s_vp_logged = true;
-    }
-
-    for (uint32_t i = 0; i < count; i++) {
-        // Vulkan allows negative viewport height (Y-flip convention).
-        // Use absolute values so the sub-native detection works correctly.
-        float fw = viewports[i].width;
-        float fh = viewports[i].height;
-        if (fw <= 0.0f) fw = -fw;
-        if (fh <= 0.0f) fh = -fh;
-        if (fw < 1.0f || fh < 1.0f) continue;
-        uint32_t w = static_cast<uint32_t>(fw);
-        uint32_t h = static_cast<uint32_t>(fh);
-
-        // Must be smaller than output (this is the upscale source)
-        if (w >= ow || h >= oh) continue;
-        // Must be at least 25% of output
-        if (w < ow / 4 || h < oh / 4) continue;
-        // Skip tiny viewports
-        if (w < 256 || h < 256) continue;
-
-        // Aspect ratio must match output within 10%
-        float out_ar = static_cast<float>(ow) / oh;
-        float vp_ar = static_cast<float>(w) / h;
-        if (std::abs(vp_ar - out_ar) / out_ar > 0.10f) continue;
-
-        // One-time log of first sub-native viewport
-        if (!s_vp_sub_logged) {
-            ul_log::Write("Viewport: sub-native %ux%u detected (output %ux%u)", w, h, ow, oh);
-            s_vp_sub_logged = true;
-        }
-
-        // Tally in per-frame buckets
-        bool found = false;
-        for (int j = 0; j < s_vp_bucket_count; j++) {
-            if (s_vp_buckets[j].w == w && s_vp_buckets[j].h == h) {
-                s_vp_buckets[j].count++;
-                found = true;
-                break;
-            }
-        }
-        if (!found && s_vp_bucket_count < kMaxVpBuckets) {
-            s_vp_buckets[s_vp_bucket_count++] = { w, h, 1 };
-        }
-    }
-}
-
 static void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* sc,
                       const reshade::api::rect*, const reshade::api::rect*,
                       uint32_t, const reshade::api::rect*) {
@@ -1597,87 +1446,12 @@ static void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* sc,
         UpdateStats();
         if (cnt > 300 && cnt % 30 == 0) PollGpuLatency();
 #ifdef _WIN64
-        // Poll Vulkan more frequently — the batch extraction in
-        // PollVkGpuLatency processes all new frames per call, so higher
-        // frequency means the pacing graph and native FPS update faster.
-        if (cnt > 300 && cnt % 10 == 0) PollVkGpuLatency();
+        // Poll Vulkan latency more frequently than DX — this is the primary
+        // source of native FPS data on Vulkan (marker callbacks may not flow).
+        if (cnt > 300 && cnt % 8 == 0) PollVkGpuLatency();
 #endif
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         ul_log::Write("OnPresent: exception 0x%08X", GetExceptionCode());
-    }
-
-    // Log viewport event status after 300 frames
-    if (cnt == 300) {
-        int vp = s_vp_calls.load(std::memory_order_relaxed);
-        ul_log::Write("Viewport: %d bind_viewports calls after %llu presents (buckets=%d)",
-                      vp, cnt, s_vp_bucket_count);
-    }
-
-#ifdef _WIN64
-    // Deferred NGX hook retry — DLSS DLLs may load lazily (Streamline games).
-    // Try periodically until we get data or give up after 600 frames.
-    if (cnt <= 600 && cnt % 60 == 0 && !ul_ngx_res::HasData()) {
-        ul_ngx_res::InstallHooks();
-    }
-#endif
-
-    // Commit the most-used sub-native viewport as the render resolution.
-    // When no sub-native viewports are seen for several consecutive frames,
-    // clear the render resolution. This avoids flickering in FG games where
-    // generated frames may not trigger the viewport callback.
-    static int s_no_vp_frames = 0;
-    static int s_dlaa_streak = 0;     // consecutive frames detecting DLAA
-    static int s_upscale_streak = 0;  // consecutive frames detecting upscaling
-    static constexpr int kResHysteresis = 10;  // frames before switching display
-    if (s_vp_bucket_count > 0) {
-        int best = 0;
-        for (int i = 1; i < s_vp_bucket_count; i++) {
-            uint32_t area_i = s_vp_buckets[i].w * s_vp_buckets[i].h;
-            uint32_t area_b = s_vp_buckets[best].w * s_vp_buckets[best].h;
-            if (area_i > area_b)
-                best = i;
-        }
-        // Detect DLAA/native: when all sub-native viewports are small enough
-        // to be internal passes (≤55% of output on both axes), the game is
-        // rendering at native resolution. With DLAA, the upscaler DLL is loaded
-        // but the render resolution equals output — all sub-native viewports
-        // are post-process passes (bloom, DOF, motion vectors, shadow maps).
-        //
-        // When at least one viewport exceeds the threshold, it's likely the
-        // real DLSS render resolution (Balanced ~58%, Quality ~67%, etc.).
-        uint32_t bw = s_vp_buckets[best].w, bh = s_vp_buckets[best].h;
-        uint32_t ow2 = s_out_w.load(std::memory_order_relaxed);
-        uint32_t oh2 = s_out_h.load(std::memory_order_relaxed);
-        bool largest_is_internal = ow2 > 0 && oh2 > 0
-                    && (bw <= ow2 * 55 / 100)
-                    && (bh <= oh2 * 55 / 100);
-        if (largest_is_internal) {
-            // Only one sub-native size and it's half-res — likely DLAA/native.
-            // Use hysteresis to prevent flickering when bucket count varies.
-            s_dlaa_streak++;
-            s_upscale_streak = 0;
-            if (s_dlaa_streak >= kResHysteresis) {
-                s_rnd_w.store(0, std::memory_order_relaxed);
-                s_rnd_h.store(0, std::memory_order_relaxed);
-                s_dlaa_detected.store(true, std::memory_order_relaxed);
-            }
-        } else {
-            s_upscale_streak++;
-            s_dlaa_streak = 0;
-            if (s_upscale_streak >= kResHysteresis) {
-                s_rnd_w.store(bw, std::memory_order_relaxed);
-                s_rnd_h.store(bh, std::memory_order_relaxed);
-                s_dlaa_detected.store(false, std::memory_order_relaxed);
-            }
-        }
-        s_vp_bucket_count = 0;
-        s_no_vp_frames = 0;
-    } else {
-        if (++s_no_vp_frames > 60) {
-            s_rnd_w.store(0, std::memory_order_relaxed);
-            s_rnd_h.store(0, std::memory_order_relaxed);
-            s_dlaa_detected.store(false, std::memory_order_relaxed);
-        }
     }
 }
 
@@ -1755,12 +1529,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             VkReflexHookCreateDevice();
 #endif
 
-            // Hook NGX CreateFeature to read DLSS render resolution and quality mode.
-            // Must be installed before the game creates its DLSS feature.
-#ifdef _WIN64
-            ul_ngx_res::InstallHooks();
-#endif
-
             SetSLPresentCb(OnSLPresentCb);
             SetMarkerCb(OnMarkerCb);
 #ifdef _WIN64
@@ -1770,7 +1538,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
             reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
             reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
-            reshade::register_event<reshade::addon_event::bind_viewports>(OnBindViewports);
             reshade::register_event<reshade::addon_event::present>(OnPresent);
             reshade::register_overlay("ReLimiter", DrawOverlay);
             reshade::register_event<reshade::addon_event::reshade_overlay>(DrawOSD);
@@ -1790,7 +1557,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         StopWorker();
 #ifdef _WIN64
         VkReflexUnhookCreateDevice();
-        ul_ngx_res::RemoveHooks();
 #endif
         reshade::unregister_overlay("ReLimiter", DrawOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_overlay>(DrawOSD);

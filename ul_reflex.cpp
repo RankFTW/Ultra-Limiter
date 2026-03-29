@@ -93,6 +93,10 @@ static std::atomic<UINT> s_game_latency{0};
 static IDXGISwapChain2* s_latency_sc2 = nullptr;
 static void* s_latency_set_target = nullptr;  // vtable[31] address
 
+// GPU architecture detection — cached at NVAPI init time.
+// Blackwell (RTX 50-series) = 0x1B0. Flip metering is only beneficial on Blackwell+.
+static bool s_is_blackwell = false;
+
 // Returns true when driver-side DMFG is likely active:
 // game requests deep queue (≥4) AND no user-space FG DLL is loaded.
 // Standard DLSS FG / FSR FG games may also request ≥4 queue depth,
@@ -141,15 +145,13 @@ static void* __cdecl Hook_QueryInterface(NvU32 id) {
         if (GetModuleHandleW(L"NvPresent64.dll") != nullptr) {
             return s_orig_qi ? s_orig_qi(id) : nullptr;
         }
-        // Allow through for DMFG (3x+) — higher multipliers need flip metering
-        // for driver-side presentation coordination. Detect via game's requested
-        // frame latency: standard 2x FG requests 2-3, DMFG 3x+ requests ≥4.
-        if (IsDmfgSession()) {
-            static bool s_dmfg_logged = false;
-            if (!s_dmfg_logged) {
-                ul_log::Write("Hook_QueryInterface: allowing SetFlipConfig for DMFG (game latency=%u)",
-                              s_game_latency.load(std::memory_order_relaxed));
-                s_dmfg_logged = true;
+        // Allow through on Blackwell+ (RTX 50-series) — flip metering is
+        // beneficial on this architecture for both DMFG and standard FG.
+        if (s_is_blackwell) {
+            static bool s_bw_logged = false;
+            if (!s_bw_logged) {
+                ul_log::Write("Hook_QueryInterface: allowing SetFlipConfig (Blackwell+)");
+                s_bw_logged = true;
             }
             return s_orig_qi ? s_orig_qi(id) : nullptr;
         }
@@ -227,6 +229,33 @@ static bool LoadNvapi() {
 
     NvStatus st = init_fn();
     if (st != NV_OK) { ul_log::Write("LoadNvapi: Initialize returned %d", st); return false; }
+
+    // Detect GPU architecture — Blackwell (RTX 50-series) = 0x1B0
+    // NvAPI_EnumPhysicalGPUs = 0xE5AC921F, NvAPI_GPU_GetArchInfo = 0xD8265D24
+    {
+        using EnumGPUs_fn = NvStatus(__cdecl*)(void* handles[64], NvU32* count);
+        using GetArchInfo_fn = NvStatus(__cdecl*)(void* handle, void* arch_info);
+
+        auto enum_gpus = reinterpret_cast<EnumGPUs_fn>(real_qi(0xE5AC921F));
+        auto get_arch  = reinterpret_cast<GetArchInfo_fn>(real_qi(0xD8265D24));
+
+        if (enum_gpus && get_arch) {
+            void* gpu_handles[64] = {};
+            NvU32 gpu_count = 0;
+            if (enum_gpus(gpu_handles, &gpu_count) == NV_OK && gpu_count > 0) {
+                // NV_GPU_ARCH_INFO: version (NvU32) + architecture_id (NvU32) + ...
+                // version = sizeof(struct) | (1 << 16). Struct is 16 bytes min.
+                struct { NvU32 version; NvU32 architecture_id; NvU32 implementation_id; NvU32 revision_id; } arch = {};
+                arch.version = sizeof(arch) | (1 << 16);
+                if (get_arch(gpu_handles[0], &arch) == NV_OK) {
+                    s_is_blackwell = (arch.architecture_id >= 0x1B0);
+                    ul_log::Write("LoadNvapi: GPU arch=0x%X impl=0x%X %s",
+                                  arch.architecture_id, arch.implementation_id,
+                                  s_is_blackwell ? "(Blackwell+)" : "");
+                }
+            }
+        }
+    }
 
     s_nvapi_dll = dll;
     s_qi = real_qi;  // store the original QI for our own use
@@ -505,6 +534,10 @@ void BlockGetLatency() {
 
 bool IsStreamlineSafeMode() {
     return s_streamline_safe_mode.load(std::memory_order_acquire);
+}
+
+bool IsBlackwell() {
+    return s_is_blackwell;
 }
 
 const GameReflexState& GetGameState() { return s_game_state; }

@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.5.3
+
+Black screen fix, OSD retune, and Vulkan FG grid pacing correction.
+
+### Black Screen Fix
+- Fixed black screen in DX games like Crimson Desert where generated frames were blocked by the render-rate grid. OnPresent now passes the FG divisor to DoOwnSleep so the grid paces at the output rate instead of the render rate.
+
+### OSD Retune
+- Tuned OSD layout spacing and element sizing for improved readability.
+- Removed certain OSD elements that were unreliable.
+
+### Vulkan Reflex Sleep Clarification
+- Corrected InvokeReflexSleep comment to reflect that the game's vkLatencySleepNV is swallowed by our wrapper, not forwarded to the driver.
+
 ## v2.5.2
 
 Vulkan Streamline compatibility, semaphore recovery, FG grid timing, NGX late-hook resolution detection, OSD improvements, and Vulkan polling overhaul.
