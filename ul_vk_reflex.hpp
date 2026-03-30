@@ -21,6 +21,7 @@ VK_DEFINE_NON_DISPATCHABLE_HANDLE(VkSemaphore)
 
 // VkDevice is a dispatchable handle (pointer-sized)
 typedef struct VkDevice_T* VkDevice;
+typedef struct VkQueue_T* VkQueue;
 
 // Vulkan base types
 typedef uint32_t VkBool32;
@@ -178,6 +179,34 @@ using PFN_vkCreateDevice = VkResult(*)(VkPhysicalDevice, const VkDeviceCreateInf
 using PFN_vkEnumerateDeviceExtensionProperties = VkResult(*)(VkPhysicalDevice, const char*, uint32_t*, VkExtensionProperties*);
 using PFN_vkGetInstanceProcAddr = void*(*)(VkInstance, const char*);
 
+// Minimal VkPresentInfoKHR (from vulkan_core.h, MIT)
+constexpr VkStructureType VK_STRUCTURE_TYPE_PRESENT_INFO_KHR = 1000001001;
+struct VkPresentInfoKHR {
+    VkStructureType    sType;
+    const void*        pNext;
+    uint32_t           waitSemaphoreCount;
+    const VkSemaphore* pWaitSemaphores;
+    uint32_t           swapchainCount;
+    const VkSwapchainKHR* pSwapchains;
+    const uint32_t*    pImageIndices;
+    VkResult*          pResults;
+};
+
+using PFN_vkQueuePresentKHR = VkResult(*)(VkQueue, const VkPresentInfoKHR*);
+
+// Minimal VkSwapchainCreateInfoKHR — we only need sType, pNext, flags
+// (from vulkan_core.h, MIT). Full struct is 104 bytes on 64-bit.
+constexpr VkStructureType VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR = 1000001000;
+struct VkSwapchainCreateInfoKHR {
+    VkStructureType sType;
+    const void*     pNext;
+    VkFlags         flags;
+    // ... remaining fields (surface, minImageCount, format, etc.)
+    // We don't access them — just patch flags and forward the whole struct.
+};
+
+using PFN_vkCreateSwapchainKHR = VkResult(*)(VkDevice, const VkSwapchainCreateInfoKHR*, const void*, VkSwapchainKHR*);
+
 // ============================================================================
 // VkReflex — Vulkan low-latency backend
 // ============================================================================
@@ -248,9 +277,137 @@ bool VkReflexExtensionInjected();
 // Reflex games (mirrors DX SetMarkerCb for Vulkan path).
 void SetVkMarkerCb(MarkerCb cb);
 
+// Hook Streamline's slPCLSetMarker — intercepts markers at the game→Streamline
+// boundary. Works for Vulkan+Streamline games where LL2 function hooking fails.
+bool HookStreamlinePCL();
+
+// Invoke the real Streamline sleep on our schedule (trampoline past our hook).
+// Equivalent to DX InvokeSleep — keeps driver LL2 state coherent.
+bool InvokeStreamlineSleep();
+
+// Invoke the real Streamline SetOptions with our interval.
+// Equivalent to DX InvokeSetSleepMode — controls the driver's pacing interval.
+bool InvokeStreamlineSetOptions(uint32_t interval_us, bool low_latency, bool boost);
+
 // Deferred hook attempt — call from OnInitSwapchain when the Vulkan device
 // is known to exist. Hooks sl.interposer.dll and LL2 functions that were
 // missed because vkCreateDevice went through Streamline before our DllMain.
 void VkReflexDeferredHook(VkDevice device);
+
+// ============================================================================
+// VK_EXT_present_timing — display-level frame pacing
+// Written from public Vulkan specification (MIT/Apache-2.0):
+//   - Khronos VK_EXT_present_timing proposal
+// ============================================================================
+
+// sType values (from vulkan_core.h)
+constexpr VkStructureType VK_STRUCTURE_TYPE_SWAPCHAIN_TIMING_PROPERTIES_EXT = static_cast<VkStructureType>(1000208001);
+constexpr VkStructureType VK_STRUCTURE_TYPE_PRESENT_TIMINGS_INFO_EXT = static_cast<VkStructureType>(1000208003);
+constexpr VkStructureType VK_STRUCTURE_TYPE_PRESENT_TIMING_INFO_EXT = static_cast<VkStructureType>(1000208004);
+constexpr VkStructureType VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT = static_cast<VkStructureType>(1000208005);
+constexpr VkStructureType VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_PROPERTIES_EXT = static_cast<VkStructureType>(1000208006);
+constexpr VkStructureType VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_EXT = static_cast<VkStructureType>(1000208007);
+constexpr VkStructureType VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT = static_cast<VkStructureType>(1000208008);
+constexpr VkStructureType VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT = static_cast<VkStructureType>(1000208000);
+
+// Swapchain create flag — bitpos 9 per vk.xml
+constexpr VkFlags VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT = 0x00000200;
+
+// Present stage flags
+constexpr uint32_t VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT = 0x00000001;
+constexpr uint32_t VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT = 0x00000004;
+constexpr uint32_t VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT = 0x00000008;
+
+struct VkSwapchainTimingPropertiesEXT {
+    VkStructureType sType;
+    const void*     pNext;
+    uint64_t        refreshDuration;
+    uint64_t        refreshInterval;
+};
+
+struct VkPresentTimingInfoEXT {
+    VkStructureType sType;
+    const void*     pNext;
+    uint32_t        flags;
+    uint64_t        targetTime;
+    uint64_t        timeDomainId;
+    uint32_t        presentStageQueries;
+    uint32_t        targetTimeDomainPresentStage;
+};
+
+struct VkPresentTimingsInfoEXT {
+    VkStructureType                sType;
+    const void*                    pNext;
+    uint32_t                       swapchainCount;
+    const VkPresentTimingInfoEXT*  pTimingInfos;
+};
+
+struct VkPresentStageTimeEXT {
+    uint32_t stage;
+    uint64_t time;
+};
+
+struct VkPastPresentationTimingInfoEXT {
+    VkStructureType sType;
+    const void*     pNext;
+    uint32_t        flags;
+    VkSwapchainKHR  swapchain;
+};
+
+struct VkPastPresentationTimingEXT {
+    VkStructureType        sType;
+    const void*            pNext;
+    uint64_t               presentId;
+    uint64_t               targetTime;
+    uint32_t               presentStageCount;
+    VkPresentStageTimeEXT* pPresentStages;
+    uint32_t               timeDomain;
+    uint64_t               timeDomainId;
+    uint32_t               reportComplete;
+};
+
+struct VkPastPresentationTimingPropertiesEXT {
+    VkStructureType              sType;
+    const void*                  pNext;
+    uint64_t                     timingPropertiesCounter;
+    uint64_t                     timeDomainsCounter;
+    uint32_t                     presentationTimingCount;
+    VkPastPresentationTimingEXT* pPresentationTimings;
+};
+
+// Function pointer types
+using PFN_vkGetSwapchainTimingPropertiesEXT = VkResult(*)(VkDevice, VkSwapchainKHR, VkSwapchainTimingPropertiesEXT*, uint64_t*);
+using PFN_vkSetSwapchainPresentTimingQueueSizeEXT = VkResult(*)(VkDevice, VkSwapchainKHR, uint32_t);
+using PFN_vkGetPastPresentationTimingEXT = VkResult(*)(VkDevice, const VkPastPresentationTimingInfoEXT*, VkPastPresentationTimingPropertiesEXT*);
+
+// Returns true if VK_EXT_present_timing was injected and is active
+bool VkPresentTimingAvailable();
+
+// Initialize present timing for a swapchain — call from OnInitSwapchain
+bool VkPresentTimingInit(VkDevice device, VkSwapchainKHR swapchain);
+
+// Poll timing properties (refresh rate, VRR status)
+bool VkPresentTimingPollProperties();
+
+// Hook vkQueuePresentKHR to attach present timing info
+bool VkPresentTimingHookPresent();
+void VkPresentTimingUnhookPresent();
+
+// Hook vkCreateSwapchainKHR to inject VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT
+bool VkPresentTimingHookCreateSwapchain();
+
+// Set the target present time for the next frame (absolute nanoseconds, QPC domain)
+void VkPresentTimingSetTargetTime(uint64_t target_ns);
+
+// Get the latest display feedback (actual scanout time)
+// Returns true if new feedback is available, fills out_display_ns
+bool VkPresentTimingGetFeedback(uint64_t* out_display_ns, uint64_t* out_target_ns);
+
+// Get the display's refresh duration in nanoseconds (from swapchain timing properties).
+// Returns 0 if not available. Updates dynamically via VkPresentTimingPollProperties.
+uint64_t VkPresentTimingGetRefreshDurationNs();
+
+// Returns true if the display is in VRR mode (refreshInterval == UINT64_MAX).
+bool VkPresentTimingIsVRR();
 
 #endif // _WIN64

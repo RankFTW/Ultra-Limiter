@@ -1288,6 +1288,21 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
                 // Try now that the device and sl.interposer.dll are loaded.
                 VkReflexDeferredHook(vk_dev);
 
+                // Set up NVAPI hooks — Streamline's Reflex plugin uses NVAPI
+                // internally even for Vulkan games. This is the same hook path
+                // that works for DX, intercepting NvAPI_D3D_SetLatencyMarker etc.
+                if (!ReflexActive()) {
+                    ul_log::Write("OnInitSwapchain: setting up NVAPI hooks for Vulkan+Streamline");
+                    SetupReflexHooks();
+                }
+
+                // Hook Streamline's PCL marker API — this intercepts markers at
+                // the game→Streamline boundary, before Streamline translates them
+                // to vkSetLatencyMarkerNV. Works where LL2 function hooking fails.
+                if (GetModuleHandleW(L"sl.common.dll") != nullptr) {
+                    HookStreamlinePCL();
+                }
+
                 if (g_vk_reflex.Init(vk_dev)) {
                     VkSwapchainKHR vk_sc = sc->get_native();
                     if (vk_sc && g_vk_reflex.AttachSwapchain(vk_sc)) {
@@ -1298,6 +1313,15 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
                     }
                 } else {
                     ul_log::Write("OnInitSwapchain: VK_NV_low_latency2 not available — timing fallback");
+                }
+
+                // Initialize VK_EXT_present_timing for display-level pacing
+                {
+                    VkSwapchainKHR vk_sc = sc->get_native();
+                    if (vk_sc && VkPresentTimingInit(vk_dev, vk_sc)) {
+                        VkPresentTimingHookPresent();
+                        ul_log::Write("OnInitSwapchain: VK_EXT_present_timing active");
+                    }
                 }
             }
             ul_log::Write("OnInitSwapchain: done (Vulkan)");

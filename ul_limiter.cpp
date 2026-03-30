@@ -761,6 +761,26 @@ static NvU32 ComputeVrrFloorIntervalUs(HWND hwnd) {
 
     if (ovr == 2) { s_cached = 0; return 0; }
 
+    // Prefer VK_EXT_present_timing refresh duration — direct from display
+    // hardware, updates dynamically, more accurate than EnumDisplaySettings.
+#ifdef _WIN64
+    {
+        uint64_t refresh_ns = VkPresentTimingGetRefreshDurationNs();
+        if (refresh_ns > 0) {
+            double hz = 1e9 / static_cast<double>(refresh_ns);
+            if (hz >= 30.0) {
+                double ceiling_fps = 3600.0 * hz / (hz + 3600.0);
+                if (ceiling_fps >= 10.0) {
+                    ceiling_fps *= 0.995;
+                    s_cached = static_cast<NvU32>(std::round(1'000'000.0 / ceiling_fps));
+                    return s_cached;
+                }
+            }
+        }
+    }
+#endif
+
+    // Fallback: EnumDisplaySettings (DX path, or Vulkan without present_timing)
     if (!hwnd) hwnd = GetForegroundWindow();
     if (!hwnd) { s_cached = 0; return 0; }
 
@@ -1149,8 +1169,9 @@ bool UlLimiter::MaybeUpdateSleepMode(const NvSleepParams& p) {
                 p.bLowLatencyBoost != 0,
                 p.minimumIntervalUs);
         } else {
-            // Native game forwards its own SetSleepMode to the driver.
-            // Don't override — our interval is communicated via the grid only.
+            // Native Reflex (including Streamline): game manages SetSleepMode.
+            // We can't override the interval because Streamline's internal
+            // vkLatencySleepNV blocks for whatever interval is set on the driver.
             ok = true;
         }
     } else
@@ -1169,10 +1190,16 @@ bool UlLimiter::MaybeUpdateSleepMode(const NvSleepParams& p) {
 // consumed the wait via our grid). Keeps the driver's internal state coherent.
 void UlLimiter::InvokeReflexSleep() {
 #ifdef _WIN64
-    // Vulkan: the game's vkLatencySleepNV is swallowed by our wrapper —
-    // our grid handles all timing. No need to call VkReflex::Sleep() here,
-    // that would create a competing semaphore sequence and break FG.
-    if (VK_REFLEX_ACTIVE()) return;
+    if (VK_REFLEX_ACTIVE()) {
+        // Streamline: call the swallowed slReflexSleep trampoline with the
+        // stashed frame token. This advances Streamline's internal state
+        // after our grid pacing has completed.
+        if (GetModuleHandleW(L"sl.common.dll") != nullptr) {
+            InvokeStreamlineSleep();
+            return;
+        }
+        return;
+    }
 #endif
     if (ReflexActive() && dev_)
         InvokeSleep(dev_);
@@ -1545,25 +1572,52 @@ void UlLimiter::UpdatePipelineStats() {
     // Use the most recent presentEndTime to measure phase error between
     // our grid and actual display timing. Nudge grid epoch to converge.
     if (grid_interval_ns_ > 0 && grid_epoch_ns_ > 0) {
-        uint64_t newest_id = 0;
-        uint64_t newest_present = 0;
-        for (int i = 0; i < 64; i++) {
-            auto& f = latency_buf_->frameReport[i];
-            if (f.frameID > newest_id && f.presentEndTime > 0) {
-                newest_id = f.frameID;
-                newest_present = f.presentEndTime;
+        int64_t actual_ns = 0;
+        uint64_t feedback_id = 0;
+        bool high_precision_feedback = false;
+
+#ifdef _WIN64
+        // Prefer VK_EXT_present_timing feedback — nanosecond-accurate scanout time
+        // from IMAGE_FIRST_PIXEL_OUT, independent of LL2/Streamline.
+        {
+            uint64_t display_ns = 0, target_ns = 0;
+            if (VkPresentTimingGetFeedback(&display_ns, &target_ns) && display_ns > 0) {
+                actual_ns = static_cast<int64_t>(display_ns);
+                feedback_id = display_ns;  // use display time as unique ID
+                high_precision_feedback = true;
+                static int s_pll_log = 0;
+                if (s_pll_log++ < 5) {
+                    ul_log::Write("PLL: display_ns=%lld grid_epoch=%lld grid_next=%lld now=%lld",
+                                   actual_ns, grid_epoch_ns_, grid_next_ns_, ul_timing::NowNs());
+                }
+            }
+        }
+#endif
+
+        // Fallback: GetLatencyTimings presentEndTime (DX path, or Vulkan without present timing)
+        if (actual_ns == 0) {
+            uint64_t newest_id = 0;
+            uint64_t newest_present = 0;
+            for (int i = 0; i < 64; i++) {
+                auto& f = latency_buf_->frameReport[i];
+                if (f.frameID > newest_id && f.presentEndTime > 0) {
+                    newest_id = f.frameID;
+                    newest_present = f.presentEndTime;
+                }
+            }
+            if (newest_id > last_pll_frame_id_ && newest_present > 0) {
+                feedback_id = newest_id;
+                // Convert presentEndTime (QPC ticks) to nanoseconds
+                actual_ns = static_cast<int64_t>(
+                    static_cast<double>(newest_present) * 1e9
+                    / static_cast<double>(ul_timing::g_qpc_freq));
             }
         }
 
-        if (newest_id > last_pll_frame_id_ && newest_present > 0) {
-            last_pll_frame_id_ = newest_id;
+        if (feedback_id > last_pll_frame_id_ && actual_ns > 0) {
+            last_pll_frame_id_ = feedback_id;
 
-            // Convert presentEndTime (QPC ticks) to nanoseconds
-            int64_t actual_ns = static_cast<int64_t>(
-                static_cast<double>(newest_present) * 1e9
-                / static_cast<double>(ul_timing::g_qpc_freq));
-
-            // Nearest grid slot to the actual present time
+            // Nearest grid slot to the actual present/display time
             int64_t elapsed = actual_ns - grid_epoch_ns_;
             int64_t expected_slot = (elapsed / grid_interval_ns_) * grid_interval_ns_
                                   + grid_epoch_ns_;
@@ -1575,13 +1629,17 @@ void UlLimiter::UpdatePipelineStats() {
             else if (phase_error_ns < -grid_interval_ns_ / 2)
                 phase_error_ns += grid_interval_ns_;
 
-            // EMA smooth the error
-            pll_smoothed_error_ns_ = pll_smoothed_error_ns_ * (1.0f - kPllAlpha)
-                                   + static_cast<float>(phase_error_ns) * kPllAlpha;
+            // EMA smooth the error — tighter gains when using VK_EXT_present_timing
+            // (nanosecond hardware feedback) vs GetLatency (microsecond, delayed).
+            float alpha = high_precision_feedback ? 0.12f : kPllAlpha;
+            float gain  = high_precision_feedback ? 0.20f : kPllCorrectionGain;
+
+            pll_smoothed_error_ns_ = pll_smoothed_error_ns_ * (1.0f - alpha)
+                                   + static_cast<float>(phase_error_ns) * alpha;
 
             // Nudge grid epoch
             int64_t correction = static_cast<int64_t>(
-                pll_smoothed_error_ns_ * kPllCorrectionGain);
+                pll_smoothed_error_ns_ * gain);
             if (correction != 0)
                 grid_epoch_ns_ += correction;
         }
@@ -1896,7 +1954,23 @@ void UlLimiter::DoOwnSleep(int fg_div) {
             grid_interval_ns_ * (1.0 - kGridAlpha) + frame_ns * kGridAlpha);
 
         if (grid_next_ns_ > now) {
-            ul_timing::SleepUntilNs(grid_next_ns_, htimer_fallback_);
+#ifdef _WIN64
+            // When VK_EXT_present_timing is active, release the frame early
+            // and let the driver's display scheduler handle final vblank
+            // alignment via targetTime. The driver has hardware-level timing
+            // precision that our busy-wait can't match.
+            // Release 500µs early — enough for the driver to process the
+            // present and schedule into the correct vblank.
+            if (VkPresentTimingAvailable()) {
+                constexpr int64_t kEarlyReleaseNs = 500'000LL;  // 500µs
+                int64_t early_wake = grid_next_ns_ - kEarlyReleaseNs;
+                if (early_wake > now)
+                    ul_timing::SleepUntilNs(early_wake, htimer_fallback_);
+            } else
+#endif
+            {
+                ul_timing::SleepUntilNs(grid_next_ns_, htimer_fallback_);
+            }
             grid_next_ns_ += grid_interval_ns_;
         } else {
             int64_t elapsed = now - grid_epoch_ns_;
@@ -1907,6 +1981,15 @@ void UlLimiter::DoOwnSleep(int fg_div) {
 
     // --- Reflex passthrough (unified) ---
     __try {
+#ifdef _WIN64
+        // VK_EXT_present_timing: set the target display time to the grid slot.
+        // We released the frame early (above) — the driver holds it until this
+        // time, aligning scanout with our grid using hardware vblank precision.
+        if (VkPresentTimingAvailable()) {
+            // Target = the grid slot we're aiming for (grid_next - interval = current slot)
+            VkPresentTimingSetTargetTime(static_cast<uint64_t>(grid_next_ns_ - grid_interval_ns_));
+        }
+#endif
         MaybeUpdateSleepMode(p);
         InvokeReflexSleep();
     } __except(EXCEPTION_EXECUTE_HANDLER) {
