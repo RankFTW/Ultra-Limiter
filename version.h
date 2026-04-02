@@ -2,5 +2,5 @@
 #pragma once
 #define UL_VERSION_MAJOR 2
 #define UL_VERSION_MINOR 5
-#define UL_VERSION_PATCH 2
-#define UL_VERSION_STRING "2.5.2"
+#define UL_VERSION_PATCH 5
+#define UL_VERSION_STRING "2.5.5"

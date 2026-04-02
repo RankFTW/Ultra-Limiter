@@ -1,5 +1,59 @@
 # Changelog
 
+## v2.5.6
+
+DX-focused rebuild — Vulkan backend removed, Streamline FG detection added, PLL and adaptive pacing improvements.
+
+### Vulkan Backend Removed
+- All Vulkan Reflex code has been removed (VK_NV_low_latency2, VK_EXT_present_timing, vkCreateDevice hooks, LL2 function hooks). ReLimiter is now DX-only.
+- Vulkan games still get basic frame limiting via the timing grid fallback — no Reflex integration or adaptive features.
+
+### Streamline FG Detection
+- Added Streamline DLSS-G detection for DX games. ReLimiter now reads the FG multiplier and active state directly from Streamline's API, replacing the old FPS-ratio estimation.
+- FG multiplier changes are tracked live (2x, 3x, 4x) and reflected immediately in pacing and OSD.
+- Only the FG detection hooks are installed — Streamline's Reflex sleep and marker paths are left untouched so the NVAPI pipeline continues working correctly.
+
+### VBlank Monitor
+- New D3DKMT-based vblank monitor provides exact hardware vblank timestamps on DX. Runs a background thread using `D3DKMTWaitForVerticalBlankEvent` with automatic retry on transient failures.
+
+### PLL Overhaul
+- PLL feedback now uses a priority chain: D3DKMT vblank (best) → DXGI GetFrameStatistics → marker PRESENT_FINISH → GetLatency presentEndTime (fallback).
+- Phase error is measured at the vblank level instead of the grid level, fixing ±interval/2 ambiguity at high vblank-to-grid ratios (e.g. 165Hz display at 41 FPS).
+- Three-tier phase error gate: normal samples accumulate into the EMA, noisy samples are skipped, genuine discontinuities trigger a full PLL reset. Prevents the old binary pass/nuke behavior from destroying PLL state on every jitter spike.
+- PLL convergence tracking: corrections are only applied after the error variance stabilizes (20+ samples, stddev below threshold).
+
+### Adaptive Pacing Improvements
+- Enforcement site now uses a 120-frame voting window with 70% supermajority — prevents oscillation from transient GPU load changes.
+- GPU load gate uses a 60-frame voting window with asymmetric thresholds (60% to open, 30% to close) — reduces false gate closures during brief load dips.
+- FG tier changes require 30 consecutive frames of confirmation before propagating. First detection is still immediate. Prevents rapid oscillation at tier boundaries.
+- Grid snaps to new interval immediately on confirmed FG tier change instead of EMA-drifting over 20 frames.
+- QPC cadence monitor only feeds on real-frame presents when FG is active, preventing the alternating real/generated frame deltas from permanently triggering the consistency buffer brake.
+- Present-to-present feedback loop is disabled when DXGI frame statistics are active, avoiding conflicts with the PLL.
+- Queue depth voting now checks predictor validity — suppresses stale miss counts when FG overhead data is missing.
+
+### Streamline GetLatency Fallback
+- When GetLatency returns empty reports (Streamline device mismatch), the cadence tracker falls back to PRESENT_FINISH marker timestamps. Smoothness, consistency buffer, PLL, and CSV diagnostics continue working.
+- GetLatency-dependent features (GPU load, bottleneck detection, predictive sleep, interval adjustment) are gracefully disabled in this mode.
+
+### GSync Detection Rewrite
+- GSync/VRR detection now uses `NvAPI_Disp_GetVRRInfo` with a display ID instead of the old back-buffer-based `GetObjectHandleForResource` + `IsGSyncActive` approach. Works on DX11, DX12, and with Streamline/ReShade wrappers without needing a D3D device or back buffer reference.
+
+### Blackwell GPU Support
+- GPU architecture is detected at NVAPI init time. On Blackwell (RTX 50-series), exclusive pacing and flip metering are auto-enabled — the UI toggle becomes "Force Disable" instead of "Enable".
+- Flip metering is allowed through on Blackwell+ unconditionally (was previously DMFG-only).
+
+### OSD Changes
+- "GPU" renamed to "GPU Latency", "Render Lat" renamed to "Input Latency".
+- Present Latency line removed.
+- Native FPS line only shows when FG is active (was always visible when markers were flowing).
+- Smoothness score always shown when data is available (was hidden at 0%).
+
+### Other
+- REFramework detection simplified — removed the dinput8+Streamline heuristic that false-triggered on DLSS Enabler/Fix setups.
+- Consistency buffer tuning params tightened across all FG tiers.
+- Late-frame grid recovery uses `now + interval` instead of epoch-aligned snap, avoiding the long+short frame pair.
+- FG divisor cached once per frame for consistency across all subsystems.
+
 ## v2.5.4
 
 Improved Vulkan Streamline compatibility, hardware-accurate display timing, and pacing stability.

@@ -1,26 +1,18 @@
 #pragma once
 // ReLimiter — Frame limiter orchestrator
 // Clean-room implementation from public API docs:
-//   - NVAPI: SetSleepMode + Sleep for Reflex-based pacing, GetLatency for adaptive tuning
+//   - NVAPI SDK (MIT): NvAPI_D3D_SetSleepMode + Sleep for Reflex-based pacing,
+//     GetLatency for adaptive tuning, NV_GET_ADAPTIVE_SYNC_DATA, NV_GET_VRR_INFO
 //   - Windows: QPC timing for fallback pacing
-// Supports: Reflex sleep pacing, marker-based pacing, SL proxy pacing,
-//           timing fallback, FG-aware rate division, adaptive interval,
-//           auto enforcement site, render queue monitoring, adaptive FG offset,
-//           pipeline-aware predictive sleep, bottleneck detection, dynamic
-//           queue depth, dynamic Boost, cadence-based FG/MFG stabilization.
 
 #include "ul_config.hpp"
 #include "ul_reflex.hpp"
+#include "ul_vblank.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <windows.h>
-
-// Forward declaration
-#ifdef _WIN64
-class VkReflex;
-#endif
 
 // ============================================================================
 // Bottleneck identification
@@ -192,10 +184,10 @@ struct ConsistencyBuffer {
         float qpc_brake_threshold_cv;
     };
 
-    static constexpr TuningParams kTier1x1      = {4,  20,  0, 2, 1, 1000.0f, 3000.0f, 15, 0.12f};
-    static constexpr TuningParams kTier2xFG     = {12, 50,  0, 4, 2, 700.0f, 2500.0f, 12, 0.10f};
-    static constexpr TuningParams kTier3xMFG    = {20, 80, 10, 6, 3, 500.0f, 2000.0f, 10, 0.10f};
-    static constexpr TuningParams kTier4xPlusMFG = {30, 120, 20, 8, 4, 400.0f, 1600.0f, 8, 0.10f};
+    static constexpr TuningParams kTier1x1       = { 4,  20,  0, 2, 1,  500.0f, 1500.0f, 12, 0.08f};
+    static constexpr TuningParams kTier2xFG      = {12,  50,  0, 4, 2,  400.0f, 1200.0f, 10, 0.07f};
+    static constexpr TuningParams kTier3xMFG     = {20,  80, 10, 6, 3,  350.0f,  950.0f,  8, 0.07f};
+    static constexpr TuningParams kTier4xPlusMFG = {30, 120, 20, 8, 4,  300.0f,  800.0f,  6, 0.07f};
 
     TuningParams active_params = kTier1x1;
 
@@ -290,50 +282,106 @@ struct BoostController {
 };
 
 // ============================================================================
-// GSyncDetector — runtime GSync/VRR active detection (64-bit only)
+// NVAPI display structs — hand-rolled from NVAPI SDK documentation (MIT)
+// Used by GSyncDetector and FrameSplitController.
 // ============================================================================
 
-#ifdef _WIN64
+#pragma pack(push, 8)
+
+// NV_GET_VRR_INFO_V1 (NvAPI_Disp_GetVRRInfo)
+struct NV_GET_VRR_INFO_V1 {
+    NvU32 version;
+    NvU32 bIsVRREnabled          : 1;
+    NvU32 bIsVRRPossible         : 1;
+    NvU32 bIsVRRRequested        : 1;
+    NvU32 bIsVRRIndicatorEnabled : 1;
+    NvU32 bIsDisplayInVRRMode    : 1;
+    NvU32 reserved               : 27;
+    NvU32 reservedEx[4];
+};
+#define NV_GET_VRR_INFO_VER1  (NvU32)(sizeof(NV_GET_VRR_INFO_V1) | (1 << 16))
+#define NV_GET_VRR_INFO_VER   NV_GET_VRR_INFO_VER1
+using NV_GET_VRR_INFO = NV_GET_VRR_INFO_V1;
+
+// NV_GET_ADAPTIVE_SYNC_DATA_V1 (NvAPI_DISP_GetAdaptiveSyncData)
+struct NV_GET_ADAPTIVE_SYNC_DATA_V1 {
+    NvU32  version;
+    NvU32  maxFrameInterval;
+    NvU32  bDisableAdaptiveSync   : 1;
+    NvU32  bDisableFrameSplitting : 1;
+    NvU32  reserved               : 30;
+    NvU32  lastFlipRefreshCount;
+    NvU64  lastFlipTimeStamp;
+    NvU32  reservedEx[4];
+};
+#define NV_GET_ADAPTIVE_SYNC_DATA_VER1  (NvU32)(sizeof(NV_GET_ADAPTIVE_SYNC_DATA_V1) | (1 << 16))
+#define NV_GET_ADAPTIVE_SYNC_DATA_VER   NV_GET_ADAPTIVE_SYNC_DATA_VER1
+using NV_GET_ADAPTIVE_SYNC_DATA = NV_GET_ADAPTIVE_SYNC_DATA_V1;
+
+// NV_SET_ADAPTIVE_SYNC_DATA_V1 (NvAPI_DISP_SetAdaptiveSyncData)
+struct NV_SET_ADAPTIVE_SYNC_DATA_V1 {
+    NvU32  version;
+    NvU32  maxFrameInterval;          // deprecated — use maxFrameIntervalNs
+    NvU32  bDisableAdaptiveSync   : 1;
+    NvU32  bDisableFrameSplitting : 1;
+    NvU32  reserved               : 30;
+    NvU32  reserved1;                 // alignment pad
+    NvU64  maxFrameIntervalNs;        // max frame interval in nanoseconds (0 = EDID default)
+    NvU32  reservedEx[4];
+};
+// NV_SET_ADAPTIVE_SYNC_DATA uses version 2 per the SDK
+#define NV_SET_ADAPTIVE_SYNC_DATA_VER2  (NvU32)(sizeof(NV_SET_ADAPTIVE_SYNC_DATA_V1) | (2 << 16))
+#define NV_SET_ADAPTIVE_SYNC_DATA_VER   NV_SET_ADAPTIVE_SYNC_DATA_VER2
+using NV_SET_ADAPTIVE_SYNC_DATA = NV_SET_ADAPTIVE_SYNC_DATA_V1;
+
+#pragma pack(pop)
+
+// ============================================================================
+// GSyncDetector — runtime GSync/VRR active detection via NvAPI_Disp_GetVRRInfo
+// Queries display ID directly — no back buffer or D3D device needed.
+// Works on DX11, DX12, Vulkan, and with Streamline/ReShade wrappers.
+// ============================================================================
+
 struct GSyncDetector {
-    // NVAPI function pointer typedefs
-    using GetObjectHandle_fn = NvStatus(__cdecl*)(IUnknown*, IUnknown*, NvU32*);
-    using IsGSyncActive_fn   = NvStatus(__cdecl*)(IUnknown*, NvU32, NvU32*);
+    // NvAPI_Disp_GetVRRInfo takes a NvU32 display ID (not an NvDisplayHandle).
+    // Use NvAPI_DISP_GetDisplayIdByDisplayName to resolve HWND → GDI device
+    // name → NVAPI display ID.
+    using GetDisplayIdByName_fn = NvStatus(__cdecl*)(const char*, NvU32*);
+    using GetVRRInfo_fn = NvStatus(__cdecl*)(NvU32, NV_GET_VRR_INFO*);
 
-    GetObjectHandle_fn get_object_handle = nullptr;
-    IsGSyncActive_fn   is_gsync_active   = nullptr;
+    GetVRRInfo_fn          get_vrr_info       = nullptr;
+    GetDisplayIdByName_fn  get_display_id     = nullptr;
 
-    NvU32   surface_handle  = 0;       // NVDX_ObjectHandle from back buffer
+    NvU32   display_id      = 0;       // NVAPI display handle
     bool    gsync_active    = false;   // last poll result
     int64_t last_poll_qpc   = 0;       // QPC of last poll
     bool    resolved        = false;   // true if function pointers resolved OK
     bool    error_logged    = false;   // one-shot error logging
+    bool    first_poll_logged = false; // true after first successful poll is logged
 
     // Resolve function pointers via QueryInterface. Returns false if unavailable.
     bool Init();
 
-    // Acquire surface handle from swapchain back buffer.
-    bool AcquireSurfaceHandle(IUnknown* device, IUnknown* back_buffer);
+    // Resolve display ID from HWND → HMONITOR → NVAPI display enumeration.
+    bool ResolveDisplayId(HWND hwnd);
 
-    // Poll GSync state. Only polls if >= 2 seconds since last poll.
+    // Poll VRR/GSync state. Only polls if >= 2 seconds since last poll.
     // Updates gsync_active. Returns current state.
-    bool Poll(IUnknown* device, int64_t now_qpc);
+    bool Poll(int64_t now_qpc);
 };
-#endif
 
 // ============================================================================
 // FrameSplitController — disable/restore NVIDIA driver frame splitting (64-bit only)
 // ============================================================================
 
-#ifdef _WIN64
 struct FrameSplitController {
-    // NVAPI function pointer typedefs
-    using GetAdaptiveSyncData_fn = NvStatus(__cdecl*)(NvU32, void*);
-    using SetAdaptiveSyncData_fn = NvStatus(__cdecl*)(NvU32, void*);
-    using EnumDisplayHandle_fn   = NvStatus(__cdecl*)(NvU32, NvU32*);
+    using GetAdaptiveSyncData_fn  = NvStatus(__cdecl*)(NvU32, NV_GET_ADAPTIVE_SYNC_DATA*);
+    using SetAdaptiveSyncData_fn  = NvStatus(__cdecl*)(NvU32, NV_SET_ADAPTIVE_SYNC_DATA*);
+    using GetDisplayIdByName_fn   = NvStatus(__cdecl*)(const char*, NvU32*);
 
-    GetAdaptiveSyncData_fn get_adaptive_sync = nullptr;
-    SetAdaptiveSyncData_fn set_adaptive_sync = nullptr;
-    EnumDisplayHandle_fn   enum_display      = nullptr;
+    GetAdaptiveSyncData_fn  get_adaptive_sync = nullptr;
+    SetAdaptiveSyncData_fn  set_adaptive_sync = nullptr;
+    GetDisplayIdByName_fn   get_display_id    = nullptr;
 
     NvU32 display_id   = 0;       // NVAPI display ID for the target monitor
     bool  resolved     = false;   // function pointers resolved
@@ -341,7 +389,7 @@ struct FrameSplitController {
     bool  error_logged = false;   // one-shot error logging
 
     // Saved original state for restore
-    uint8_t saved_data[64] = {};  // NV_SET_ADAPTIVE_SYNC_DATA is small
+    NV_GET_ADAPTIVE_SYNC_DATA saved_data = {};
     bool    saved_valid = false;
 
     // Resolve function pointers via QueryInterface. Returns false if unavailable.
@@ -356,7 +404,6 @@ struct FrameSplitController {
     // Restore original frame splitting state.
     bool Restore();
 };
-#endif
 
 class UlLimiter {
 public:
@@ -364,11 +411,8 @@ public:
     void Shutdown();
 
     bool ConnectReflex(IUnknown* device);
-#ifdef _WIN64
-    void ConnectVulkanReflex(VkReflex* vk);
-    void AcquireGSyncSurface(IUnknown* device, IUnknown* back_buffer);
-#endif
     void SetHwnd(HWND hwnd) { hwnd_ = hwnd; }
+    void SetDXGISwapChain(IUnknown* sc) { dxgi_sc_ = sc; }
 
     void OnPresent();
     void OnSLPresent();
@@ -377,15 +421,13 @@ public:
     const PipelineStats& GetPipelineStats() const { return pipeline_stats_; }
     float GetCadenceCV() const { return pipeline_predictor_.cadence.ComputeCV(); }
     int GetCadenceCount() const { return pipeline_predictor_.cadence.count; }
-#ifdef _WIN64
     bool IsGSyncActive() const { return gsync_detector_.gsync_active; }
-#else
-    bool IsGSyncActive() const { return false; }
-#endif
 
 private:
     float ComputeRenderFps() const;
     int DetectFGDivisor() const;
+    int ComputeFGDivisorRaw() const;  // raw computation (DLL + FPS monitor + latency hint)
+    void CacheFGDivisor();            // call once per frame at top of OnPresent
 
     void DoReflexSleep();
     void DoOwnSleep(int fg_div = 1);
@@ -401,13 +443,13 @@ private:
     int ResolveEnforcementSite() const;
 
     IUnknown* dev_ = nullptr;
+    IUnknown* dxgi_sc_ = nullptr;  // IDXGISwapChain for GetFrameStatistics
     HWND hwnd_ = nullptr;
+    UINT last_real_present_count_ = 0;  // DXGI present count at last real-frame PRESENT_FINISH
     uint64_t frame_num_ = 0;
-#ifdef _WIN64
-    VkReflex* vk_reflex_ = nullptr;  // non-null when Vulkan backend is active
     GSyncDetector gsync_detector_;
     FrameSplitController frame_split_ctrl_;
-#endif
+    VBlankMonitor vblank_monitor_;  // D3DKMT vblank thread for DX PLL
 
     HANDLE htimer_delay_ = nullptr;
     HANDLE htimer_fallback_ = nullptr;
@@ -437,9 +479,25 @@ private:
     QPCCadenceMonitor qpc_monitor_;
     ConsistencyBuffer consistency_buf_;
     bool gpu_load_gate_open_ = false;
+
+    // Enforcement site voting window — prevents oscillation from transient
+    // GPU load changes. Only switches after sustained agreement.
+    static constexpr int kSiteVoteWindow = 120;  // ~2 seconds at 60fps
+    int site_votes_[kSiteVoteWindow] = {};
+    int site_vote_head_ = 0;
+    int site_vote_count_ = 0;
+
+    // GPU load gate voting window — prevents gate flapping when load
+    // hovers near 50% (menu/gameplay transitions).
+    static constexpr int kGateVoteWindow = 60;  // ~1 second at 60fps
+    int gate_votes_[kGateVoteWindow] = {};  // 1 = open, 0 = closed
+    int gate_vote_head_ = 0;
+    int gate_vote_count_ = 0;
     int last_fg_tier_ = 0;
     int pending_fg_tier_ = 0;
     int fg_tier_confirm_ticks_ = 0;
+    static constexpr int kFGTierConfirmThreshold = 30;  // frames to confirm tier change
+    int cached_fg_divisor_ = 1;  // per-frame cached FG divisor (set once in OnPresent)
     bool is_dmfg_ = false;  // true when FG tier comes from driver (no FG DLL)
     DiagCSVLogger diag_csv_logger_;
 
@@ -459,5 +517,22 @@ private:
     float pll_smoothed_error_ns_ = 0.0f;
     static constexpr float kPllAlpha = 0.05f;
     static constexpr float kPllCorrectionGain = 0.1f;
+    float pll_error_variance_ns2_ = 0.0f;  // EMA of squared phase error (convergence check)
+    int   pll_sample_count_ = 0;
+    bool  pll_converged_ = false;
     uint64_t last_pll_frame_id_ = 0;
+
+    // Marker-based PLL feedback — QPC timestamp of PRESENT_FINISH on real frames.
+    // Always in QPC domain, always on real frames. Used as primary PLL source
+    // when DXGI/VK_EXT feedback is unavailable or noisy.
+    std::atomic<int64_t> pll_marker_present_ns_{0};
+    std::atomic<uint64_t> pll_marker_frame_id_{0};
+    uint64_t last_pll_marker_frame_id_ = 0;  // separate from last_pll_frame_id_ (avoids DXGI count collision)
+
+    // DXGI frame statistics — display feedback for DX PLL
+    uint64_t last_dxgi_sync_qpc_ = 0;
+    UINT last_dxgi_present_count_ = 0;
+
+    // VBlank monitor — exact vblank timestamps for DX PLL
+    uint64_t last_pll_vblank_count_ = 0;  // last consumed vblank count
 };

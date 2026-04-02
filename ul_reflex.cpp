@@ -3,7 +3,7 @@
 //   - NVAPI SDK (MIT): nvapi_interface.h for function IDs, nvapi.h for structs
 //   - MinHook (BSD-2): MH_CreateHook, MH_EnableHook, MH_DisableHook, MH_RemoveHook
 //   - Windows: LoadLibraryA, GetProcAddress, DXGI vtable layout
-// No code from Display Commander, Special K, or any other project.
+// No code from any other project.
 
 #include "ul_reflex.hpp"
 #include "ul_config.hpp"
@@ -113,6 +113,15 @@ static bool IsDmfgSession() {
     if (GetModuleHandleW(L"ffx_framegeneration.dll"))            return false;
     return true;
 }
+
+// Exclusive pacing: auto-enabled on Blackwell+, user toggle becomes force-disable.
+// On pre-Blackwell, the config toggle enables it manually (opt-in).
+static bool ShouldExclusivePace() {
+    bool user_setting = g_cfg.exclusive_pacing.load(std::memory_order_relaxed);
+    if (s_is_blackwell)
+        return !user_setting;  // Blackwell: ON by default, toggle = force disable
+    return user_setting;       // Pre-Blackwell: OFF by default, toggle = enable
+}
 static void* s_latency_get_target = nullptr;  // vtable[32] address
 
 // ============================================================================
@@ -185,21 +194,10 @@ static bool LoadNvapi() {
     // Skip entirely when REFramework is present — its Streamline integration
     // calls nvapi_QueryInterface during swapchain recreation and blocking
     // SetFlipConfig at that point causes a hard crash in sl.dlss_g.dll.
-    // REFramework can appear as reframework.dll or load via dinput8.dll.
-    // When dinput8.dll is present alongside Streamline (sl.common.dll), the
-    // QI hook blocking SetFlipConfig during swapchain recreation crashes
-    // sl.dlss_g.dll. Check all known indicators.
+    // Only detect actual REFramework DLLs — the dinput8+Streamline heuristic
+    // was too broad and false-triggered on DLSS Enabler/Fix setups.
     bool reframework = GetModuleHandleW(L"reframework.dll") != nullptr
                     || GetModuleHandleW(L"REFramework.dll") != nullptr;
-    if (!reframework) {
-        // dinput8.dll is REFramework's proxy DLL in RE Engine games.
-        // Only treat it as REFramework if Streamline is also present —
-        // dinput8.dll alone (e.g. from other mods) is harmless.
-        bool dinput8 = GetModuleHandleW(L"dinput8.dll") != nullptr;
-        bool streamline = GetModuleHandleW(L"sl.common.dll") != nullptr
-                       || GetModuleHandleW(L"sl.dlss_g.dll") != nullptr;
-        if (dinput8 && streamline) reframework = true;
-    }
     if (reframework) {
         ul_log::Write("LoadNvapi: REFramework detected — skipping QueryInterface hook (crash prevention)");
         s_orig_qi = nullptr;
@@ -284,6 +282,10 @@ static NvStatus __cdecl Hook_SetSleepMode(IUnknown* dev, NvSleepParams* p) {
 // Games like Monster Hunter Wilds call Sleep multiple times per frame.
 // We suppress everything here — UlLimiter calls InvokeSleep on its own schedule.
 // The dedup tracking lets us detect misbehaving games in logs if needed.
+//
+// We suppress everything here — UlLimiter calls InvokeSleep on its own schedule.
+// The dedup tracking lets us detect misbehaving games in logs if needed.
+
 static NvStatus __cdecl Hook_Sleep(IUnknown* dev) {
     uint64_t cur = g_present_count.load(std::memory_order_relaxed);
     s_last_sleep_frame.store(cur, std::memory_order_relaxed);
@@ -321,7 +323,7 @@ static NvStatus __cdecl Hook_SetMarker(IUnknown* dev, NvMarkerParams* p) {
     }
 
     // Filter out RTSS (RivaTuner Statistics Server) — it fires latency
-    // markers but is NOT native Reflex.  Both SK and DC filter this.
+    // markers but is NOT native Reflex. Filter this out.
     // Re-check each call since RTSS can load after the game starts.
     {
         HMODULE rtss = GetModuleHandleW(L"RTSSHooks64.dll");
@@ -455,7 +457,7 @@ bool SetupReflexHooks() {
     s_tgt_marker = resolve("NvAPI_D3D_SetLatencyMarker");
     if (!s_tgt_sleep_mode || !s_tgt_sleep || !s_tgt_marker) return false;
 
-    // Resolve GetLatency (not hooked)
+    // Resolve GetLatency (not hooked — Streamline bypasses NVAPI for latency data)
     NvU32 gl_id = FindFuncId("NvAPI_D3D_GetLatency");
     if (gl_id) s_get_latency = reinterpret_cast<NvGetLatency_fn>(s_qi(gl_id));
 
@@ -651,7 +653,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetMaxFrameLatency(IDXGISwapChain* sc, UIN
     UINT target = MaxLatency;
     const char* reason = nullptr;
 
-    if (g_cfg.exclusive_pacing.load(std::memory_order_relaxed)) {
+    if (ShouldExclusivePace()) {
         if (IsDmfgSession()) {
             // Driver-side DMFG — pass through the game's requested depth.
             // Forcing 1 would starve the 3x-6x generation pipeline.
@@ -681,7 +683,7 @@ static HRESULT STDMETHODCALLTYPE Hook_SetMaxFrameLatency(IDXGISwapChain* sc, UIN
 static HRESULT STDMETHODCALLTYPE Hook_GetMaxFrameLatency(IDXGISwapChain* sc, UINT* pMaxLatency) {
     // If we're overriding, report the game's original value back so it doesn't
     // get confused by our override.
-    if (g_cfg.exclusive_pacing.load(std::memory_order_relaxed) && pMaxLatency) {
+    if (ShouldExclusivePace() && pMaxLatency) {
         UINT game_val = s_game_latency.load(std::memory_order_relaxed);
         if (game_val > 0) {
             *pMaxLatency = game_val;
@@ -748,7 +750,7 @@ bool HookFrameLatency(IDXGISwapChain* sc) {
     // Call the trampoline directly to avoid going through our hook (which
     // would overwrite s_game_latency with our override value).
     if (s_orig_set_max_latency) {
-        if (g_cfg.exclusive_pacing.load(std::memory_order_relaxed)) {
+        if (ShouldExclusivePace()) {
             if (IsDmfgSession()) {
                 // Driver-side DMFG — don't override, the game needs a deep queue
                 UINT game_val = s_game_latency.load(std::memory_order_relaxed);
@@ -770,7 +772,7 @@ void ApplyFrameLatency() {
 
     // Call the trampoline directly — going through the vtable would hit our
     // hook and corrupt s_game_latency with the override value.
-    if (g_cfg.exclusive_pacing.load(std::memory_order_relaxed)) {
+    if (ShouldExclusivePace()) {
         if (IsDmfgSession()) {
             // Driver-side DMFG — pass through the game's requested depth
             UINT game_val = s_game_latency.load(std::memory_order_relaxed);

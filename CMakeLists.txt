@@ -27,17 +27,15 @@ add_library(ultra_limiter SHARED
     main.cpp
     ul_config.cpp
     ul_fg_monitor.cpp
+    ul_fg.cpp
     ul_limiter.cpp
     ul_log.cpp
     ul_reflex.cpp
+    ul_streamline.cpp
     ul_timing.cpp
+    ul_vblank.cpp
     version.rc
 )
-
-# Vulkan Reflex backend — 64-bit only (requires vulkan-1.dll / VK_NV_low_latency2)
-if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    target_sources(ultra_limiter PRIVATE ul_vk_reflex.cpp)
-endif()
 
 # Include directories
 target_include_directories(ultra_limiter PRIVATE

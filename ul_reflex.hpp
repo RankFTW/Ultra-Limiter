@@ -17,6 +17,7 @@ struct IDXGISwapChain;
 // NVAPI status codes (from nvapi.h, MIT)
 using NvStatus = int;
 using NvU32 = unsigned int;
+using NvU64 = unsigned long long;
 constexpr NvStatus NV_OK = 0;
 constexpr NvStatus NV_NO_IMPL = -4;
 constexpr NvStatus NV_BAD_ARG = -5;

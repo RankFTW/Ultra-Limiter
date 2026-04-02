@@ -7,9 +7,10 @@
 
 namespace ul_fg_monitor {
 
-// Feed measured output FPS and native (render-only) FPS each update.
-// Computes the FG multiplier tier from the ratio.
-void Update(float output_fps, float native_fps);
+// Feed the computed FG multiplier each frame.
+// raw_tier: 0 = no FG, 2-6 = multiplier (from output_fps / real_fps).
+// First detection confirms after 30 frames. Tier changes require 120 frames.
+void Update(int raw_tier);
 
 // Read the current FPS-based FG tier (0 = no FG, 2–6 = multiplier).
 int  GetTier();

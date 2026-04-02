@@ -4,27 +4,23 @@
 //   - Dear ImGui: GetForegroundDrawList, SliderInt, Checkbox, BeginCombo (MIT)
 //   - Windows: EnumDisplayMonitors, SetWindowPos, GetWindowLong, CreateThread
 //   - NVAPI SDK (MIT): NvAPI_D3D_GetLatency struct layout
-// No code from Display Commander, Special K, or any other project.
+// No code from any other project.
 
 #define ImTextureID ImU64
 #include <imgui.h>
 
 #include "ul_config.hpp"
-#include "ul_fg_monitor.hpp"
+#include "ul_fg.hpp"
 #include "ul_limiter.hpp"
 #include "ul_log.hpp"
+#include "ul_streamline.hpp"
 #include "ul_timing.hpp"
-#ifdef _WIN64
-#include "ul_vk_reflex.hpp"
-#endif
 
 #include <reshade.hpp>
 #include <algorithm>
 
 #include <MinHook.h>
 #include <dxgi.h>
-#include <d3d11.h>
-#include <d3d12.h>
 #include <windows.h>
 #include <cmath>
 #include <new>
@@ -91,22 +87,22 @@ static void UpdateFGString() {
               || GetModuleHandleW(L"_nvngx_dlssg.dll")
               || GetModuleHandleW(L"sl.dlss_g.dll")
               || GetModuleHandleW(L"dlss-g.dll");
-    bool fsr = GetModuleHandleW(L"amd_fidelityfx_framegeneration.dll")
-            || GetModuleHandleW(L"ffx_framegeneration.dll");
     bool smooth = GetModuleHandleW(L"NvPresent64.dll") != nullptr;
 
     if (!s_fg_logged) {
-        ul_log::Write("FG detect: dlssg=%d fsr=%d smooth=%d", dlssg, fsr, smooth);
+        ul_log::Write("FG detect: dlssg=%d smooth=%d", dlssg, smooth);
         s_fg_logged = true;
     }
 
-    const char* mult = ul_fg_monitor::GetMultiplierString();
-    bool from_fps = (ul_fg_monitor::GetTier() >= 2);
+    int fg_mult = g_fg_multiplier.load(std::memory_order_relaxed);
+    bool fg_active = g_fg_active.load(std::memory_order_relaxed);
+    char mult_str[8] = "";
+    if (fg_mult >= 2)
+        snprintf(mult_str, sizeof(mult_str), " %dx", fg_mult);
 
-    if (dlssg)          snprintf(s_fg_str, sizeof(s_fg_str), "DLSS FG%s", mult);
-    else if (fsr)       snprintf(s_fg_str, sizeof(s_fg_str), "FSR FG%s", mult);
-    else if (smooth)    snprintf(s_fg_str, sizeof(s_fg_str), "Smooth Motion%s", mult);
-    else if (from_fps)  snprintf(s_fg_str, sizeof(s_fg_str), "FG%s", mult);
+    if (fg_active)     snprintf(s_fg_str, sizeof(s_fg_str), "DLSS FG%s", mult_str);
+    else if (dlssg)     snprintf(s_fg_str, sizeof(s_fg_str), "DLSS FG");
+    else if (smooth)    snprintf(s_fg_str, sizeof(s_fg_str), "Smooth Motion");
     else                snprintf(s_fg_str, sizeof(s_fg_str), "None");
 }
 
@@ -236,110 +232,6 @@ static void PollGpuLatency() {
     }
 }
 
-// Vulkan equivalent — uses VkReflex::GetLatencyTimings instead of NVAPI
-#ifdef _WIN64
-static void PollVkGpuLatency() {
-    if (!g_vk_reflex.IsActive()) return;
-
-    static NvLatencyResult* buf = nullptr;
-    static uint64_t s_last_vk_native_frame_id = 0;
-    static uint64_t s_last_vk_sim_start = 0;  // bridge deltas across polls
-    if (!buf) { buf = new (std::nothrow) NvLatencyResult{}; if (!buf) return; }
-
-    if (!g_vk_reflex.GetLatencyTimings(buf)) return;
-
-    // One-shot diagnostic: dump first few frame reports to understand the data
-    static bool s_vk_diag_logged = false;
-    if (!s_vk_diag_logged) {
-        int logged = 0;
-        for (int i = 0; i < 64 && logged < 8; i++) {
-            auto& f = buf->frameReport[i];
-            if (!f.frameID) continue;
-            ul_log::Write("VkLatency[%d]: id=%llu sim=%llu-%llu gpu=%u present=%llu-%llu",
-                          i, f.frameID, f.simStartTime, f.simEndTime,
-                          f.gpuActiveRenderTimeUs, f.presentStartTime, f.presentEndTime);
-            logged++;
-        }
-        if (logged > 0) s_vk_diag_logged = true;
-    }
-
-    float gpu = 0, rlat = 0, plat = 0;
-    int n_gpu = 0, n_rlat = 0, n_plat = 0;
-    for (int i = 63; i >= 0 && n_gpu < 8; i--) {
-        auto& f = buf->frameReport[i];
-        if (!f.frameID) continue;
-        if (f.gpuActiveRenderTimeUs > 0 && f.gpuActiveRenderTimeUs < 200'000) {
-            gpu += static_cast<float>(f.gpuActiveRenderTimeUs) / 1000.0f;
-            n_gpu++;
-        }
-        // Only compute render/present latency for real frames (have a sim phase)
-        if (f.simStartTime > 0 && f.simEndTime > f.simStartTime) {
-            if (f.gpuRenderEndTime > f.simStartTime) {
-                float r = static_cast<float>(f.gpuRenderEndTime - f.simStartTime) / 1000.0f;
-                if (r < 500.0f) { rlat += r; n_rlat++; }
-            }
-            if (f.presentStartTime > 0 && f.presentEndTime > f.presentStartTime) {
-                float p = static_cast<float>(f.presentEndTime - f.presentStartTime) / 1000.0f;
-                if (p < 500.0f) { plat += p; n_plat++; }
-            }
-        }
-    }
-    if (n_gpu > 0) {
-        s_gpu_ms = gpu / n_gpu;
-        s_has_gpu.store(true, std::memory_order_relaxed);
-    }
-    if (n_rlat > 0) s_render_lat_ms = rlat / n_rlat;
-    if (n_plat > 0) s_present_lat_ms = plat / n_plat;
-
-    // Feed native FPS tracker from simStartTime deltas.
-    // On Vulkan with Streamline, marker callbacks don't flow (can't hook LL2
-    // functions without breaking FG). Derive render cadence from GetLatencyTimings
-    // frame reports instead, filtering to REAL frames only.
-    // Real frames have a sim phase (simEndTime > simStartTime). Generated frames
-    // either have simStartTime == simEndTime or duplicate the previous real frame's
-    // sim timestamps.
-    {
-        struct SimFrame { uint64_t id; uint64_t sim_start; uint64_t sim_end; };
-        SimFrame frames[64];
-        int n_frames = 0;
-        for (int i = 0; i < 64; i++) {
-            auto& f = buf->frameReport[i];
-            if (!f.frameID || f.frameID <= s_last_vk_native_frame_id) continue;
-            if (f.simStartTime == 0) continue;
-            // Only include frames with a real sim phase (not generated)
-            if (f.simEndTime <= f.simStartTime) continue;
-            frames[n_frames++] = { f.frameID, f.simStartTime, f.simEndTime };
-        }
-        // Sort by frame ID ascending
-        for (int i = 0; i < n_frames - 1; i++)
-            for (int j = i + 1; j < n_frames; j++)
-                if (frames[j].id < frames[i].id)
-                    std::swap(frames[i], frames[j]);
-
-        for (int i = 0; i < n_frames; i++) {
-            uint64_t prev_sim = (i > 0) ? frames[i - 1].sim_start : s_last_vk_sim_start;
-            if (prev_sim > 0 && frames[i].sim_start > prev_sim) {
-                float dt_ms = static_cast<float>(frames[i].sim_start - prev_sim) / 1000.0f;
-                if (dt_ms > 0.5f && dt_ms < 200.0f) {
-                    s_nat_hist[s_nat_idx % 64] = dt_ms;
-                    s_nat_idx++;
-                    int n = (s_nat_idx < 64) ? s_nat_idx : 64;
-                    float sum = 0.0f;
-                    for (int k = 0; k < n; k++) sum += s_nat_hist[(s_nat_idx - 1 - k + 64) % 64];
-                    s_native_ft_ms = sum / static_cast<float>(n);
-                    s_native_fps = (s_native_ft_ms > 0.0f) ? 1000.0f / s_native_ft_ms : 0.0f;
-                    s_has_native.store(true, std::memory_order_relaxed);
-                }
-            }
-        }
-        if (n_frames > 0) {
-            s_last_vk_native_frame_id = frames[n_frames - 1].id;
-            s_last_vk_sim_start = frames[n_frames - 1].sim_start;
-        }
-    }
-}
-#endif
-
 // ============================================================================
 // Frametime stats
 // ============================================================================
@@ -357,9 +249,7 @@ static void UpdateStats() {
         s_ft_ms = sum / static_cast<float>(n);
         s_fps = (s_ft_ms > 0.0f) ? 1000.0f / s_ft_ms : 0.0f;
 
-        // Update FG tier from FPS ratio every frame (independent of OSD)
-        if (s_has_native.load(std::memory_order_relaxed))
-            ul_fg_monitor::Update(s_fps, s_native_fps);
+        // (FG detection moved to NGX hooks — no ratio computation needed here.)
 
         // Feed 1% low rolling window
         s_low_pct_hist[s_low_pct_head] = dt;
@@ -499,7 +389,8 @@ static void DrawOSD(reshade::api::effect_runtime*) {
         snprintf(buf, sizeof(buf), "1%% Low: %.1f", disp_1pct);
         add_line(buf, white);
     }
-    if (g_cfg.show_native_fps.load(std::memory_order_relaxed) && s_has_native.load(std::memory_order_relaxed)) {
+    if (g_cfg.show_native_fps.load(std::memory_order_relaxed) && s_has_native.load(std::memory_order_relaxed)
+        && (sm || g_fg_active.load(std::memory_order_relaxed))) {
         snprintf(buf, sizeof(buf), "Native: %.1f FPS (%.2f ms)", disp_native_fps, disp_native_ft);
         add_line(buf, white);
     }
@@ -510,15 +401,11 @@ static void DrawOSD(reshade::api::effect_runtime*) {
 
     bool gpu = s_has_gpu.load(std::memory_order_relaxed);
     if (gpu && g_cfg.show_gpu_time.load(std::memory_order_relaxed)) {
-        snprintf(buf, sizeof(buf), "GPU: %.2f ms", s_gpu_ms);
+        snprintf(buf, sizeof(buf), "GPU Latency: %.2f ms", s_gpu_ms);
         add_line(buf, cyan);
     }
     if (gpu && g_cfg.show_render_lat.load(std::memory_order_relaxed) && s_render_lat_ms > 0.0f) {
-        snprintf(buf, sizeof(buf), "Render Lat: %.2f ms", s_render_lat_ms);
-        add_line(buf, cyan);
-    }
-    if (gpu && g_cfg.show_present_lat.load(std::memory_order_relaxed) && s_present_lat_ms > 0.0f) {
-        snprintf(buf, sizeof(buf), "Present Lat: %.2f ms", s_present_lat_ms);
+        snprintf(buf, sizeof(buf), "Input Latency: %.2f ms", s_render_lat_ms);
         add_line(buf, cyan);
     }
 
@@ -1022,16 +909,22 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
 
     ImGui::Spacing();
 
-    // --- 5XXX Exclusive Pacing Optimization ---
-    ImGui::TextDisabled("5XXX Exclusive Pacing Optimization");
+    // --- Blackwell Optimization ---
+    bool is_bw = IsBlackwell();
+    ImGui::TextDisabled(is_bw ? "Blackwell Optimization (auto-enabled)" : "Exclusive Pacing Optimization");
     ImGui::SameLine(); ImGui::TextDisabled("(?)");
     if (ImGui::IsItemHovered()) ImGui::SetTooltip(
-        "Forces single-frame queue depth (SetMaximumFrameLatency = 1).\n"
-        "Reduces input latency by preventing the GPU from queuing extra frames.\n"
-        "Recommended for NVIDIA 50-series GPUs with flip metering support.");
+        is_bw
+        ? "Single-frame queue depth + flip metering (auto-enabled on RTX 50-series).\n"
+          "Reduces input latency by preventing the GPU from queuing extra frames.\n"
+          "Check the box below to DISABLE this optimization."
+        : "Forces single-frame queue depth (SetMaximumFrameLatency = 1).\n"
+          "Reduces input latency by preventing the GPU from queuing extra frames.\n"
+          "Recommended for NVIDIA 50-series GPUs.");
 
     bool ep = g_cfg.exclusive_pacing.load(std::memory_order_relaxed);
-    if (ImGui::Checkbox("Enable##excl_pacing", &ep)) {
+    const char* ep_label = is_bw ? "Force Disable##excl_pacing" : "Enable##excl_pacing";
+    if (ImGui::Checkbox(ep_label, &ep)) {
         g_cfg.exclusive_pacing.store(ep);
         ApplyFrameLatency();
         changed = true;
@@ -1064,9 +957,8 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
             toggle("Frametime", g_cfg.show_frametime, "Time per frame in milliseconds.");
             toggle("Native FPS", g_cfg.show_native_fps, "Real render rate excluding generated frames.");
             toggle("Render Pacing", g_cfg.show_native_graph, "Frame time graph for real rendered frames (excludes FG-generated frames).");
-            toggle("GPU Render Time", g_cfg.show_gpu_time, "GPU active render time from Reflex.");
-            toggle("Render Latency", g_cfg.show_render_lat, "Sim-start to GPU-render-end latency.");
-            toggle("Present Latency", g_cfg.show_present_lat, "Present start-to-end latency.");
+            toggle("GPU Latency", g_cfg.show_gpu_time, "GPU active render time from Reflex.");
+            toggle("Input Latency", g_cfg.show_render_lat, "Sim-start to GPU-render-end latency.");
             toggle("FG Mode", g_cfg.show_fg_mode, "Detected frame generation technology.");
             toggle("Smoothness", g_cfg.show_smoothness, "Cadence smoothness score (CV-based).");
 
@@ -1176,34 +1068,16 @@ static void DrawOverlay(reshade::api::effect_runtime*) {
     ImGui::Spacing();
     ImGui::TextDisabled("Status");
     ImGui::Text("Reflex: %s",
-#ifdef _WIN64
-                g_vk_reflex.IsActive() ? "Vulkan (VK_NV_low_latency2)" :
                 (GetModuleHandleW(L"sl.common.dll") ? "Streamline (managed)" :
-#endif
-                (ReflexActive() ? "Hooked" : "Not hooked"))
-#ifdef _WIN64
-                )
-#endif
-                ;
+                (ReflexActive() ? "Hooked" : "Not hooked")));
     ImGui::Text("Native Reflex: %s",
                 g_game_uses_reflex.load() ? "Detected" :
                 (GetModuleHandleW(L"sl.common.dll") ? "Streamline" : "No"));
 
     bool native = g_game_uses_reflex.load();
-#ifdef _WIN64
-    bool vk_active = g_vk_reflex.IsActive();
-#else
     bool vk_active = false;
-#endif
     const char* mode = "Timing";
-    if (vk_active) {
-        if (native) {
-            mode = "Vulkan Reflex (Native)";
-        } else {
-            mode = "Vulkan Low-Latency + Timing";
-        }
-    }
-    else if (!ReflexActive()) {
+    if (!ReflexActive()) {
         // Check if Streamline is managing pacing through its own LL2
         if (GetModuleHandleW(L"sl.common.dll"))
             mode = "Streamline + Timing";
@@ -1275,60 +1149,6 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
         UpdateFGString();
         ul_log::Write("OnInitSwapchain: FG=%s", s_fg_str);
 
-        // --- Vulkan path ---
-#ifdef _WIN64
-        if (api == reshade::api::device_api::vulkan) {
-            VkDevice vk_dev = reinterpret_cast<VkDevice>(static_cast<uintptr_t>(dev->get_native()));
-            if (vk_dev) {
-                ul_log::Write("OnInitSwapchain: Vulkan device detected (ext injected=%d)",
-                              VkReflexExtensionInjected() ? 1 : 0);
-
-                // Deferred hook: if vkCreateDevice was called through Streamline
-                // before our DllMain hooks, the LL2 functions weren't hooked.
-                // Try now that the device and sl.interposer.dll are loaded.
-                VkReflexDeferredHook(vk_dev);
-
-                // Set up NVAPI hooks — Streamline's Reflex plugin uses NVAPI
-                // internally even for Vulkan games. This is the same hook path
-                // that works for DX, intercepting NvAPI_D3D_SetLatencyMarker etc.
-                if (!ReflexActive()) {
-                    ul_log::Write("OnInitSwapchain: setting up NVAPI hooks for Vulkan+Streamline");
-                    SetupReflexHooks();
-                }
-
-                // Hook Streamline's PCL marker API — this intercepts markers at
-                // the game→Streamline boundary, before Streamline translates them
-                // to vkSetLatencyMarkerNV. Works where LL2 function hooking fails.
-                if (GetModuleHandleW(L"sl.common.dll") != nullptr) {
-                    HookStreamlinePCL();
-                }
-
-                if (g_vk_reflex.Init(vk_dev)) {
-                    VkSwapchainKHR vk_sc = sc->get_native();
-                    if (vk_sc && g_vk_reflex.AttachSwapchain(vk_sc)) {
-                        s_limiter.ConnectVulkanReflex(&g_vk_reflex);
-                        ul_log::Write("OnInitSwapchain: Vulkan Reflex active");
-                    } else {
-                        ul_log::Write("OnInitSwapchain: Vulkan swapchain attach failed — timing fallback");
-                    }
-                } else {
-                    ul_log::Write("OnInitSwapchain: VK_NV_low_latency2 not available — timing fallback");
-                }
-
-                // Initialize VK_EXT_present_timing for display-level pacing
-                {
-                    VkSwapchainKHR vk_sc = sc->get_native();
-                    if (vk_sc && VkPresentTimingInit(vk_dev, vk_sc)) {
-                        VkPresentTimingHookPresent();
-                        ul_log::Write("OnInitSwapchain: VK_EXT_present_timing active");
-                    }
-                }
-            }
-            ul_log::Write("OnInitSwapchain: done (Vulkan)");
-            return;
-        }
-#endif
-
         // --- DX9 path ---
         if (api == reshade::api::device_api::d3d9) {
             // DX9 fake fullscreen — hook Reset to force windowed mode
@@ -1354,39 +1174,11 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
             s_limiter.ConnectReflex(native);
             ul_log::Write("OnInitSwapchain: ConnectReflex done");
 
-#ifdef _WIN64
-            // Acquire GSync surface handle from back buffer
-            // NvAPI_D3D_GetObjectHandleForResource needs the real D3D device and resource.
-            // For DX12, we get ID3D12Device from the resource itself to ensure it's the
-            // real device (not a ReShade wrapper).
+            // Store DXGI swapchain for GetFrameStatistics (PLL display feedback)
             {
-                auto nsc = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
-                if (nsc) {
-                    IUnknown* back_buffer = nullptr;
-                    if (api == reshade::api::device_api::d3d12) {
-                        nsc->GetBuffer(0, __uuidof(ID3D12Resource),
-                                       reinterpret_cast<void**>(&back_buffer));
-                    } else {
-                        nsc->GetBuffer(0, __uuidof(ID3D11Texture2D),
-                                       reinterpret_cast<void**>(&back_buffer));
-                    }
-                    if (back_buffer) {
-                        IUnknown* nvapi_device = native;
-                        ID3D12Device* d3d12_dev = nullptr;
-                        if (api == reshade::api::device_api::d3d12) {
-                            auto res = reinterpret_cast<ID3D12Resource*>(back_buffer);
-                            if (SUCCEEDED(res->GetDevice(__uuidof(ID3D12Device),
-                                                          reinterpret_cast<void**>(&d3d12_dev)))) {
-                                nvapi_device = d3d12_dev;
-                            }
-                        }
-                        s_limiter.AcquireGSyncSurface(nvapi_device, back_buffer);
-                        if (d3d12_dev) d3d12_dev->Release();
-                        back_buffer->Release();
-                    }
-                }
+                auto nsc = reinterpret_cast<IUnknown*>(sc->get_native());
+                s_limiter.SetDXGISwapChain(nsc);
             }
-#endif
         }
 
         if (g_cfg.use_sl_proxy.load(std::memory_order_relaxed) && !IsStreamlineSafeMode()) {
@@ -1435,6 +1227,10 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
             ul_log::Write("OnInitSwapchain: skipping FakeFullscreen hook (Streamline safe mode)");
         }
 
+        // Hook Streamline PCL for FG detection and marker interception
+        if (GetModuleHandleW(L"sl.interposer.dll") != nullptr)
+            HookStreamlinePCL();
+
         ul_log::Write("OnInitSwapchain: done");
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         ul_log::Write("OnInitSwapchain: exception 0x%08X", GetExceptionCode());
@@ -1443,13 +1239,6 @@ static void OnInitSwapchain(reshade::api::swapchain* sc, bool) {
 
 static void OnDestroySwapchain(reshade::api::swapchain* sc, bool) {
     ul_log::Write("OnDestroySwapchain");
-    // Detach Vulkan Reflex if active
-#ifdef _WIN64
-    if (g_vk_reflex.IsActive()) {
-        g_vk_reflex.DetachSwapchain();
-        ul_log::Write("OnDestroySwapchain: Vulkan Reflex detached");
-    }
-#endif
     // Release swapchain vtable hooks (SL proxy, VSync, frame latency) before
     // the swapchain is freed. This prevents use-after-free when MinHook tries
     // to restore the original function prologues during MH_Uninitialize.
@@ -1469,11 +1258,6 @@ static void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* sc,
         s_limiter.OnPresent();
         UpdateStats();
         if (cnt > 300 && cnt % 30 == 0) PollGpuLatency();
-#ifdef _WIN64
-        // Poll Vulkan latency more frequently than DX — this is the primary
-        // source of native FPS data on Vulkan (marker callbacks may not flow).
-        if (cnt > 300 && cnt % 8 == 0) PollVkGpuLatency();
-#endif
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         ul_log::Write("OnPresent: exception 0x%08X", GetExceptionCode());
     }
@@ -1547,17 +1331,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         __try {
             s_limiter.Init(hModule);
 
-            // Hook vkCreateDevice to inject VK_NV_low_latency2 before the game
-            // creates its Vulkan device. Safe to call even if Vulkan isn't loaded.
-#ifdef _WIN64
-            VkReflexHookCreateDevice();
-#endif
+            InstallLoadLibraryHooks();
 
             SetSLPresentCb(OnSLPresentCb);
             SetMarkerCb(OnMarkerCb);
-#ifdef _WIN64
-            SetVkMarkerCb(OnMarkerCb);
-#endif
+            SetStreamlineMarkerCb(OnMarkerCb);
             StartWorker();
 
             reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
@@ -1579,9 +1357,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         ul_log::Write("Shutting down");
         SetUnhandledExceptionFilter(s_prev_filter);
         StopWorker();
-#ifdef _WIN64
-        VkReflexUnhookCreateDevice();
-#endif
+        RemoveLoadLibraryHooks();
         reshade::unregister_overlay("ReLimiter", DrawOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_overlay>(DrawOSD);
         s_limiter.Shutdown();

@@ -14,38 +14,39 @@ static int              s_update_count = 0;  // number of valid Update() calls
 // tier has been observed for kConfirmFrames consecutive updates.
 static int s_pending_tier = 0;
 static int s_confirm_count = 0;
-static constexpr int kConfirmFrames = 30;
+static constexpr int kFirstDetectFrames = 30;   // immediate-ish first detection
+static constexpr int kTierChangeFrames  = 120;  // ~1-2s sustained for tier changes
 
-void Update(float output_fps, float native_fps) {
-    if (native_fps <= 1.0f || output_fps <= 1.0f) return;
+void Update(int raw_tier) {
+    if (raw_tier < 0 || raw_tier > 6) return;
     s_update_count++;
-
-    float r = output_fps / native_fps;
-    int raw_tier = 0;
-    if      (r > 5.5f) raw_tier = 6;
-    else if (r > 4.5f) raw_tier = 5;
-    else if (r > 3.5f) raw_tier = 4;
-    else if (r > 2.5f) raw_tier = 3;
-    else if (r > 1.5f) raw_tier = 2;
 
     int current = s_tier.load(std::memory_order_relaxed);
 
-    // First detection: accept immediately
+    // First detection: accept after a short confirmation window
     if (current == 0 && raw_tier > 0) {
-        s_tier.store(raw_tier, std::memory_order_relaxed);
-        s_pending_tier = 0;
-        s_confirm_count = 0;
+        if (raw_tier == s_pending_tier) {
+            s_confirm_count++;
+            if (s_confirm_count >= kFirstDetectFrames) {
+                s_tier.store(raw_tier, std::memory_order_relaxed);
+                s_pending_tier = 0;
+                s_confirm_count = 0;
+            }
+        } else {
+            s_pending_tier = raw_tier;
+            s_confirm_count = 1;
+        }
     }
     // Same as current: reset pending
     else if (raw_tier == current) {
         s_pending_tier = 0;
         s_confirm_count = 0;
     }
-    // Different tier: require sustained confirmation
-    else if (raw_tier != current) {
+    // Different tier: require sustained confirmation (120 frames)
+    else {
         if (raw_tier == s_pending_tier) {
             s_confirm_count++;
-            if (s_confirm_count >= kConfirmFrames) {
+            if (s_confirm_count >= kTierChangeFrames) {
                 s_tier.store(raw_tier, std::memory_order_relaxed);
                 s_pending_tier = 0;
                 s_confirm_count = 0;
@@ -81,7 +82,7 @@ void Reset() {
 }
 
 bool HasData() {
-    return s_update_count >= kConfirmFrames;
+    return s_update_count >= kFirstDetectFrames;
 }
 
 const char* GetMultiplierString() {

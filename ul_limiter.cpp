@@ -1,29 +1,39 @@
 // ReLimiter — Frame limiter implementation
 // Clean-room from public API docs:
-//   - NVAPI SDK (MIT): NvAPI_D3D_SetSleepMode params, NvAPI_D3D_Sleep
+//   - NVAPI SDK (MIT): NvAPI_D3D_SetSleepMode params, NvAPI_D3D_Sleep,
+//     NV_GET_ADAPTIVE_SYNC_DATA, NV_SET_ADAPTIVE_SYNC_DATA, NV_GET_VRR_INFO
 //   - Windows: GetModuleHandleW for DLL detection, QPC for timing,
 //              EnumDisplaySettings / MonitorFromWindow for refresh rate
-// No code from Display Commander or any other project.
+// No code from any other project.
 
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 
-#include "ul_fg_monitor.hpp"
 #include "ul_limiter.hpp"
 #include "ul_log.hpp"
+#include "ul_fg.hpp"
 #include "ul_timing.hpp"
-#ifdef _WIN64
-#include "ul_vk_reflex.hpp"
-#define VK_REFLEX_ACTIVE() (vk_reflex_ && vk_reflex_->IsActive())
-#else
-#define VK_REFLEX_ACTIVE() (false)
-#endif
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <dxgi.h>
+#include <memory>
 #include <new>
+
+// ============================================================================
+// IsRealFrame — true when a GetLatency frame report represents a real rendered
+// frame rather than a generated (FG) frame.
+//
+// Generated frames either have no sim phase at all (simStartTime == 0) or
+// duplicate the previous real frame's sim timestamps (simEndTime <= simStartTime).
+// Real frames always have a distinct, non-zero sim phase.
+// ============================================================================
+
+static inline bool IsRealFrame(const NvLatencyFrameReport& f) {
+    return f.simStartTime > 0 && f.simEndTime > f.simStartTime;
+}
 
 // ============================================================================
 // StagePredictor — trend-aware per-stage time prediction
@@ -493,7 +503,6 @@ void BoostController::Reset() {
 // GSyncDetector — runtime GSync/VRR active detection (64-bit only)
 // ============================================================================
 
-#ifdef _WIN64
 bool GSyncDetector::Init() {
     NvQueryInterface_fn qi = GetNvapiQi();
     if (!qi) {
@@ -501,52 +510,70 @@ bool GSyncDetector::Init() {
         return false;
     }
 
-    NvU32 goh_id = FindFuncId("NvAPI_D3D_GetObjectHandleForResource");
-    NvU32 gsa_id = FindFuncId("NvAPI_D3D_IsGSyncActive");
+    NvU32 vrr_id  = FindFuncId("NvAPI_Disp_GetVRRInfo");
+    NvU32 name_id = FindFuncId("NvAPI_DISP_GetDisplayIdByDisplayName");
 
-    if (!goh_id || !gsa_id) {
-        ul_log::Write("GSyncDetector::Init: function IDs not found in table");
+    if (!vrr_id || !name_id) {
+        ul_log::Write("GSyncDetector::Init: function IDs not found in table "
+                      "(GetVRRInfo=0x%08X, GetDisplayIdByName=0x%08X)", vrr_id, name_id);
         return false;
     }
 
-    get_object_handle = reinterpret_cast<GetObjectHandle_fn>(qi(goh_id));
-    is_gsync_active   = reinterpret_cast<IsGSyncActive_fn>(qi(gsa_id));
+    get_vrr_info    = reinterpret_cast<GetVRRInfo_fn>(qi(vrr_id));
+    get_display_id  = reinterpret_cast<GetDisplayIdByName_fn>(qi(name_id));
 
-    resolved = (get_object_handle != nullptr && is_gsync_active != nullptr);
+    resolved = (get_vrr_info != nullptr && get_display_id != nullptr);
     if (!resolved) {
         ul_log::Write("GSyncDetector::Init: failed to resolve function pointers "
-                      "(GetObjectHandle=%p, IsGSyncActive=%p)",
-                      reinterpret_cast<void*>(get_object_handle),
-                      reinterpret_cast<void*>(is_gsync_active));
+                      "(GetVRRInfo=%p, GetDisplayIdByName=%p)",
+                      reinterpret_cast<void*>(get_vrr_info),
+                      reinterpret_cast<void*>(get_display_id));
     } else {
         ul_log::Write("GSyncDetector::Init: resolved OK");
     }
     return resolved;
 }
 
-bool GSyncDetector::AcquireSurfaceHandle(IUnknown* device, IUnknown* back_buffer) {
-    if (!resolved || !get_object_handle || !device || !back_buffer) return false;
+bool GSyncDetector::ResolveDisplayId(HWND hwnd) {
+    if (!resolved || !get_display_id) return false;
+    if (!hwnd) return false;
 
-    // Reset error flag on each attempt (swapchain re-init should retry cleanly)
-    error_logged = false;
-
-    NvU32 handle = 0;
-    NvStatus st = get_object_handle(device, back_buffer, &handle);
-    if (st != NV_OK) {
-        if (!error_logged) {
-            ul_log::Write("GSyncDetector::AcquireSurfaceHandle: failed (status=%d)", st);
-            error_logged = true;
-        }
-        surface_handle = 0;
+    // HWND → HMONITOR → GDI device name → NVAPI display ID
+    HMONITOR hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!hmon) {
+        ul_log::Write("GSyncDetector::ResolveDisplayId: MonitorFromWindow failed");
         return false;
     }
-    surface_handle = handle;
-    ul_log::Write("GSyncDetector::AcquireSurfaceHandle: handle=0x%08X", handle);
+
+    MONITORINFOEXA mi = {};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoA(hmon, &mi)) {
+        ul_log::Write("GSyncDetector::ResolveDisplayId: GetMonitorInfoA failed");
+        return false;
+    }
+
+    // NvAPI_DISP_GetDisplayIdByDisplayName expects the GDI device name
+    // exactly as returned by GetMonitorInfoA (e.g. "\\.\DISPLAY1")
+    NvU32 id = 0;
+    NvStatus st = get_display_id(mi.szDevice, &id);
+    if (st != NV_OK) {
+        if (!error_logged) {
+            ul_log::Write("GSyncDetector::ResolveDisplayId: GetDisplayIdByDisplayName "
+                          "failed for '%s' (status=%d)", mi.szDevice, st);
+            error_logged = true;
+        }
+        return false;
+    }
+
+    display_id = id;
+    error_logged = false;  // reset so Poll errors are reported fresh
+    ul_log::Write("GSyncDetector::ResolveDisplayId: '%s' -> display ID 0x%08X",
+                  mi.szDevice, display_id);
     return true;
 }
 
-bool GSyncDetector::Poll(IUnknown* device, int64_t now_qpc) {
-    if (!resolved || !is_gsync_active || surface_handle == 0) {
+bool GSyncDetector::Poll(int64_t now_qpc) {
+    if (!resolved || !get_vrr_info || display_id == 0) {
         gsync_active = false;
         return false;
     }
@@ -559,27 +586,42 @@ bool GSyncDetector::Poll(IUnknown* device, int64_t now_qpc) {
 
     last_poll_qpc = now_qpc;
 
-    NvU32 active = 0;
-    NvStatus st = is_gsync_active(device, surface_handle, &active);
+    NV_GET_VRR_INFO vrr_info = {};
+    vrr_info.version = NV_GET_VRR_INFO_VER;
+
+    NvStatus st = get_vrr_info(display_id, &vrr_info);
     if (st != NV_OK) {
         if (!error_logged) {
-            ul_log::Write("GSyncDetector::Poll: IsGSyncActive failed (status=%d)", st);
+            ul_log::Write("GSyncDetector::Poll: GetVRRInfo failed (status=%d)", st);
             error_logged = true;
         }
         gsync_active = false;
         return false;
     }
 
-    gsync_active = (active != 0);
+    bool prev = gsync_active;
+    // Check both bIsVRREnabled (driver-level VRR enablement) and
+    // bIsDisplayInVRRMode (display hardware actually in VRR mode).
+    // Some configurations (e.g. DLSS FG + Streamline, borderless windowed)
+    // may only set one of these flags.
+    gsync_active = (vrr_info.bIsVRREnabled != 0 || vrr_info.bIsDisplayInVRRMode != 0);
+
+    // Log all VRR bits on first successful poll and on state transitions
+    if (prev != gsync_active || !first_poll_logged) {
+        ul_log::Write("GSyncDetector::Poll: enabled=%d possible=%d requested=%d "
+                      "indicator=%d displayInVRR=%d -> gsync_active=%d",
+                      vrr_info.bIsVRREnabled, vrr_info.bIsVRRPossible,
+                      vrr_info.bIsVRRRequested, vrr_info.bIsVRRIndicatorEnabled,
+                      vrr_info.bIsDisplayInVRRMode, gsync_active ? 1 : 0);
+        first_poll_logged = true;
+    }
     return gsync_active;
 }
-#endif
 
 // ============================================================================
 // FrameSplitController — disable/restore NVIDIA driver frame splitting
 // ============================================================================
 
-#ifdef _WIN64
 bool FrameSplitController::Init() {
     NvQueryInterface_fn qi = GetNvapiQi();
     if (!qi) {
@@ -587,21 +629,21 @@ bool FrameSplitController::Init() {
         return false;
     }
 
-    NvU32 get_id = FindFuncId("NvAPI_DISP_GetAdaptiveSyncData");
-    NvU32 set_id = FindFuncId("NvAPI_DISP_SetAdaptiveSyncData");
-    NvU32 enum_id = FindFuncId("NvAPI_EnumNvidiaDisplayHandle");
+    NvU32 get_id  = FindFuncId("NvAPI_DISP_GetAdaptiveSyncData");
+    NvU32 set_id  = FindFuncId("NvAPI_DISP_SetAdaptiveSyncData");
+    NvU32 name_id = FindFuncId("NvAPI_DISP_GetDisplayIdByDisplayName");
 
-    if (!get_id || !set_id || !enum_id) {
+    if (!get_id || !set_id || !name_id) {
         ul_log::Write("FrameSplitController::Init: function IDs not found in table");
         return false;
     }
 
     get_adaptive_sync = reinterpret_cast<GetAdaptiveSyncData_fn>(qi(get_id));
     set_adaptive_sync = reinterpret_cast<SetAdaptiveSyncData_fn>(qi(set_id));
-    enum_display      = reinterpret_cast<EnumDisplayHandle_fn>(qi(enum_id));
+    get_display_id    = reinterpret_cast<GetDisplayIdByName_fn>(qi(name_id));
 
     resolved = (get_adaptive_sync != nullptr && set_adaptive_sync != nullptr
-                && enum_display != nullptr);
+                && get_display_id != nullptr);
     if (!resolved) {
         ul_log::Write("FrameSplitController::Init: failed to resolve function pointers");
     } else {
@@ -611,7 +653,7 @@ bool FrameSplitController::Init() {
 }
 
 bool FrameSplitController::ResolveDisplayId(HWND hwnd) {
-    if (!resolved || !enum_display) return false;
+    if (!resolved || !get_display_id) return false;
     if (!hwnd) return false;
 
     HMONITOR hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
@@ -623,48 +665,44 @@ bool FrameSplitController::ResolveDisplayId(HWND hwnd) {
         return false;
     }
 
-    MONITORINFOEXW mi = {};
+    MONITORINFOEXA mi = {};
     mi.cbSize = sizeof(mi);
-    if (!GetMonitorInfoW(hmon, &mi)) {
+    if (!GetMonitorInfoA(hmon, &mi)) {
         if (!error_logged) {
-            ul_log::Write("FrameSplitController::ResolveDisplayId: GetMonitorInfoW failed");
+            ul_log::Write("FrameSplitController::ResolveDisplayId: GetMonitorInfoA failed");
             error_logged = true;
         }
         return false;
     }
 
-    // Enumerate NVAPI displays and match by device name
-    for (NvU32 i = 0; i < 32; i++) {
-        NvU32 handle = 0;
-        NvStatus st = enum_display(i, &handle);
-        if (st != NV_OK) break;  // no more displays
-
-        display_id = handle;
-        ul_log::Write("FrameSplitController::ResolveDisplayId: using display handle 0x%08X", handle);
-        return true;
+    NvU32 id = 0;
+    NvStatus st = get_display_id(mi.szDevice, &id);
+    if (st != NV_OK) {
+        if (!error_logged) {
+            ul_log::Write("FrameSplitController::ResolveDisplayId: "
+                          "GetDisplayIdByDisplayName failed for '%s' (status=%d)",
+                          mi.szDevice, st);
+            error_logged = true;
+        }
+        return false;
     }
 
-    if (!error_logged) {
-        ul_log::Write("FrameSplitController::ResolveDisplayId: no NVAPI display found");
-        error_logged = true;
-    }
-    return false;
+    display_id = id;
+    error_logged = false;
+    ul_log::Write("FrameSplitController::ResolveDisplayId: '%s' -> display ID 0x%08X",
+                  mi.szDevice, display_id);
+    return true;
 }
 
 bool FrameSplitController::Disable() {
     if (!resolved || !get_adaptive_sync || !set_adaptive_sync) return false;
     if (display_id == 0) return false;
-    if (disabled) return true;  // already disabled
+    if (disabled) return true;
 
-    // Save original state
-    memset(saved_data, 0, sizeof(saved_data));
-    // NV_GET_ADAPTIVE_SYNC_DATA structure: version at offset 0 (NvU32)
-    // Version = sizeof(struct) | (1 << 16)
-    // Struct size is typically 12 bytes: version(4) + maxFrameInterval(4) + flags(4)
-    NvU32 version = 12 | (1 << 16);
-    memcpy(saved_data, &version, sizeof(version));
+    NV_GET_ADAPTIVE_SYNC_DATA get_data = {};
+    get_data.version = NV_GET_ADAPTIVE_SYNC_DATA_VER;
 
-    NvStatus st = get_adaptive_sync(display_id, saved_data);
+    NvStatus st = get_adaptive_sync(display_id, &get_data);
     if (st != NV_OK) {
         if (!error_logged) {
             ul_log::Write("FrameSplitController::Disable: GetAdaptiveSyncData failed (status=%d)", st);
@@ -673,20 +711,23 @@ bool FrameSplitController::Disable() {
         saved_valid = false;
         return false;
     }
+
+    // Save original state for restore
+    memcpy(&saved_data, &get_data, sizeof(get_data));
     saved_valid = true;
 
-    // Set frame splitting disabled: copy saved data, set bDisableFrameSplitting flag
-    uint8_t set_data[64] = {};
-    memcpy(set_data, saved_data, sizeof(saved_data));
+    NV_SET_ADAPTIVE_SYNC_DATA set_data = {};
+    set_data.version               = NV_SET_ADAPTIVE_SYNC_DATA_VER;
+    set_data.maxFrameInterval      = get_data.maxFrameInterval;
+    set_data.bDisableAdaptiveSync  = get_data.bDisableAdaptiveSync;
+    set_data.bDisableFrameSplitting = 1;
+    // maxFrameIntervalNs = 0 → EDID default ("don't change").
+    // The GET struct doesn't return maxFrameIntervalNs (it has lastFlipTimeStamp
+    // at that offset instead), so we can't read-modify-write it. Passing 0
+    // tells the driver to keep whatever ns-level interval is already configured.
+    set_data.maxFrameIntervalNs    = 0;
 
-    // The flags field is at offset 8 (after version + maxFrameInterval)
-    // Bit 0 of flags = bDisableFrameSplitting
-    NvU32 flags = 0;
-    memcpy(&flags, &set_data[8], sizeof(flags));
-    flags |= 1;  // set bDisableFrameSplitting = 1
-    memcpy(&set_data[8], &flags, sizeof(flags));
-
-    st = set_adaptive_sync(display_id, set_data);
+    st = set_adaptive_sync(display_id, &set_data);
     if (st != NV_OK) {
         if (!error_logged) {
             ul_log::Write("FrameSplitController::Disable: SetAdaptiveSyncData failed (status=%d)", st);
@@ -702,25 +743,24 @@ bool FrameSplitController::Disable() {
 
 bool FrameSplitController::Restore() {
     if (!resolved || !set_adaptive_sync) return false;
-    if (!disabled) return true;  // nothing to restore
+    if (!disabled) return true;
     if (!saved_valid) return false;
 
-    // Restore original state: clear bDisableFrameSplitting flag
-    uint8_t restore_data[64] = {};
-    memcpy(restore_data, saved_data, sizeof(saved_data));
+    NV_GET_ADAPTIVE_SYNC_DATA& saved = saved_data;
 
-    NvU32 flags = 0;
-    memcpy(&flags, &restore_data[8], sizeof(flags));
-    flags &= ~1u;  // clear bDisableFrameSplitting
-    memcpy(&restore_data[8], &flags, sizeof(flags));
+    NV_SET_ADAPTIVE_SYNC_DATA set_data = {};
+    set_data.version                = NV_SET_ADAPTIVE_SYNC_DATA_VER;
+    set_data.maxFrameInterval       = saved.maxFrameInterval;
+    set_data.bDisableAdaptiveSync   = saved.bDisableAdaptiveSync;
+    set_data.bDisableFrameSplitting = saved.bDisableFrameSplitting;
 
-    NvStatus st = set_adaptive_sync(display_id, restore_data);
+    NvStatus st = set_adaptive_sync(display_id, &set_data);
     if (st != NV_OK) {
         if (!error_logged) {
             ul_log::Write("FrameSplitController::Restore: SetAdaptiveSyncData failed (status=%d)", st);
             error_logged = true;
         }
-        disabled = false;  // best-effort: mark as not disabled
+        disabled = false;
         return false;
     }
 
@@ -728,7 +768,6 @@ bool FrameSplitController::Restore() {
     ul_log::Write("FrameSplitController::Restore: frame splitting restored");
     return true;
 }
-#endif
 
 // ============================================================================
 // Smooth Motion detection
@@ -753,6 +792,7 @@ static NvU32 ComputeVrrFloorIntervalUs(HWND hwnd) {
     int ovr = g_cfg.vsync_override.load(std::memory_order_relaxed);
     int64_t now_qpc = ul_timing::NowQpc();
 
+    // Invalidate cache on: timer expiry or vsync override change.
     bool stale = (now_qpc - s_last_check_qpc > ul_timing::g_qpc_freq * 2)
               || (ovr != s_last_vsync_override);
     if (!stale) return s_cached;
@@ -761,13 +801,130 @@ static NvU32 ComputeVrrFloorIntervalUs(HWND hwnd) {
 
     if (ovr == 2) { s_cached = 0; return 0; }
 
-    // Prefer VK_EXT_present_timing refresh duration — direct from display
-    // hardware, updates dynamically, more accurate than EnumDisplaySettings.
-#ifdef _WIN64
+    // QueryDisplayConfig — DX path.
+    // Uses DISPLAYCONFIG_VIDEO_SIGNAL_INFO::vSyncFreq which reports the actual
+    // display signal timing — works correctly under GSync/VRR where
+    // EnumDisplaySettings may return dmDisplayFrequency=0.
+    // Same approach as SpecialK and DisplayCommander.
+    if (!hwnd) hwnd = GetForegroundWindow();
+    if (!hwnd) { s_cached = 0; return 0; }
+
+    HMONITOR hm = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!hm) { s_cached = 0; return 0; }
+
+    // Get the GDI device name for this monitor
+    MONITORINFOEXA mi = {}; mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoA(hm, &mi)) { s_cached = 0; return 0; }
+
+    // Try QueryDisplayConfig first — accurate under VRR
     {
-        uint64_t refresh_ns = VkPresentTimingGetRefreshDurationNs();
-        if (refresh_ns > 0) {
-            double hz = 1e9 / static_cast<double>(refresh_ns);
+        UINT32 path_count = 0, mode_count = 0;
+        LONG buf_res = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count);
+        if (buf_res == ERROR_SUCCESS && path_count > 0 && mode_count > 0) {
+            auto paths = std::make_unique<DISPLAYCONFIG_PATH_INFO[]>(path_count);
+            auto modes = std::make_unique<DISPLAYCONFIG_MODE_INFO[]>(mode_count);
+            LONG qdc_res = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.get(),
+                                              &mode_count, modes.get(), nullptr);
+            if (qdc_res == ERROR_SUCCESS) {
+                bool found_monitor = false;
+                for (UINT32 i = 0; i < path_count; i++) {
+                    if (!(paths[i].flags & DISPLAYCONFIG_PATH_ACTIVE))
+                        continue;
+
+                    // Match this path to our monitor via GDI device name
+                    DISPLAYCONFIG_SOURCE_DEVICE_NAME src_name = {};
+                    src_name.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+                    src_name.header.size = sizeof(src_name);
+                    src_name.header.adapterId = paths[i].sourceInfo.adapterId;
+                    src_name.header.id = paths[i].sourceInfo.id;
+                    if (DisplayConfigGetDeviceInfo(&src_name.header) != ERROR_SUCCESS)
+                        continue;
+
+                    // Compare wide GDI name against our ANSI name
+                    char src_name_a[64] = {};
+                    WideCharToMultiByte(CP_ACP, 0, src_name.viewGdiDeviceName, -1,
+                                        src_name_a, sizeof(src_name_a), nullptr, nullptr);
+                    if (strcmp(src_name_a, mi.szDevice) != 0)
+                        continue;
+
+                    found_monitor = true;
+
+                    // Found our monitor — get target mode for vSyncFreq
+                    int mode_idx = (paths[i].flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE)
+                        ? paths[i].targetInfo.targetModeInfoIdx
+                        : paths[i].targetInfo.modeInfoIdx;
+                    if (mode_idx < 0 || static_cast<UINT32>(mode_idx) >= mode_count) {
+                        static bool s_log_idx = false;
+                        if (!s_log_idx) {
+                            ul_log::Write("VrrFloor: monitor found but mode_idx out of range (%d, count=%u)",
+                                           mode_idx, mode_count);
+                            s_log_idx = true;
+                        }
+                        continue;
+                    }
+                    if (modes[mode_idx].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_TARGET) {
+                        static bool s_log_type = false;
+                        if (!s_log_type) {
+                            ul_log::Write("VrrFloor: monitor found but mode type=%d (expected TARGET=2)",
+                                           modes[mode_idx].infoType);
+                            s_log_type = true;
+                        }
+                        continue;
+                    }
+
+                    auto& vsig = modes[mode_idx].targetMode.targetVideoSignalInfo;
+                    if (vsig.vSyncFreq.Numerator > 0 && vsig.vSyncFreq.Denominator > 0) {
+                        double hz = static_cast<double>(vsig.vSyncFreq.Numerator)
+                                  / static_cast<double>(vsig.vSyncFreq.Denominator);
+                        if (hz >= 30.0) {
+                            double ceiling_fps = 3600.0 * hz / (hz + 3600.0);
+                            if (ceiling_fps >= 10.0) {
+                                ceiling_fps *= 0.995;
+                                s_cached = static_cast<NvU32>(std::round(1'000'000.0 / ceiling_fps));
+                                return s_cached;
+                            }
+                        }
+                    }
+                    // vSyncFreq was 0 or hz < 30
+                    static bool s_log_freq = false;
+                    if (!s_log_freq) {
+                        ul_log::Write("VrrFloor: monitor found, vSyncFreq=%u/%u (unusable)",
+                                       vsig.vSyncFreq.Numerator, vsig.vSyncFreq.Denominator);
+                        s_log_freq = true;
+                    }
+                    break;  // found our monitor, stop searching
+                }
+
+                if (!found_monitor) {
+                    static bool s_log_nomatch = false;
+                    if (!s_log_nomatch) {
+                        ul_log::Write("VrrFloor: QueryDisplayConfig OK (%u paths) but no match for '%s'",
+                                       path_count, mi.szDevice);
+                        s_log_nomatch = true;
+                    }
+                }
+            } else {
+                static bool s_log_qdc = false;
+                if (!s_log_qdc) {
+                    ul_log::Write("VrrFloor: QueryDisplayConfig failed (%ld)", qdc_res);
+                    s_log_qdc = true;
+                }
+            }
+        } else {
+            static bool s_log_buf = false;
+            if (!s_log_buf) {
+                ul_log::Write("VrrFloor: GetDisplayConfigBufferSizes failed (res=%ld, paths=%u, modes=%u)",
+                               buf_res, path_count, mode_count);
+                s_log_buf = true;
+            }
+        }
+    }
+
+    // Last resort: EnumDisplaySettings (may return 0 under VRR)
+    {
+        DEVMODEA dm = {}; dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) {
+            double hz = static_cast<double>(dm.dmDisplayFrequency);
             if (hz >= 30.0) {
                 double ceiling_fps = 3600.0 * hz / (hz + 3600.0);
                 if (ceiling_fps >= 10.0) {
@@ -778,30 +935,9 @@ static NvU32 ComputeVrrFloorIntervalUs(HWND hwnd) {
             }
         }
     }
-#endif
 
-    // Fallback: EnumDisplaySettings (DX path, or Vulkan without present_timing)
-    if (!hwnd) hwnd = GetForegroundWindow();
-    if (!hwnd) { s_cached = 0; return 0; }
-
-    HMONITOR hm = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-    if (!hm) { s_cached = 0; return 0; }
-
-    MONITORINFOEXA mi = {}; mi.cbSize = sizeof(mi);
-    if (!GetMonitorInfoA(hm, &mi)) { s_cached = 0; return 0; }
-
-    DEVMODEA dm = {}; dm.dmSize = sizeof(dm);
-    if (!EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) { s_cached = 0; return 0; }
-
-    double hz = static_cast<double>(dm.dmDisplayFrequency);
-    if (hz < 30.0) { s_cached = 0; return 0; }
-
-    double ceiling_fps = 3600.0 * hz / (hz + 3600.0);
-    if (ceiling_fps < 10.0) { s_cached = 0; return 0; }
-    ceiling_fps *= 0.995;
-
-    s_cached = static_cast<NvU32>(std::round(1'000'000.0 / ceiling_fps));
-    return s_cached;
+    s_cached = 0;
+    return 0;
 }
 
 // ============================================================================
@@ -827,51 +963,37 @@ static constexpr NvU32 kFGPacingOffsetUs = 24;
 // ============================================================================
 
 int UlLimiter::DetectFGDivisor() const {
-    bool fg_dll = GetModuleHandleW(L"nvngx_dlssg.dll")
-              || GetModuleHandleW(L"_nvngx_dlssg.dll")
-              || GetModuleHandleW(L"sl.dlss_g.dll")
-              || GetModuleHandleW(L"dlss-g.dll");
-    bool fsr_dll = GetModuleHandleW(L"amd_fidelityfx_framegeneration.dll")
-                || GetModuleHandleW(L"ffx_framegeneration.dll");
+    return cached_fg_divisor_;
+}
+
+int UlLimiter::ComputeFGDivisorRaw() const {
+    // Streamline slDLSSGSetOptions hook is the primary source of truth for DLSS FG.
+    // Reads numFramesToGenerate directly from the Streamline DLSS-G API.
+    int fg_mult = g_fg_multiplier.load(std::memory_order_relaxed);
+    if (g_fg_active.load(std::memory_order_relaxed) && fg_mult >= 2)
+        return fg_mult;
 
     // DMFG hint from game's requested frame latency.
     // ONLY used when no user-space FG DLL is present — this is the signal
     // for driver-side DMFG (RTX 50 series) which has no DLL.
-    // When an FG DLL IS loaded, the game may still request high queue depths
-    // (e.g. Crimson Desert requests 4 with standard 2x DLSS FG), so the
-    // latency hint would misclassify 2x as 3x. Trust cadence detection instead.
-    UINT game_lat = GetGameRequestedLatency();
-    int lat_hint = 1;
-    if (!fg_dll && !fsr_dll) {
+    bool fg_dll = GetModuleHandleW(L"nvngx_dlssg.dll")
+              || GetModuleHandleW(L"_nvngx_dlssg.dll")
+              || GetModuleHandleW(L"sl.dlss_g.dll")
+              || GetModuleHandleW(L"dlss-g.dll");
+    if (!fg_dll) {
+        UINT game_lat = GetGameRequestedLatency();
         if (game_lat >= 3) {
-            lat_hint = static_cast<int>(game_lat);
+            int lat_hint = static_cast<int>(game_lat);
             if (lat_hint > 6) lat_hint = 6;
+            return lat_hint;
         }
     }
 
-    // FPS-based monitor is ground truth for runtime FG state.
-    // It detects FG on/off from the output/native FPS ratio.
-    // When it has data, trust it over DLL presence (DLLs stay loaded
-    // even when the game disables FG, e.g. in menus).
-    int fps_tier = ul_fg_monitor::GetTier();
-    if (fps_tier >= 2) return fps_tier;
-    if (fps_tier == 0 && ul_fg_monitor::HasData()) return 1;  // confirmed no FG
-
-    // No FPS-based data yet — fall back to static detection.
-    // DMFG latency hint (no DLL case)
-    if (lat_hint > 1) return lat_hint;
-
-    // DLL loaded but no FPS confirmation yet — default to 1 (no FG).
-    // FG DLLs stay loaded even when FG is disabled (menus, user toggle),
-    // so DLL presence alone is not proof of active frame generation.
-    // The FPS monitor will promote to 2x+ once it confirms the ratio.
-    // Exception: when Streamline is present, trust DLL presence as a hint
-    // since marker-based native FPS may not be available on Vulkan.
-    if (fg_dll || fsr_dll) {
-        if (GetModuleHandleW(L"sl.interposer.dll") != nullptr)
-            return 2;  // Streamline present — assume 2x until FPS confirms
-    }
     return 1;
+}
+
+void UlLimiter::CacheFGDivisor() {
+    cached_fg_divisor_ = ComputeFGDivisorRaw();
 }
 
 // Compute the Reflex cap from the monitor refresh rate.
@@ -930,19 +1052,10 @@ void UlLimiter::Init(HMODULE addon_module) {
 
 void UlLimiter::Shutdown() {
     diag_csv_logger_.Close();
+    vblank_monitor_.Shutdown();
 
     // Restore frame splitting state before shutdown
-#ifdef _WIN64
     frame_split_ctrl_.Restore();
-#endif
-
-    // Vulkan cleanup
-#ifdef _WIN64
-    if (vk_reflex_) {
-        vk_reflex_->Shutdown();
-        vk_reflex_ = nullptr;
-    }
-#endif
 
     if (dev_ && ReflexActive()) {
         const auto& gs = GetGameState();
@@ -957,6 +1070,7 @@ void UlLimiter::Shutdown() {
     }
     TeardownReflexHooks();
     dev_ = nullptr;
+    dxgi_sc_ = nullptr;
     last_sleep_valid_ = false;
 
     if (htimer_delay_) { CloseHandle(htimer_delay_); htimer_delay_ = nullptr; }
@@ -977,35 +1091,28 @@ bool UlLimiter::ConnectReflex(IUnknown* device) {
     }
     ul_log::Write("ConnectReflex: hooks active");
 
-#ifdef _WIN64
     // Init GSync detection and frame splitting control now that NVAPI is loaded
     if (!gsync_detector_.resolved)
         gsync_detector_.Init();
     if (!frame_split_ctrl_.resolved)
         frame_split_ctrl_.Init();
-#endif
+
+    // Start VBlank monitor for DX PLL — exact hardware vblank timestamps.
+    if (hwnd_ && !vblank_monitor_.IsActive()) {
+        vblank_monitor_.Init(hwnd_);
+    }
 
     return true;
 }
 
-#ifdef _WIN64
-void UlLimiter::ConnectVulkanReflex(VkReflex* vk) {
-    vk_reflex_ = vk;
-    ul_log::Write("ConnectVulkanReflex: Vulkan Reflex backend attached (active=%d)",
-                  vk ? vk->IsActive() : 0);
-}
-
-void UlLimiter::AcquireGSyncSurface(IUnknown* device, IUnknown* back_buffer) {
-    gsync_detector_.AcquireSurfaceHandle(device, back_buffer);
-}
-#endif
 
 void UlLimiter::ResetAdaptiveState() {
     pipeline_predictor_.Reset();
     pipeline_stats_ = PipelineStats{};
     boost_ctrl_.Reset();
     qpc_monitor_.Reset();
-    consistency_buf_.Reset(DetectFGDivisor());
+    cached_fg_divisor_ = ComputeFGDivisorRaw();  // refresh before Reset uses it
+    consistency_buf_.Reset(cached_fg_divisor_);
     gpu_load_gate_open_ = false;
     last_fg_tier_ = 0;
     pending_fg_tier_ = 0;
@@ -1020,6 +1127,26 @@ void UlLimiter::ResetAdaptiveState() {
     gpu_recover_count_ = 0;
     pll_smoothed_error_ns_ = 0.0f;
     last_pll_frame_id_ = 0;
+    pll_error_variance_ns2_ = 0.0f;
+    pll_sample_count_ = 0;
+    pll_converged_ = false;
+    pll_marker_present_ns_.store(0, std::memory_order_relaxed);
+    pll_marker_frame_id_.store(0, std::memory_order_relaxed);
+    last_pll_marker_frame_id_ = 0;
+
+    // Reset voting windows
+    site_vote_head_ = 0;
+    site_vote_count_ = 0;
+    gate_vote_head_ = 0;
+    gate_vote_count_ = 0;
+
+    // Reset DXGI frame stats tracking
+    last_dxgi_sync_qpc_ = 0;
+    last_dxgi_present_count_ = 0;
+    last_real_present_count_ = 0;
+    last_pll_vblank_count_ = 0;
+    // Note: dxgi_sc_ is NOT cleared here — it's still valid across resets.
+    // Only cleared in Shutdown or when the swapchain is destroyed.
 
     grid_epoch_ns_ = 0;
     grid_next_ns_ = 0;
@@ -1053,10 +1180,22 @@ static NvU32 AdjustIntervalUs(NvU32 raw, int fg_divisor, HWND hwnd,
     }
 
     if (fg_divisor > 1) {
-        // FG path: consistency buffer + FG overhead offset
+        // FG path: consistency buffer + FG overhead offset.
+        // Cap the combined adjustment to prevent over-padding — the consistency
+        // buffer's max for the current tier is the ceiling for total FG adjustment.
         int32_t fg_adj = consistency_buffer_us;
         if (ps.adaptive_fg_offset_us > 0)
             fg_adj += ps.adaptive_fg_offset_us;
+
+        // Clamp: don't let FG offset push total beyond what the consistency
+        // buffer considers safe for this tier.
+        if (fg_adj > consistency_buffer_us && consistency_buffer_us > 0) {
+            // The consistency buffer already accounts for cadence variance.
+            // Allow the FG offset to add at most half the buffer's current value
+            // on top, preventing runaway stacking.
+            int32_t max_total = consistency_buffer_us + (consistency_buffer_us / 2);
+            if (fg_adj > max_total) fg_adj = max_total;
+        }
 
         if (fg_adj > 0) {
             raw += static_cast<NvU32>(fg_adj);
@@ -1141,11 +1280,7 @@ NvSleepParams UlLimiter::BuildSleepParams() const {
     p.minimumIntervalUs = AdjustIntervalUs(raw_interval, DetectFGDivisor(), hwnd_,
                                             pipeline_stats_, ptp_correction_us_,
                                             consistency_buf_.buffer_us,
-#ifdef _WIN64
                                             gsync_detector_.gsync_active
-#else
-                                            false
-#endif
                                             );
     return p;
 }
@@ -1160,22 +1295,6 @@ bool UlLimiter::MaybeUpdateSleepMode(const NvSleepParams& p) {
     }
 
     bool ok = false;
-#ifdef _WIN64
-    if (VK_REFLEX_ACTIVE()) {
-        bool native = g_game_uses_reflex.load(std::memory_order_relaxed);
-        if (!native) {
-            ok = vk_reflex_->SetSleepMode(
-                p.bLowLatencyMode != 0,
-                p.bLowLatencyBoost != 0,
-                p.minimumIntervalUs);
-        } else {
-            // Native Reflex (including Streamline): game manages SetSleepMode.
-            // We can't override the interval because Streamline's internal
-            // vkLatencySleepNV blocks for whatever interval is set on the driver.
-            ok = true;
-        }
-    } else
-#endif
     {
         NvSleepParams copy = p;
         NvStatus st = InvokeSetSleepMode(dev_, &copy);
@@ -1189,18 +1308,6 @@ bool UlLimiter::MaybeUpdateSleepMode(const NvSleepParams& p) {
 // Invoke the driver's sleep function (returns near-instantly when we already
 // consumed the wait via our grid). Keeps the driver's internal state coherent.
 void UlLimiter::InvokeReflexSleep() {
-#ifdef _WIN64
-    if (VK_REFLEX_ACTIVE()) {
-        // Streamline: call the swallowed slReflexSleep trampoline with the
-        // stashed frame token. This advances Streamline's internal state
-        // after our grid pacing has completed.
-        if (GetModuleHandleW(L"sl.common.dll") != nullptr) {
-            InvokeStreamlineSleep();
-            return;
-        }
-        return;
-    }
-#endif
     if (ReflexActive() && dev_)
         InvokeSleep(dev_);
 }
@@ -1212,29 +1319,46 @@ void UlLimiter::InvokeReflexSleep() {
 void UlLimiter::UpdatePipelineStats() {
     if (!latency_buf_) return;
 
-    // Vulkan path
-#ifdef _WIN64
-    if (VK_REFLEX_ACTIVE()) {
-        memset(latency_buf_, 0, sizeof(*latency_buf_));
-        latency_buf_->version = NV_LATENCY_RESULT_VER;
-        if (!vk_reflex_->GetLatencyTimings(latency_buf_)) return;
-    }
-    // DX path
-    else
-#endif
+    // Try GetLatency — may return empty reports for Streamline games
+    // where the device registration is owned by Streamline's interposer.
+    bool has_getlatency_data = false;
     {
-        if (!ReflexActive() || !dev_) return;
+        if (ReflexActive() && dev_) {
+            memset(latency_buf_, 0, sizeof(*latency_buf_));
+            latency_buf_->version = NV_LATENCY_RESULT_VER;
 
-        memset(latency_buf_, 0, sizeof(*latency_buf_));
-        latency_buf_->version = NV_LATENCY_RESULT_VER;
+            NvStatus st;
+            __try { st = InvokeGetLatency(dev_, latency_buf_); }
+            __except(EXCEPTION_EXECUTE_HANDLER) { st = NV_NO_IMPL; }
 
-        NvStatus st;
-        __try { st = InvokeGetLatency(dev_, latency_buf_); }
-        __except(EXCEPTION_EXECUTE_HANDLER) { st = NV_NO_IMPL; }
-        if (st != NV_OK) return;
+            if (st == NV_OK) {
+                for (int i = 0; i < 64; i++) {
+                    if (latency_buf_->frameReport[i].frameID) {
+                        has_getlatency_data = true;
+                        break;
+                    }
+                }
+            }
+
+            // One-shot diagnostic
+            {
+                static bool s_gl_logged = false;
+                static int s_gl_empty_count = 0;
+                if (!s_gl_logged) {
+                    s_gl_empty_count++;
+                    if (has_getlatency_data) {
+                        ul_log::Write("GetLatency: data available (after %d empty polls)", s_gl_empty_count);
+                        s_gl_logged = true;
+                    } else if (s_gl_empty_count == 300) {
+                        ul_log::Write("GetLatency: still empty after %d polls — Streamline device mismatch, using marker fallback", s_gl_empty_count);
+                        s_gl_logged = true;
+                    }
+                }
+            }
+        }
     }
 
-    // Scan the most recent valid reports (up to 16)
+    // Scan the most recent valid reports (up to 16) — only when GetLatency has data
     float sum_gpu = 0, sum_queue = 0, sum_fg = 0;
     float sum_sim = 0, sum_submit = 0, sum_driver = 0;
     float sum_idle_gap = 0, sum_input_disp = 0;
@@ -1254,6 +1378,7 @@ void UlLimiter::UpdatePipelineStats() {
     GapFrame gap_frames[16] = {};
     int n_gap_frames = 0;
 
+    if (has_getlatency_data) {
     for (int i = 63; i >= 0 && n_gpu < 16; i--) {
         auto& f = latency_buf_->frameReport[i];
         if (!f.frameID) continue;
@@ -1266,15 +1391,15 @@ void UlLimiter::UpdatePipelineStats() {
             float q_us = static_cast<float>(f.osRenderQueueEndTime - f.osRenderQueueStartTime);
             if (q_us < 500'000.0f) { sum_queue += q_us; n_queue++; }
         }
-        if (fg_active && f.gpuRenderEndTime > 0 && f.presentEndTime > f.gpuRenderEndTime) {
+        if (fg_active && f.gpuRenderEndTime > 0 && f.presentEndTime > f.gpuRenderEndTime
+            && IsRealFrame(f)) {
             float fg_us = static_cast<float>(f.presentEndTime - f.gpuRenderEndTime);
             if (fg_us > 0.0f && fg_us < 200'000.0f) { sum_fg += fg_us; n_fg++; }
         }
-        if (f.simStartTime > 0 && f.simEndTime > f.simStartTime) {
+        if (IsRealFrame(f)) {
             float sim_us = static_cast<float>(f.simEndTime - f.simStartTime);
             if (sim_us < 200'000.0f) { sum_sim += sim_us; n_sim++; }
-        }
-        if (f.renderSubmitStartTime > 0 && f.renderSubmitEndTime > f.renderSubmitStartTime) {
+        }        if (f.renderSubmitStartTime > 0 && f.renderSubmitEndTime > f.renderSubmitStartTime) {
             float sub_us = static_cast<float>(f.renderSubmitEndTime - f.renderSubmitStartTime);
             if (sub_us < 200'000.0f) { sum_submit += sub_us; n_submit++; }
         }
@@ -1309,6 +1434,7 @@ void UlLimiter::UpdatePipelineStats() {
             }
         }
     }
+    } // end if (has_getlatency_data)
 
     // Update EMAs
     auto& ps = pipeline_stats_;
@@ -1348,14 +1474,26 @@ void UlLimiter::UpdatePipelineStats() {
     }
 
     ps.samples += n_gpu;
-    if (ps.samples < PipelineStats::kMinSamples) return;
-    ps.valid = true;
+    if (!has_getlatency_data) {
+        // Streamline fallback: no GetLatency data, but we can still track cadence
+        // from marker timestamps. Set valid after enough marker-based cadence samples.
+        if (pipeline_predictor_.cadence.count >= PipelineStats::kMinSamples)
+            ps.valid = true;
+        // Set target_load_ratio to a neutral value so adaptive systems don't
+        // make decisions based on missing GPU data.
+        target_load_ratio = 0.75f;  // neutral — neither overloaded nor idle
+    } else {
+        if (ps.samples < PipelineStats::kMinSamples) return;
+        ps.valid = true;
+    }
 
-    ps.avg_pipeline_total_us = ps.avg_sim_us + ps.avg_render_submit_us
-                             + ps.avg_driver_us + ps.avg_queue_us + ps.avg_gpu_active_us;
+    if (has_getlatency_data) {
+        ps.avg_pipeline_total_us = ps.avg_sim_us + ps.avg_render_submit_us
+                                 + ps.avg_driver_us + ps.avg_queue_us + ps.avg_gpu_active_us;
+    }
 
-    // Adaptive interval adjustment
-    if (target_interval_us > 0.0f) {
+    // Adaptive interval adjustment (requires GetLatency GPU data)
+    if (has_getlatency_data && target_interval_us > 0.0f) {
         ps.gpu_load_ratio = ps.avg_gpu_active_us / target_interval_us;
         ps.pipeline_load_ratio = ps.avg_pipeline_total_us / target_interval_us;
 
@@ -1425,8 +1563,8 @@ void UlLimiter::UpdatePipelineStats() {
             ps.interval_adjust_us = 0;
     }
 
-    // Bottleneck detection (40% threshold)
-    if (ps.avg_pipeline_total_us > 0.0f) {
+    // Bottleneck detection (40% threshold) — requires GetLatency data
+    if (has_getlatency_data && ps.avg_pipeline_total_us > 0.0f) {
         float stages[5] = {
             ps.avg_sim_us, ps.avg_render_submit_us, ps.avg_driver_us,
             ps.avg_queue_us, ps.avg_gpu_active_us
@@ -1444,24 +1582,51 @@ void UlLimiter::UpdatePipelineStats() {
             ps.bottleneck = Bottleneck::None;
     }
 
-    // Auto enforcement site (enhanced with bottleneck + FG awareness)
-    if (fg_active) {
-        // Hysteresis band: only switch when gpu_load crosses 0.55 or 0.70
-        // to avoid oscillation when hovering near the boundary.
-        if (target_load_ratio < 0.55f)
-            ps.auto_site = SIM_START;
-        else if (target_load_ratio > 0.70f)
-            ps.auto_site = PRESENT_FINISH;
-        // else: keep previous site (dead zone)
-    } else if (ps.bottleneck == Bottleneck::Gpu)
-        ps.auto_site = SIM_START;
-    else if (ps.bottleneck == Bottleneck::CpuSim || ps.bottleneck == Bottleneck::CpuSubmit)
-        ps.auto_site = PRESENT_FINISH;
-    else {
-        if (target_load_ratio > 0.85f)
-            ps.auto_site = SIM_START;
-        else if (target_load_ratio < 0.65f)
-            ps.auto_site = PRESENT_FINISH;
+    // Auto enforcement site — voting window prevents oscillation from
+    // transient GPU load changes. Each frame votes for a site, and the
+    // site only switches when a supermajority (70%) of the window agrees.
+    {
+        int suggested_site = ps.auto_site;  // keep current as default
+
+        if (fg_active) {
+            if (target_load_ratio < 0.55f)
+                suggested_site = SIM_START;
+            else if (target_load_ratio > 0.70f)
+                suggested_site = PRESENT_FINISH;
+        } else if (ps.bottleneck == Bottleneck::Gpu)
+            suggested_site = SIM_START;
+        else if (ps.bottleneck == Bottleneck::CpuSim || ps.bottleneck == Bottleneck::CpuSubmit)
+            suggested_site = PRESENT_FINISH;
+        else {
+            if (target_load_ratio > 0.85f)
+                suggested_site = SIM_START;
+            else if (target_load_ratio < 0.65f)
+                suggested_site = PRESENT_FINISH;
+        }
+
+        // Record vote
+        site_votes_[site_vote_head_] = suggested_site;
+        site_vote_head_ = (site_vote_head_ + 1) % kSiteVoteWindow;
+        if (site_vote_count_ < kSiteVoteWindow) site_vote_count_++;
+
+        // Count votes — only switch when 70% agree on a different site.
+        // Before the window fills, use the suggested site directly.
+        if (site_vote_count_ < kSiteVoteWindow / 2) {
+            ps.auto_site = suggested_site;
+        } else {
+            int sim_votes = 0, pf_votes = 0;
+            for (int i = 0; i < site_vote_count_; i++) {
+                int idx = (site_vote_head_ - site_vote_count_ + i + kSiteVoteWindow) % kSiteVoteWindow;
+                if (site_votes_[idx] == SIM_START) sim_votes++;
+                else if (site_votes_[idx] == PRESENT_FINISH) pf_votes++;
+            }
+            int threshold = static_cast<int>(site_vote_count_ * 0.70f);
+            if (sim_votes >= threshold)
+                ps.auto_site = SIM_START;
+            else if (pf_votes >= threshold)
+                ps.auto_site = PRESENT_FINISH;
+            // else: keep current site (no supermajority)
+        }
     }
 
     // Render queue depth monitoring
@@ -1491,8 +1656,8 @@ void UlLimiter::UpdatePipelineStats() {
         ps.prev_adaptive_fg_offset_us = -1;
     }
 
-    // Predictive sleep — pipeline-aware wake scheduling
-    {
+    // Predictive sleep — pipeline-aware wake scheduling (requires GetLatency data)
+    if (has_getlatency_data) {
         auto& pred = pipeline_predictor_;
 
         struct FrameSample { uint64_t id; float gpu_us; float sim_us; float fg_us; };
@@ -1507,11 +1672,12 @@ void UlLimiter::UpdatePipelineStats() {
             s.id = f.frameID;
             if (f.gpuActiveRenderTimeUs > 0 && f.gpuActiveRenderTimeUs < 200'000)
                 s.gpu_us = static_cast<float>(f.gpuActiveRenderTimeUs);
-            if (f.simStartTime > 0 && f.simEndTime > f.simStartTime) {
+            if (IsRealFrame(f)) {
                 float sim = static_cast<float>(f.simEndTime - f.simStartTime);
                 if (sim < 200'000.0f) s.sim_us = sim;
             }
-            if (fg_active && f.gpuRenderEndTime > 0 && f.presentEndTime > f.gpuRenderEndTime) {
+            if (fg_active && f.gpuRenderEndTime > 0 && f.presentEndTime > f.gpuRenderEndTime
+                && IsRealFrame(f)) {
                 float fgo = static_cast<float>(f.presentEndTime - f.gpuRenderEndTime);
                 if (fgo > 0.0f && fgo < 200'000.0f) s.fg_us = fgo;
             }
@@ -1541,31 +1707,41 @@ void UlLimiter::UpdatePipelineStats() {
 
         pred.active = (pred.gpu.count >= 4)
                    && (pred.predicted_total_us > 0.0f) && (target_interval_us > 0.0f);
+    } // end if (has_getlatency_data) — predictive sleep
 
-        // Feed cadence tracker
-        {
+    // Feed cadence tracker — works with both GetLatency and marker fallback.
+    {
+        auto& cadence = pipeline_predictor_.cadence;
+        if (has_getlatency_data) {
+            // Real frames only — generated frames have no sim phase.
             struct CadenceSample { uint64_t id; uint64_t present_end; };
             CadenceSample csamples[64];
             int n_cs = 0;
-            uint64_t last_fed = pred.cadence.last_fed_frame_id;
+            uint64_t last_fed = cadence.last_fed_frame_id;
             for (int i = 0; i < 64; i++) {
                 auto& f = latency_buf_->frameReport[i];
-                if (f.frameID && f.presentEndTime && f.frameID > last_fed)
-                    csamples[n_cs++] = { f.frameID, f.presentEndTime };
+                if (!f.frameID || !f.presentEndTime || f.frameID <= last_fed) continue;
+                if (!IsRealFrame(f)) continue;
+                csamples[n_cs++] = { f.frameID, f.presentEndTime };
             }
             for (int i = 0; i < n_cs - 1; i++)
                 for (int j = i + 1; j < n_cs; j++)
                     if (csamples[j].id < csamples[i].id)
                         std::swap(csamples[i], csamples[j]);
             for (int i = 0; i < n_cs; i++)
-                pred.cadence.Feed(csamples[i].present_end);
+                cadence.Feed(csamples[i].present_end);
             if (n_cs > 0)
-                pred.cadence.last_fed_frame_id = csamples[n_cs - 1].id;
+                cadence.last_fed_frame_id = csamples[n_cs - 1].id;
+        } else {
+            // Streamline fallback: feed cadence from PRESENT_FINISH marker timestamps.
+            uint64_t marker_fid = pll_marker_frame_id_.load(std::memory_order_relaxed);
+            int64_t  marker_ns  = pll_marker_present_ns_.load(std::memory_order_relaxed);
+            if (marker_fid > cadence.last_fed_frame_id && marker_ns > 0) {
+                cadence.Feed(static_cast<uint64_t>(marker_ns / 1000));
+                cadence.last_fed_frame_id = marker_fid;
+            }
         }
-
-        // Cadence response and unified FG adjustment removed — replaced by ConsistencyBuffer
-        // ComputeStats so CV is fresh for the consistency buffer tick
-        pred.cadence.ComputeStats();
+        cadence.ComputeStats();
     }
 
     // --- PLL: phase-locked grid correction from display feedback ---
@@ -1575,134 +1751,422 @@ void UlLimiter::UpdatePipelineStats() {
         int64_t actual_ns = 0;
         uint64_t feedback_id = 0;
         bool high_precision_feedback = false;
+        bool used_marker = false;
+        bool used_dxgi = false;
+        bool used_vblank = false;
 
-#ifdef _WIN64
-        // Prefer VK_EXT_present_timing feedback — nanosecond-accurate scanout time
-        // from IMAGE_FIRST_PIXEL_OUT, independent of LL2/Streamline.
-        {
-            uint64_t display_ns = 0, target_ns = 0;
-            if (VkPresentTimingGetFeedback(&display_ns, &target_ns) && display_ns > 0) {
-                actual_ns = static_cast<int64_t>(display_ns);
-                feedback_id = display_ns;  // use display time as unique ID
+        // Priority 1 (DX only): VBlank monitor — exact hardware vblank
+        // timestamps from D3DKMTWaitForVerticalBlankEvent. Zero jitter,
+        // zero delay, always in QPC domain. Best possible DX PLL source.
+        if (vblank_monitor_.IsActive()) {
+            uint64_t vb_count = vblank_monitor_.GetVBlankCount();
+            if (vb_count > last_pll_vblank_count_) {
+                last_pll_vblank_count_ = vb_count;
+                actual_ns = vblank_monitor_.GetLastVBlankNs();
+                feedback_id = vb_count;
                 high_precision_feedback = true;
-                static int s_pll_log = 0;
-                if (s_pll_log++ < 5) {
-                    ul_log::Write("PLL: display_ns=%lld grid_epoch=%lld grid_next=%lld now=%lld",
-                                   actual_ns, grid_epoch_ns_, grid_next_ns_, ul_timing::NowNs());
+                used_vblank = true;
+            }
+        }
+
+        // PLL feedback priority depends on whether Streamline is present.
+        // Without Streamline: DXGI GetFrameStatistics is the best source —
+        // hardware vblank timestamps, no CPU scheduling jitter. Markers are
+        // CPU-timestamped and jitter by ±several ms under load.
+        // With Streamline: DXGI may be a proxy swapchain with unreliable
+        // stats. Markers (from PCL hook) are more reliable in that case.
+        //
+        // In both cases, the marker's "same render cycle" detection still
+        // runs to prevent duplicate PLL corrections on generated frames.
+        bool prefer_dxgi = dxgi_sc_
+            && (GetModuleHandleW(L"sl.interposer.dll") == nullptr);
+
+        // Always check marker state for render-cycle dedup, even when DXGI
+        // is preferred. This prevents DXGI from firing on generated frame
+        // presents within the same render cycle.
+        bool marker_fresh = false;   // true when a NEW marker arrived this present
+        bool marker_stale = false;   // true when we're in the same render cycle (generated frame)
+        {
+            uint64_t marker_fid = pll_marker_frame_id_.load(std::memory_order_relaxed);
+            int64_t  marker_ns  = pll_marker_present_ns_.load(std::memory_order_relaxed);
+            if (marker_fid > last_pll_marker_frame_id_ && marker_ns > 0) {
+                last_pll_marker_frame_id_ = marker_fid;
+                marker_fresh = true;
+
+                if (actual_ns == 0 && !prefer_dxgi) {
+                    // Streamline present: use marker as primary PLL source
+                    // (only if no higher-priority source already provided data)
+                    actual_ns   = marker_ns;
+                    feedback_id = marker_fid;
+                    high_precision_feedback = true;
+                    used_marker = true;
+                }
+            } else if (actual_ns == 0 && marker_fid == last_pll_marker_frame_id_ && marker_ns > 0) {
+                // Same render cycle (generated frame) — suppress lower-priority sources.
+                // Only if no higher-priority source (vblank monitor) already provided data.
+                marker_stale = true;
+                actual_ns = marker_ns;
+                used_marker = true;
+            }
+        }
+
+        // DXGI GetFrameStatistics — direct display vblank timing.
+        // Primary source on DX without Streamline (hardware timestamps).
+        // Fallback source on DX with Streamline (proxy swapchain risk).
+        // Skipped on generated frames (marker_stale).
+        if (actual_ns == 0 && dxgi_sc_ && !marker_stale) {
+            IDXGISwapChain* sc = reinterpret_cast<IDXGISwapChain*>(dxgi_sc_);
+            DXGI_FRAME_STATISTICS stats = {};
+            if (SUCCEEDED(sc->GetFrameStatistics(&stats)) && stats.SyncQPCTime.QuadPart > 0) {
+                UINT ref_count = 0;
+                if (fg_active) {
+                    ref_count = last_real_present_count_;
+                } else {
+                    sc->GetLastPresentCount(&ref_count);
+                }
+                if (ref_count > last_dxgi_present_count_
+                    && stats.PresentCount >= ref_count) {
+                    last_dxgi_present_count_ = ref_count;
+                    actual_ns = static_cast<int64_t>(
+                        static_cast<double>(stats.SyncQPCTime.QuadPart) * 1e9
+                        / static_cast<double>(ul_timing::g_qpc_freq));
+                    feedback_id = ref_count;
+                    high_precision_feedback = true;
+                    used_dxgi = true;
                 }
             }
         }
-#endif
 
-        // Fallback: GetLatencyTimings presentEndTime (DX path, or Vulkan without present timing)
+        // Marker fallback — when DXGI is preferred but didn't produce data
+        // (e.g., GetFrameStatistics failed, or present count didn't advance),
+        // fall back to the marker timestamp if we have one this cycle.
+        if (actual_ns == 0 && prefer_dxgi && marker_fresh) {
+            int64_t marker_ns = pll_marker_present_ns_.load(std::memory_order_relaxed);
+            if (marker_ns > 0) {
+                actual_ns   = marker_ns;
+                feedback_id = pll_marker_frame_id_.load(std::memory_order_relaxed);
+                high_precision_feedback = true;
+                used_marker = true;
+            }
+        }
+
+        // Fallback 2: GetLatencyTimings presentEndTime — real frames only.
+        // When FG is active, this is the preferred DX feedback source since
+        // GetLatency reports are filtered to real frames via IsRealFrame,
+        // avoiding the generated-frame vblank misalignment of DXGI stats.
         if (actual_ns == 0) {
-            uint64_t newest_id = 0;
-            uint64_t newest_present = 0;
-            for (int i = 0; i < 64; i++) {
-                auto& f = latency_buf_->frameReport[i];
-                if (f.frameID > newest_id && f.presentEndTime > 0) {
-                    newest_id = f.frameID;
-                    newest_present = f.presentEndTime;
+            // One-shot validation: confirm GetLatency timestamps are in the QPC
+            // time domain. presentEndTime should be within a few seconds of NowQpc().
+            // If the difference is large, the driver is using a different clock
+            // (e.g. GPU hardware counter) and the conversion would be garbage.
+            static int s_latency_domain_state = 0;  // 0=unknown, 1=valid, -1=invalid
+            if (s_latency_domain_state == 0) {
+                // Find any recent frame with a presentEndTime
+                for (int i = 63; i >= 0; i--) {
+                    auto& f = latency_buf_->frameReport[i];
+                    if (f.presentEndTime == 0) continue;
+                    int64_t now_qpc_ticks = ul_timing::NowQpc();
+                    int64_t delta_ticks = now_qpc_ticks
+                                       - static_cast<int64_t>(f.presentEndTime);
+                    // Allow up to 10 seconds of delta (report delay + warmup)
+                    int64_t max_delta = ul_timing::g_qpc_freq * 10;
+                    if (std::abs(delta_ticks) < max_delta) {
+                        s_latency_domain_state = 1;
+                        ul_log::Write("PLL: GetLatency timestamps validated "
+                                      "(delta=%.1fms, QPC domain confirmed)",
+                                      static_cast<float>(delta_ticks) * 1000.0f
+                                      / static_cast<float>(ul_timing::g_qpc_freq));
+                    } else {
+                        s_latency_domain_state = -1;
+                        ul_log::Write("PLL: GetLatency timestamps INVALID "
+                                      "(delta=%.1fs — not QPC domain, fallback disabled)",
+                                      static_cast<float>(delta_ticks)
+                                      / static_cast<float>(ul_timing::g_qpc_freq));
+                    }
+                    break;
                 }
             }
-            if (newest_id > last_pll_frame_id_ && newest_present > 0) {
-                feedback_id = newest_id;
-                // Convert presentEndTime (QPC ticks) to nanoseconds
-                actual_ns = static_cast<int64_t>(
-                    static_cast<double>(newest_present) * 1e9
-                    / static_cast<double>(ul_timing::g_qpc_freq));
+
+            if (s_latency_domain_state == 1) {
+                uint64_t newest_id = 0;
+                uint64_t newest_present = 0;
+                for (int i = 0; i < 64; i++) {
+                    auto& f = latency_buf_->frameReport[i];
+                    // Real frames only — generated frames have no sim phase
+                    if (!IsRealFrame(f)) continue;
+                    if (f.frameID > newest_id && f.presentEndTime > 0) {
+                        newest_id = f.frameID;
+                        newest_present = f.presentEndTime;
+                    }
+                }
+                if (newest_id > last_pll_frame_id_ && newest_present > 0) {
+                    feedback_id = newest_id;
+                    actual_ns = static_cast<int64_t>(
+                        static_cast<double>(newest_present) * 1e9
+                        / static_cast<double>(ul_timing::g_qpc_freq));
+                }
             }
         }
 
-        if (feedback_id > last_pll_frame_id_ && actual_ns > 0) {
+        // Gate: only process new feedback (dedup).
+        // Vblank monitor has its own dedup (last_pll_vblank_count_), so don't
+        // update last_pll_frame_id_ from vblank counts — they're in a different
+        // ID space and would permanently block marker/DXGI sources.
+        bool new_feedback = false;
+        if (used_vblank && actual_ns > 0) {
+            new_feedback = true;  // already deduped by last_pll_vblank_count_
+        } else if (feedback_id > last_pll_frame_id_ && actual_ns > 0) {
             last_pll_frame_id_ = feedback_id;
-
-            // Nearest grid slot to the actual present/display time
-            int64_t elapsed = actual_ns - grid_epoch_ns_;
-            int64_t expected_slot = (elapsed / grid_interval_ns_) * grid_interval_ns_
-                                  + grid_epoch_ns_;
-            int64_t phase_error_ns = actual_ns - expected_slot;
-
-            // Wrap to [-interval/2, +interval/2] for slot ambiguity
-            if (phase_error_ns > grid_interval_ns_ / 2)
-                phase_error_ns -= grid_interval_ns_;
-            else if (phase_error_ns < -grid_interval_ns_ / 2)
-                phase_error_ns += grid_interval_ns_;
-
-            // EMA smooth the error — tighter gains when using VK_EXT_present_timing
-            // (nanosecond hardware feedback) vs GetLatency (microsecond, delayed).
-            float alpha = high_precision_feedback ? 0.12f : kPllAlpha;
-            float gain  = high_precision_feedback ? 0.20f : kPllCorrectionGain;
-
-            pll_smoothed_error_ns_ = pll_smoothed_error_ns_ * (1.0f - alpha)
-                                   + static_cast<float>(phase_error_ns) * alpha;
-
-            // Nudge grid epoch
-            int64_t correction = static_cast<int64_t>(
-                pll_smoothed_error_ns_ * gain);
-            if (correction != 0)
-                grid_epoch_ns_ += correction;
+            new_feedback = true;
         }
-    }
 
-    // --- GPU Load Gate ---
-    // When GPU load is below 50%, freeze ConsistencyBuffer tick only.
-    // DynamicPacing and BoostController continue running as before.
-    // Use target-based load ratio for the gate — in overload mode the
-    // cadence-based ratio is artificially low and would falsely close the gate.
-    bool was_gate_open = gpu_load_gate_open_;
-    gpu_load_gate_open_ = (target_load_ratio >= 0.50f);
+        if (new_feedback) {
 
-    // Flush overload state when transitioning from gameplay to menu/loading
-    // (gate closing). Overload detection from gameplay is invalid in menus.
-    if (was_gate_open && !gpu_load_gate_open_) {
-        gpu_overload_mode_ = false;
-        gpu_overload_count_ = 0;
-        gpu_recover_count_ = 0;
-    }
-
-    if (gpu_load_gate_open_) {
-        // --- FG tier change detection ---
-        // DetectFGDivisor() returns the latency-hint-aware base tier (DLL
-        // presence for standard FG, latency hint for DMFG).
-        // g_fps_fg_tier (from main.cpp) provides the FPS-based multiplier
-        // computed from output_fps / native_fps — immune to GPU load
-        // inflating cadence mean_delta.  Prefer it when available.
-        int fg_tier = DetectFGDivisor();
-        int dmfg_floor = fg_tier;
-        is_dmfg_ = (dmfg_floor >= 3);
-
-        // FPS-based tier override (DLL-based FG only — DMFG uses latency hint)
-        int fps_tier = ul_fg_monitor::GetTier();
-        if (!is_dmfg_ && fps_tier >= 2) {
-            fg_tier = fps_tier;
-        }
-        if (fg_tier != last_fg_tier_) {
-            // Only reset the consistency buffer when the tuning params actually
-            // change. DMFG can oscillate between 4x/5x/6x frequently — all use
-            // kTier4xPlusMFG, so resetting on every shift would cause repeated
-            // buffer spikes for no benefit.
-            ConsistencyBuffer::TuningParams prev_params = consistency_buf_.active_params;
-            consistency_buf_.SelectTier(fg_tier);
-            if (consistency_buf_.active_params.initial_buffer_us != prev_params.initial_buffer_us
-                || consistency_buf_.active_params.max_buffer_us != prev_params.max_buffer_us) {
-                consistency_buf_.Reset(fg_tier);
+            // Measure phase error at the vblank level, not the grid level.
+            // With high vblank:grid ratios (e.g. 12:1 at 165Hz/41FPS), measuring
+            // against the grid slot causes ±interval/2 ambiguity — the frame can
+            // land on any of ~12 vblanks within one grid interval, making the
+            // "nearest grid slot" meaningless.
+            //
+            // Instead: find the nearest vblank boundary to actual_ns.
+            // The vblank period is known from the VRR floor interval.
+            // Phase error = distance from nearest vblank = always in [-vblank/2, +vblank/2].
+            // Correction still applies to grid_epoch_ns_ — a small epoch shift
+            // moves the grid so the next real frame lands closer to a vblank.
+            //
+            // With VRR/GSync active, the display dynamically matches the render rate.
+            // The effective vblank period equals the render interval (grid_interval_ns_),
+            // not the monitor's maximum refresh rate. Use the grid interval directly.
+            int64_t vblank_ns = 0;
+            if (gsync_detector_.gsync_active) {
+                // VRR active on DX: display locks to render rate
+                vblank_ns = grid_interval_ns_;
+            }
+            if (vblank_ns == 0 && hwnd_) {
+                NvU32 floor_us = ComputeVrrFloorIntervalUs(hwnd_);
+                if (floor_us > 0)
+                    vblank_ns = static_cast<int64_t>(floor_us) * 1000LL;
             }
 
-            // Flush GPU overload state — FG state change fundamentally changes
-            // what "target render FPS" means, so overload detection from the
-            // previous FG state is invalid.
+            int64_t phase_error_ns = 0;
+            if (vblank_ns > 0) {
+                // Nearest vblank to actual_ns
+                int64_t vblank_slot = (actual_ns / vblank_ns) * vblank_ns;
+                phase_error_ns = actual_ns - vblank_slot;
+                // Wrap to [-vblank/2, +vblank/2]
+                if (phase_error_ns > vblank_ns / 2)
+                    phase_error_ns -= vblank_ns;
+            } else {
+                // No vblank info — fall back to grid-level measurement with tight threshold
+                int64_t elapsed = actual_ns - grid_epoch_ns_;
+                int64_t expected_slot = (elapsed / grid_interval_ns_) * grid_interval_ns_
+                                      + grid_epoch_ns_;
+                phase_error_ns = actual_ns - expected_slot;
+                if (phase_error_ns > grid_interval_ns_ / 2)
+                    phase_error_ns -= grid_interval_ns_;
+                else if (phase_error_ns < -grid_interval_ns_ / 2)
+                    phase_error_ns += grid_interval_ns_;
+            }
+
+            // Three-tier gate for phase error samples:
+            //   |error| <= vblank/4  → normal sample, accumulate into EMA
+            //   |error| > vblank/4 && <= vblank/2 → noisy, skip sample, keep state
+            //   |error| > vblank/2  → genuine discontinuity (mode change, clock jump), reset
+            //
+            // The old binary gate (pass/nuke) destroyed all PLL state on every
+            // outlier. Marker feedback jitters by ±half a frame under CPU load,
+            // producing frequent outliers that kept the PLL in permanent reset.
+            // The three-tier approach lets the EMA survive normal jitter while
+            // still resetting on actual discontinuities.
+            int64_t gate_normal = vblank_ns > 0 ? vblank_ns / 4 : 1'000'000LL;
+            int64_t gate_reset  = vblank_ns > 0 ? vblank_ns / 2 : 2'000'000LL;
+            int64_t abs_error = std::abs(phase_error_ns);
+
+            if (abs_error <= gate_normal) {
+                // Normal sample — accumulate
+                float alpha = high_precision_feedback ? 0.12f : kPllAlpha;
+                float gain  = high_precision_feedback ? 0.20f : kPllCorrectionGain;
+
+                pll_smoothed_error_ns_ = pll_smoothed_error_ns_ * (1.0f - alpha)
+                                       + static_cast<float>(phase_error_ns) * alpha;
+
+                float err_f = static_cast<float>(phase_error_ns);
+                pll_error_variance_ns2_ = pll_error_variance_ns2_ * 0.95f
+                                        + err_f * err_f * 0.05f;
+                pll_sample_count_++;
+
+                float noise_threshold = vblank_ns > 0
+                    ? static_cast<float>(vblank_ns) * 0.25f
+                    : 1'500'000.0f;
+                float error_std = std::sqrt(pll_error_variance_ns2_);
+                pll_converged_ = (pll_sample_count_ >= 20)
+                              && (error_std < noise_threshold);
+
+                if (pll_converged_) {
+                    int64_t correction = static_cast<int64_t>(
+                        pll_smoothed_error_ns_ * gain);
+                    if (correction != 0)
+                        grid_epoch_ns_ += correction;
+                }
+            } else if (abs_error > gate_reset) {
+                // Genuine discontinuity — reset
+                pll_smoothed_error_ns_ = 0.0f;
+                pll_error_variance_ns2_ = 0.0f;
+                pll_sample_count_ = 0;
+                pll_converged_ = false;
+            }
+            // else: noisy sample (between vblank/4 and vblank/2) — skip, keep state
+
+            // Diagnostics — one-shot on first feedback, then every 30 seconds
+            static bool s_pll_first = true;
+            static int64_t s_pll_last_log_qpc = 0;
+            int64_t now_qpc = ul_timing::NowQpc();
+            bool periodic = (now_qpc - s_pll_last_log_qpc) > ul_timing::g_qpc_freq * 30;
+            if (s_pll_first || periodic) {
+                const char* src = used_vblank ? "D3DKMT(vblank)"
+                    : !high_precision_feedback ? "GetLatency"
+                    : used_marker ? "marker(PF)"
+                    : used_dxgi ? "DXGI(real)" : "unknown";
+                const char* state = (abs_error > gate_reset) ? "reset(discontinuity)"
+                    : (abs_error > gate_normal) ? "skipped(noisy)"
+                    : pll_converged_ ? "correcting"
+                    : "acquiring";
+                float error_std = std::sqrt(pll_error_variance_ns2_);
+                ul_log::Write("PLL: src=%s vblank=%.0fus phase_err=%+.0fus "
+                              "smoothed=%+.0fus noise_std=%.0fus samples=%d %s",
+                              src,
+                              vblank_ns / 1000.0f,
+                              static_cast<float>(phase_error_ns) / 1000.0f,
+                              pll_smoothed_error_ns_ / 1000.0f,
+                              error_std / 1000.0f,
+                              pll_sample_count_,
+                              state);
+                s_pll_last_log_qpc = now_qpc;
+                s_pll_first = false;
+            }
+        }
+    }
+
+    // --- GPU Load Gate (voting window) ---
+    // When GPU load is below 50%, freeze ConsistencyBuffer tick only.
+    // Voting window prevents gate flapping when load hovers near 50%.
+    {
+        int gate_vote = (target_load_ratio >= 0.50f) ? 1 : 0;
+        gate_votes_[gate_vote_head_] = gate_vote;
+        gate_vote_head_ = (gate_vote_head_ + 1) % kGateVoteWindow;
+        if (gate_vote_count_ < kGateVoteWindow) gate_vote_count_++;
+
+        bool was_gate_open = gpu_load_gate_open_;
+
+        // Gate opens when 60% of votes say open, closes when 70% say closed.
+        // Asymmetric thresholds: easier to open (enter gameplay) than close
+        // (transition to menu), reducing false closes during brief load dips.
+        // Before the window fills, use direct evaluation.
+        if (gate_vote_count_ < kGateVoteWindow / 2) {
+            gpu_load_gate_open_ = (target_load_ratio >= 0.50f);
+        } else {
+            int open_votes = 0;
+            for (int i = 0; i < gate_vote_count_; i++) {
+                int idx = (gate_vote_head_ - gate_vote_count_ + i + kGateVoteWindow) % kGateVoteWindow;
+                open_votes += gate_votes_[idx];
+            }
+            float open_ratio = static_cast<float>(open_votes) / static_cast<float>(gate_vote_count_);
+            if (!gpu_load_gate_open_ && open_ratio >= 0.60f)
+                gpu_load_gate_open_ = true;
+            else if (gpu_load_gate_open_ && open_ratio < 0.30f)
+                gpu_load_gate_open_ = false;
+        }
+
+        // Flush overload state when transitioning from gameplay to menu/loading
+        if (was_gate_open && !gpu_load_gate_open_) {
             gpu_overload_mode_ = false;
             gpu_overload_count_ = 0;
             gpu_recover_count_ = 0;
-            pipeline_predictor_.cadence.Reset();
+        }
+    }
 
-            last_fg_tier_ = fg_tier;
+    if (gpu_load_gate_open_) {
+        // --- FG tier change detection with hysteresis ---
+        // DetectFGDivisor() returns the cached per-frame value (DLL presence,
+        // FPS-ratio monitor, latency hint). FPS-based tier override is already
+        // folded into ComputeFGDivisorRaw().
+        int fg_tier = DetectFGDivisor();
+        is_dmfg_ = (fg_tier >= 3 && !GetModuleHandleW(L"nvngx_dlssg.dll")
+                                  && !GetModuleHandleW(L"_nvngx_dlssg.dll")
+                                  && !GetModuleHandleW(L"sl.dlss_g.dll")
+                                  && !GetModuleHandleW(L"dlss-g.dll")
+                                  && !GetModuleHandleW(L"amd_fidelityfx_framegeneration.dll")
+                                  && !GetModuleHandleW(L"ffx_framegeneration.dll"));
+
+        // Hysteresis: require kFGTierConfirmThreshold consecutive frames at
+        // the new tier before propagating. Prevents rapid oscillation when
+        // the FPS ratio hovers near a tier boundary (e.g. 2.5x → 2↔3).
+        // First detection (last_fg_tier_ == 0 → nonzero) is immediate.
+        if (fg_tier != last_fg_tier_) {
+            if (last_fg_tier_ == 0 && fg_tier > 0) {
+                // First detection: accept immediately
+                pending_fg_tier_ = 0;
+                fg_tier_confirm_ticks_ = 0;
+            } else if (fg_tier == pending_fg_tier_) {
+                fg_tier_confirm_ticks_++;
+            } else {
+                pending_fg_tier_ = fg_tier;
+                fg_tier_confirm_ticks_ = 1;
+            }
+
+            bool confirmed = (last_fg_tier_ == 0 && fg_tier > 0)
+                          || (fg_tier_confirm_ticks_ >= kFGTierConfirmThreshold);
+
+            if (confirmed) {
+                // Check if the consistency buffer tuning tier actually changes.
+                // DMFG can oscillate between 4x/5x/6x — all use kTier4xPlusMFG.
+                // Also 3x↔4x transitions: compare the full tuning struct
+                // (all 9 fields) to avoid unnecessary resets.
+                ConsistencyBuffer::TuningParams prev_params = consistency_buf_.active_params;
+                consistency_buf_.SelectTier(fg_tier);
+                bool tier_params_changed =
+                    std::memcmp(&consistency_buf_.active_params, &prev_params,
+                                sizeof(ConsistencyBuffer::TuningParams)) != 0;
+
+                if (tier_params_changed) {
+                    consistency_buf_.Reset(fg_tier);
+                }
+
+                // Flush GPU overload state — FG state change fundamentally changes
+                // what "target render FPS" means, so overload detection from the
+                // previous FG state is invalid.
+                gpu_overload_mode_ = false;
+                gpu_overload_count_ = 0;
+                gpu_recover_count_ = 0;
+                pipeline_predictor_.cadence.Reset();
+
+                // Snap grid to new interval immediately — don't EMA-drift from
+                // the old FG rate to the new one over 20 frames.
+                grid_epoch_ns_ = 0;
+                grid_next_ns_ = 0;
+                grid_interval_ns_ = 0;
+
+                // Reset PLL — stale phase errors from the old FG rate would
+                // corrupt the EMA and cause the PLL to apply wrong corrections.
+                pll_smoothed_error_ns_ = 0.0f;
+                pll_error_variance_ns2_ = 0.0f;
+                pll_sample_count_ = 0;
+                pll_converged_ = false;
+
+                last_fg_tier_ = fg_tier;
+                pending_fg_tier_ = 0;
+                fg_tier_confirm_ticks_ = 0;
+            }
+        } else {
+            // Same tier as current: reset pending
+            pending_fg_tier_ = 0;
+            fg_tier_confirm_ticks_ = 0;
         }
 
         // --- GSync active detection ---
-#ifdef _WIN64
-        gsync_detector_.Poll(dev_, ul_timing::NowQpc());
+        if (gsync_detector_.display_id == 0 && hwnd_)
+            gsync_detector_.ResolveDisplayId(hwnd_);
+        gsync_detector_.Poll(ul_timing::NowQpc());
 
         // --- Frame splitting control ---
         if (gsync_detector_.gsync_active && fg_tier > 1) {
@@ -1712,7 +2176,6 @@ void UlLimiter::UpdatePipelineStats() {
         } else {
             frame_split_ctrl_.Restore();
         }
-#endif
 
         // --- VRR proximity ---
         NvU32 target_iv_us = 0;
@@ -1724,10 +2187,8 @@ void UlLimiter::UpdatePipelineStats() {
         float vrr_proximity = ComputeVrrProximity(hwnd_, target_iv_us);
 
         // Gate VRR proximity: when GSync is not active, disable VRR-specific behavior
-#ifdef _WIN64
         if (!gsync_detector_.gsync_active)
             vrr_proximity = 0.0f;
-#endif
 
         // --- Cadence stddev_us with 8-sample minimum gate ---
         float cadence_stddev_us = (pipeline_predictor_.cadence.count >= 8)
@@ -1755,11 +2216,7 @@ void UlLimiter::UpdatePipelineStats() {
                     diag_final_interval_us = AdjustIntervalUs(raw, fg_tier, hwnd_,
                                                               ps, ptp_correction_us_,
                                                               consistency_buf_.buffer_us,
-#ifdef _WIN64
                                                               gsync_detector_.gsync_active
-#else
-                                                              false
-#endif
                                                               );
                 }
             }
@@ -1775,6 +2232,7 @@ void UlLimiter::UpdatePipelineStats() {
             if (fg_tier > 1 && render_interval_us > 0.0f && qpc_stddev_us > 0.0f)
                 qpc_cv_render = qpc_stddev_us / render_interval_us;
 
+
             diag_csv_logger_.WriteRow(
                 ul_timing::NowQpc(),
                 smoothness,
@@ -1784,11 +2242,7 @@ void UlLimiter::UpdatePipelineStats() {
                 diag_cv,
                 qpc_cv,
                 qpc_cv_render,
-#ifdef _WIN64
                 gsync_detector_.gsync_active,
-#else
-                false,
-#endif
                 consistency_buf_.mode,
                 consistency_buf_.buffer_us,
                 pipeline_predictor_.gpu.predicted_us,
@@ -1812,8 +2266,20 @@ void UlLimiter::UpdatePipelineStats() {
               / static_cast<float>((std::max)(pipeline_predictor_.gpu.count, 1))
             : 0.0f;
 
+        // When FG is active but the FG overhead predictor has no data
+        // (e.g. frame splitting disabled -> presentEndTime ≈ gpuRenderEndTime),
+        // predicted_total underestimates the actual cycle. Stale miss_count
+        // from before the transition inflates miss_rate and locks queue_depth=3.
+        // Suppress predictor-based queue depth decisions in this state.
+        bool predictor_valid = !fg_active || (pipeline_predictor_.fg.count > 0);
+
         int suggested = 1;
-        if (margin < 400.0f && miss_rate < 0.05f)
+        if (!predictor_valid) {
+            // FG active but no FG overhead data (e.g. frame splitting disabled).
+            // Predictor underestimates cycle time; stale miss_count inflates
+            // miss_rate. Use a safe default rather than predictor-driven depth.
+            suggested = 2;
+        } else if (margin < 400.0f && miss_rate < 0.05f)
             suggested = 1;
         else if (margin > 1500.0f)
             suggested = 3;
@@ -1894,27 +2360,6 @@ int UlLimiter::ResolveEnforcementSite() const {
 // ============================================================================
 
 void UlLimiter::DoReflexSleep() {
-    // Vulkan path: use VK_NV_low_latency2
-#ifdef _WIN64
-    if (VK_REFLEX_ACTIVE()) {
-        // When the game uses native Reflex (calls vkSetLatencySleepModeNV /
-        // vkLatencySleepNV itself), do NOT call SetSleepMode or Sleep — our
-        // calls would conflict with the game's own sleep cycle and crash.
-        // The game handles its own pacing; we just provide timing backstop.
-        if (g_game_uses_reflex.load(std::memory_order_relaxed))
-            return;
-
-        // Non-native: update driver hints only, no semaphore wait.
-        // DoTimingFallback handles actual pacing.
-        NvSleepParams p = BuildSleepParams();
-        vk_reflex_->SetSleepMode(
-            p.bLowLatencyMode != 0,
-            p.bLowLatencyBoost != 0,
-            p.minimumIntervalUs);
-        return;
-    }
-#endif
-
     // DX path: NVAPI
     if (!ReflexActive() || !dev_) return;
     NvSleepParams p = BuildSleepParams();
@@ -1954,42 +2399,18 @@ void UlLimiter::DoOwnSleep(int fg_div) {
             grid_interval_ns_ * (1.0 - kGridAlpha) + frame_ns * kGridAlpha);
 
         if (grid_next_ns_ > now) {
-#ifdef _WIN64
-            // When VK_EXT_present_timing is active, release the frame early
-            // and let the driver's display scheduler handle final vblank
-            // alignment via targetTime. The driver has hardware-level timing
-            // precision that our busy-wait can't match.
-            // Release 500µs early — enough for the driver to process the
-            // present and schedule into the correct vblank.
-            if (VkPresentTimingAvailable()) {
-                constexpr int64_t kEarlyReleaseNs = 500'000LL;  // 500µs
-                int64_t early_wake = grid_next_ns_ - kEarlyReleaseNs;
-                if (early_wake > now)
-                    ul_timing::SleepUntilNs(early_wake, htimer_fallback_);
-            } else
-#endif
-            {
-                ul_timing::SleepUntilNs(grid_next_ns_, htimer_fallback_);
-            }
+            ul_timing::SleepUntilNs(grid_next_ns_, htimer_fallback_);
             grid_next_ns_ += grid_interval_ns_;
         } else {
-            int64_t elapsed = now - grid_epoch_ns_;
-            int64_t slots = elapsed / grid_interval_ns_;
-            grid_next_ns_ = grid_epoch_ns_ + (slots + 1) * grid_interval_ns_;
+            // Frame arrived late — missed the grid slot.
+            // Advance from now to avoid the long+short frame pair that epoch
+            // snapping creates when a single frame runs late.
+            grid_next_ns_ = now + grid_interval_ns_;
         }
     }
 
     // --- Reflex passthrough (unified) ---
     __try {
-#ifdef _WIN64
-        // VK_EXT_present_timing: set the target display time to the grid slot.
-        // We released the frame early (above) — the driver holds it until this
-        // time, aligning scanout with our grid using hardware vblank precision.
-        if (VkPresentTimingAvailable()) {
-            // Target = the grid slot we're aiming for (grid_next - interval = current slot)
-            VkPresentTimingSetTargetTime(static_cast<uint64_t>(grid_next_ns_ - grid_interval_ns_));
-        }
-#endif
         MaybeUpdateSleepMode(p);
         InvokeReflexSleep();
     } __except(EXCEPTION_EXECUTE_HANDLER) {
@@ -2050,12 +2471,41 @@ void UlLimiter::HandleQueuedFrames(uint64_t frame_id, int max_q) {
 // ============================================================================
 
 void UlLimiter::OnMarker(int marker_type, uint64_t frame_id) {
-    bool has_reflex = (ReflexActive() && dev_) || VK_REFLEX_ACTIVE();
+    bool has_reflex = (ReflexActive() && dev_);
     if (!has_reflex) return;
     if (!warmup_done_) return;
     if (is_background_) return;
 
     if (s_smooth_motion.load(std::memory_order_relaxed)) return;
+
+    // Capture QPC timestamp at PRESENT_FINISH for PLL feedback — before any
+    // early returns so it fires regardless of is_real_frame or enforcement site.
+    if (marker_type == PRESENT_FINISH) {
+        pll_marker_present_ns_.store(ul_timing::NowNs(), std::memory_order_relaxed);
+        pll_marker_frame_id_.store(frame_id, std::memory_order_relaxed);
+        if (dxgi_sc_) {
+            IDXGISwapChain* sc = reinterpret_cast<IDXGISwapChain*>(dxgi_sc_);
+            UINT cnt = 0;
+            if (SUCCEEDED(sc->GetLastPresentCount(&cnt)) && cnt > 0)
+                last_real_present_count_ = cnt;
+        }
+        // One-shot diagnostic: log the first PRESENT_FINISH frame_id after
+        // enforcement switches to PRESENT_FINISH, to verify IDs are advancing.
+        static int64_t s_pf_site_switch_qpc = 0;
+        static bool s_pf_logged = false;
+        int64_t now_qpc = ul_timing::NowQpc();
+        if (!s_pf_logged && pipeline_stats_.auto_site == PRESENT_FINISH) {
+            if (s_pf_site_switch_qpc == 0) s_pf_site_switch_qpc = now_qpc;
+            if (now_qpc - s_pf_site_switch_qpc > ul_timing::g_qpc_freq * 2) {
+                ul_log::Write("PLL marker(PF) check: frame_id=%llu last_marker_id=%llu "
+                              "marker_ns=%lld now_ns=%lld",
+                              frame_id, last_pll_marker_frame_id_,
+                              pll_marker_present_ns_.load(std::memory_order_relaxed),
+                              ul_timing::NowNs());
+                s_pf_logged = true;
+            }
+        }
+    }
 
     const auto& dp = pipeline_stats_.pacing;
 
@@ -2073,8 +2523,9 @@ void UlLimiter::OnMarker(int marker_type, uint64_t frame_id) {
     if (site == SIM_START && dp.queue_depth > 1)
         effective_site = PRESENT_BEGIN;
 
-    if (marker_type == effective_site)
+    if (marker_type == effective_site) {
         DoOwnSleep();
+    }
 }
 
 // ============================================================================
@@ -2112,9 +2563,7 @@ void UlLimiter::DoTimingFallback() {
     grid_interval_ns_ = frame_ns;
 
     if (grid_next_ns_ <= now) {
-        int64_t elapsed = now - grid_epoch_ns_;
-        int64_t slots_elapsed = elapsed / grid_interval_ns_;
-        grid_next_ns_ = grid_epoch_ns_ + (slots_elapsed + 1) * grid_interval_ns_;
+        grid_next_ns_ = now + grid_interval_ns_;
         return;
     }
 
@@ -2130,16 +2579,6 @@ void UlLimiter::OnPresent() {
     frame_num_++;
     g_present_count.fetch_add(1, std::memory_order_relaxed);
 
-    // Emit synthetic markers for non-native Vulkan games so the driver's
-    // latency pipeline has data. Without these, GetLatencyTimings returns
-    // empty reports and native FPS / the pacing graph never appear.
-#ifdef _WIN64
-    if (VK_REFLEX_ACTIVE() && !g_game_uses_reflex.load(std::memory_order_relaxed)) {
-        vk_reflex_->SetMarker(frame_num_, VK_LATENCY_MARKER_SIMULATION_START_NV);
-        vk_reflex_->SetMarker(frame_num_, VK_LATENCY_MARKER_PRESENT_START_NV);
-    }
-#endif
-
     int64_t now_qpc = ul_timing::NowQpc();
     if (!warmup_done_) {
         if (warmup_start_qpc_ == 0) {
@@ -2153,12 +2592,11 @@ void UlLimiter::OnPresent() {
 
         // Log pacing mode summary
         {
-            bool vk = VK_REFLEX_ACTIVE();
-            bool dx = !vk && ReflexActive() && dev_;
+            bool dx = ReflexActive() && dev_;
             bool native = g_game_uses_reflex.load(std::memory_order_relaxed);
             bool sl = GetModuleHandleW(L"sl.interposer.dll") != nullptr;
-            const char* api = vk ? "Vulkan" : dx ? "DX" : "None";
-            const char* reflex = native ? "native" : (vk || dx) ? "injected" : "none";
+            const char* api = dx ? "DX" : "None";
+            const char* reflex = native ? "native" : dx ? "injected" : "none";
             int fg = DetectFGDivisor();
             float fps = g_cfg.fps_limit.load(std::memory_order_relaxed);
             ul_log::Write("OnPresent: warmup done (frame %llu) — API=%s, Reflex=%s, "
@@ -2171,6 +2609,12 @@ void UlLimiter::OnPresent() {
         if (!s_settings_flushed) {
             SaveSettings();
             s_settings_flushed = true;
+        }
+
+        // Re-init VBlank monitor if it died during startup (transient D3DKMT
+        // failures during display mode changes).
+        if (hwnd_ && !vblank_monitor_.IsActive()) {
+            vblank_monitor_.Init(hwnd_);
         }
     }
 
@@ -2185,10 +2629,7 @@ void UlLimiter::OnPresent() {
         } else if (!bg && is_background_) {
             is_background_ = false;
             ResetAdaptiveState();
-            // Clear stale FPS-based FG tier — background limiter distorts
-            // the output/native FPS ratio.  Falls back to DLL-based detection
-            // until the ratio stabilizes after warmup.
-            ul_fg_monitor::Reset();
+            // Background refocus — full reset of adaptive state.
             ul_log::Write("Background: refocused, full reset");
         }
         if (is_background_) {
@@ -2223,8 +2664,23 @@ void UlLimiter::OnPresent() {
         }
     }
 
-    // Feed QPC timestamp to local brake signal monitor
-    qpc_monitor_.Feed(now_qpc);
+    // Feed QPC timestamp to local brake signal monitor.
+    // When FG is active, OnPresent fires for every output frame (real + generated).
+    // Feeding all of them produces alternating ~render_interval / ~0.5ms deltas,
+    // giving qpc_cv > 1.0 which permanently triggers the ConsistencyBuffer brake.
+    // Only feed on real-frame presents: every fg_divisor-th present.
+    // Use last_fg_tier_ (confirmed from previous frame) — cached_fg_divisor_ isn't
+    // set yet this frame.
+    {
+        int div = (last_fg_tier_ > 1) ? last_fg_tier_ : 1;
+        if (div <= 1 || (frame_num_ % static_cast<uint64_t>(div)) == 0)
+            qpc_monitor_.Feed(now_qpc);
+    }
+
+    // Cache FG divisor once per frame — all subsequent DetectFGDivisor() calls
+    // return this value, ensuring consistency across BuildSleepParams,
+    // ComputeRenderFps, UpdatePipelineStats, and the FG tier change logic.
+    CacheFGDivisor();
 
     // --- Settings change detection → global reset ---
     {
@@ -2279,8 +2735,12 @@ void UlLimiter::OnPresent() {
     }
 
     // Present-to-present feedback loop (1:1 only — not under FG)
-    bool any_reflex = (ReflexActive() && dev_) || VK_REFLEX_ACTIVE();
-    if (any_reflex && DetectFGDivisor() == 1) {
+    // Skip when DXGI frame stats are active —
+    // the PLL handles timing correction from direct display feedback,
+    // and PTP's interval adjustments would fight the PLL's epoch corrections.
+    bool any_reflex = (ReflexActive() && dev_);
+    bool has_display_feedback = (dxgi_sc_ != nullptr);
+    if (any_reflex && DetectFGDivisor() == 1 && !has_display_feedback) {
         float out_fps = g_cfg.fps_limit.load(std::memory_order_relaxed);
         if (out_fps > 0.0f) {
             float target_us = 1'000'000.0f / out_fps;
@@ -2308,40 +2768,26 @@ void UlLimiter::OnPresent() {
         }
     }
 
-    // Reflex path — unified for DX and Vulkan.
+    // Reflex path — DX only.
     // Native Reflex (markers flow): OnMarker calls DoOwnSleep at enforcement site.
     // Non-native Reflex (no markers): DoOwnSleep here in OnPresent.
     // No Reflex: timing grid only.
-    bool has_reflex = VK_REFLEX_ACTIVE() || (ReflexActive() && dev_);
+    bool has_reflex = (ReflexActive() && dev_);
     if (has_reflex) {
         if (g_game_uses_reflex.load(std::memory_order_relaxed)) {
-            // Marker pacing — OnMarker calls DoOwnSleep at enforcement site.
-            // Just update sleep mode params here (no sleep, no grid).
+            // DX native Reflex: marker pacing — OnMarker calls DoOwnSleep
+            // at enforcement site. Just update sleep mode params here.
             NvSleepParams p = BuildSleepParams();
             MaybeUpdateSleepMode(p);
         } else {
             // Non-native: DoOwnSleep from OnPresent.
-            // On Vulkan, OnPresent fires for ALL frames (real + generated),
-            // so pass the FG divisor to pace the grid at output rate.
             // On DX, OnPresent only fires for real frames — fg_div stays 1.
-            int fg_div = 1;
-#ifdef _WIN64
-            if (VK_REFLEX_ACTIVE())
-                fg_div = DetectFGDivisor();
-#endif
-            DoOwnSleep(fg_div);
+            DoOwnSleep();
         }
     } else {
         // Non-Reflex games — timing grid is the only pacer
         DoTimingFallback();
     }
-
-    // Close the synthetic marker pair for non-native Vulkan games.
-#ifdef _WIN64
-    if (VK_REFLEX_ACTIVE() && !g_game_uses_reflex.load(std::memory_order_relaxed)) {
-        vk_reflex_->SetMarker(frame_num_, VK_LATENCY_MARKER_PRESENT_END_NV);
-    }
-#endif
 }
 
 // ============================================================================
